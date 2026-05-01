@@ -1,0 +1,18 @@
+{
+  "default_alias": "main",
+  "aliases": {
+    "main": {
+      "IMAP_HOST": "imap.163.com",
+      "IMAP_PORT": 993,
+      "IMAP_USERNAME": "test@163.com",
+      "IMAP_PASSWORD": "test",
+      "IMAP_MAILBOX": "INBOX",
+      "IMAP_TLS": true,
+      "IMAP_INSECURE_SKIP_VERIFY": false,
+      "IMAP_ID_NAME": "longtradego",
+      "IMAP_ID_VERSION": "1.0.0",
+      "IMAP_ID_VENDOR": "longtradego",
+      "IMAP_ID_ADDRESS": "test@163.com"
+    }
+  }
+}

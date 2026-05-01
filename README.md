@@ -1,0 +1,702 @@
+# longtradego
+
+A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queries and designed to be easy to extend with more commands.
+
+## Features
+
+- `cobra`-based CLI command structure
+- `quote` command with multiple symbols
+- `email` command for SMTP notifications
+- `email receive` command for IMAP inbox polling and action trigger
+- `email monitor` command for new-mail monitoring (polling)
+- `mail monitor` cursor persistence (`data/mail_monitor_cursors.json`) for restart-safe UID continuation (daemon monitors are isolated by `MONITOR_ID`)
+- `email analyze` command to print current mail element fields for downstream logic
+- `email --to` alias lookup via `conf/email_aliases.json`
+- `sys` command for Linux/system automation commands
+- `version` command for build metadata (`version/commit/build date/platform`)
+- `upgrade` command (`check` / install / dry-run) with GitHub Releases
+- Automatic update reminder cache (`data/update_state.json`, max once per 24h check)
+- `webhook` command for signature generation, test sending, managed lifecycle (`start/status/stop/kill-port`), and management endpoints (`/admin`, `/healthz`, `/readyz`, `/admin/webhook/status`, `/metrics`, `/admin/webhook/stop`)
+- `admin` command for daemon-admin runtime inspection (`admin status`)
+- Daemon scheduled task management (`task add/list/pause/resume/global-pause/global-resume/remove`)
+- Daemon task persistence across restarts (`conf/daemon_tasks.json`)
+- Removed task backup history with deletion timestamp (`data/daemon_tasks_history.json`)
+- Daemon mail monitor persistence across restarts (`conf/daemon_monitors.json`)
+- Daemon-owned independent admin service runtime (`conf/admin_runtime.json`)
+- Daemon admin Basic Auth config (`conf/admin_auth.json`)
+- Symbol-first backward compatibility (`go run . AAPL.US TSLA.US`)
+- OAuth client id flow support (`LONGBRIDGE_CLIENT_ID`)
+- Reuse quote session across commands; reconnect lazily only when a running command hits session expiration
+- Structured command execution logs
+- Log file rotation when `logs/command.log` exceeds `5MB`
+
+## Project Layout
+
+- `main.go`: app entrypoint, command execution lifecycle, unified logging
+- `root_command.go`: root CLI command registration
+- `execute_command.go`: shared execution lifecycle (normal + daemon)
+- `daemon_command.go`: interactive daemon mode (`daemon` / `d`)
+- `admin_command.go`: daemon-admin runtime status command (`admin status`)
+- `quote_command.go`: quote command implementation
+- `email_command.go`: email command implementation
+- `system_command.go`: system command execution (`sys` / `shell`)
+- `version_command.go`: build metadata output command
+- `upgrade_command.go`: release check/install and update reminder cache
+- `webhook_command.go`: webhook service/signature/token/runtime implementation
+- `daemon_task.go`: daemon scheduled task manager
+- `daemon_admin_service.go`: daemon-owned independent admin HTTP service
+- `args.go`: argument normalization and symbol parsing
+- `app_context.go`: shared app state and Longbridge config bootstrap
+- `command_log.go`: JSON lines command logs and file rotation
+
+## Requirements
+
+- Go `1.24+`
+- Longbridge credentials
+
+## Environment
+
+Use `.env` in project root:
+
+```env
+LONGBRIDGE_CLIENT_ID=your_client_id
+# Optional, default is 60355
+# LONGBRIDGE_CALLBACK_PORT=60355
+
+# SMTP for `email send`
+# SMTP_HOST=smtp.example.com
+# SMTP_PORT=587
+# SMTP_USERNAME=your_account@example.com
+# SMTP_PASSWORD=your_password_or_app_password
+# SMTP_FROM=your_account@example.com
+
+# Optional monitor defaults (mail monitor)
+# IMAP_MONITOR_MODE=hybrid
+# IMAP_MONITOR_LIMIT=20
+# IMAP_MONITOR_CONNECT_TIMEOUT=10s
+# IMAP_MONITOR_POLL_INTERVAL=15s
+# IMAP_MONITOR_FALLBACK_POLL_INTERVAL=2m
+# IMAP_MONITOR_BODY_MAX_BYTES=20000
+```
+
+Notes:
+
+- On first OAuth run, CLI prints an authorization URL.
+- Token is managed by Longbridge SDK and persisted locally.
+- IMAP for `mail receive/monitor/analyze` reads `conf/mail_receive_setting.json` only (no IMAP credential fallback from `.env`).
+
+## Run
+
+Install dependencies:
+
+```bash
+go mod tidy
+```
+
+Run quote command:
+
+```bash
+go run . quote AAPL.US TSLA.US 700.HK
+```
+
+Alias:
+
+```bash
+go run . q AAPL.US TSLA.US
+```
+
+Version and upgrade:
+
+```bash
+# Build metadata
+go run . version
+
+# Check latest release
+go run . upgrade check
+
+# Dry-run planned upgrade (no binary replacement)
+go run . upgrade --dry-run --yes
+
+# Install latest release (binary mode)
+longtradego upgrade
+```
+
+Upgrade notes:
+
+- `upgrade` downloads release assets from GitHub Releases and verifies `checksums.txt` before replacement.
+- `upgrade` refuses to run while daemon is running; stop daemon first.
+- `upgrade` refuses `go run .` execution mode; install and run released binary first.
+- Automatic update checks are cached in `data/update_state.json` and throttled to at most once per 24 hours.
+- Update reminder text is shown only in interactive terminals (non-interactive runs stay silent).
+
+Send email notification:
+
+```bash
+go run . email send \
+  --to "alice@example.com,bob@example.com" \
+  --subject "Longtrade Notification" \
+  --body "AAPL reached target price."
+```
+
+Send email by recipient alias (`--to` can be alias or email):
+
+```bash
+go run . email send \
+  --to "qa,dev" \
+  --subject "Department Alert" \
+  --body "Pipeline finished."
+```
+
+Send email with body file:
+
+```bash
+go run . email send \
+  --to "alice@example.com" \
+  --subject "Daily Report" \
+  --body-file ./report.txt
+```
+
+Receive emails via IMAP (alias: `mail recv`):
+
+```bash
+go run . email receive --limit 10 --unread-only
+go run . mail recv --subject-contains "ALERT" --from-contains "ops@"
+go run . mail recv --mail-alias main
+```
+
+Trigger a system command when matching mails are found:
+
+```bash
+go run . mail recv \
+  --subject-contains "DEPLOY_OK" \
+  --action-cmd 'echo got ${MAIL_COUNT} mail(s) from ${MAILBOX}'
+```
+
+Fetch message content and save attachments to files:
+
+```bash
+go run . mail recv \
+  --with-body \
+  --with-files \
+  --files-dir ./logs/mail_files
+```
+
+Monitor new incoming mail and trigger follow-up commands:
+
+```bash
+go run . mail monitor --poll-interval 15s --wait-timeout 10m --with-body
+go run . mail monitor --mode idle --poll-interval 30s --wait-timeout 10m
+go run . mail monitor --mode hybrid --poll-interval 30s --fallback-poll-interval 2m --wait-timeout 30m
+go run . mail monitor --mode hybrid --once --wait-timeout 10m
+go run . mail monitor --mail-alias main --wait-timeout 10m
+```
+
+`mail monitor` mode guide:
+
+- `--mode poll`: pure polling
+- `--mode idle`: IMAP IDLE first (server fallback handled by go-imap)
+- `--mode hybrid` (default): IDLE + low-frequency fallback polling
+- If `--mode` is empty, it defaults to `hybrid`
+- Adaptive polling: if 3 consecutive polls find no new mail, interval increases by `+5s`; when new mail is detected, interval resets to initial value (default `15s`); max interval is `300s`
+
+Analyze mail elements (temporary loop-print for business prep):
+
+```bash
+go run . mail analyze --limit 5 --with-files --files-dir ./logs/mail_files
+```
+
+Daemon pipeline example (new mail -> analyze):
+
+```text
+longtradego> mail monitor --poll-interval 15s --wait-timeout 5m --with-body | mail analyze
+```
+
+Email alias config file (`conf/email_aliases.json`):
+
+```json
+{
+  "aliases": {
+    "qa": ["qa@example.com"],
+    "dev": ["dev1@example.com", "dev2@example.com"],
+    "trading": ["trading@example.com"]
+  }
+}
+```
+
+IMAP settings file (`conf/mail_receive_setting.json`):
+
+```json
+{
+  "default_alias": "main",
+  "aliases": {
+    "main": {
+      "IMAP_HOST": "imap.example.com",
+      "IMAP_PORT": 993,
+      "IMAP_USERNAME": "your_account@example.com",
+      "IMAP_PASSWORD": "your_password_or_app_password",
+      "IMAP_MAILBOX": "INBOX",
+      "IMAP_TLS": true,
+      "IMAP_INSECURE_SKIP_VERIFY": false,
+      "IMAP_ID_NAME": "longtradego",
+      "IMAP_ID_VERSION": "1.0.0",
+      "IMAP_ID_VENDOR": "longtradego",
+      "IMAP_ID_ADDRESS": "your_account@example.com"
+    }
+  }
+}
+```
+
+- Use `--mail-alias <alias>` to pick a mailbox profile.
+- If `--mail-alias` is omitted, `default_alias` is used.
+
+Run Linux/system command directly:
+
+```bash
+go run . sys -- ls -la
+go run . sys --shell "uname -a && date"
+```
+
+`sys --shell` uses `$SHELL` when available (falls back to `zsh`, then `sh`).
+`sys` writes execution logs (stdout/stderr/exit code) to `logs/system_command.log` and does not print command output to terminal, to avoid interfering with interactive input.
+For readable JSON payloads, keep using `stdout`/`stderr` for raw text compatibility and prefer `stdout_json` / `stderr_json` when present.
+
+Webhook lifecycle and usage:
+
+```bash
+# Start webhook service in background (non-blocking)
+go run . webhook start --addr :8080 --path /webhook/events
+
+# Query background runtime status
+go run . webhook status
+
+# Stop background webhook service
+go run . webhook stop
+
+# Kill local processes occupying target webhook port (TERM then KILL if needed)
+go run . webhook kill-port --addr :8080
+
+# Preview matched pids only (no kill)
+go run . webhook kill-port --addr :8080 --dry-run
+```
+
+`webhook kill-port` behavior:
+
+- Finds listening pids by target port, tries graceful `TERM` first, then escalates to `KILL` on timeout.
+- Cleans runtime state only when runtime `pid` matches one of the stopped pids.
+
+Webhook route management (single service, multi-routes):
+
+```bash
+# Add one sync route
+go run . webhook route add r-sync \
+  --path /webhook/orders \
+  --mode sync \
+  --pipeline "webhook sign --third-party-id p1 --token t1 --data '{\"ok\":1}'"
+
+# Add one async route
+go run . webhook route add r-async \
+  --path /webhook/alerts \
+  --mode async \
+  --pipeline "email send --to ops@example.com --subject 'Webhook Alert'"
+
+# List / update / remove routes
+go run . webhook route list
+go run . webhook route update r-async --timeout 45s --max-attempts 8
+go run . webhook route remove r-async r-async
+```
+
+Compatibility note:
+
+- If no `webhook route` config exists, `webhook start` auto creates a legacy default route from `--path` (default `/webhook/events`), so existing integrations continue to work.
+
+Webhook start mode (background only):
+
+```bash
+go run . webhook start --addr :8080 --path /webhook/events
+```
+
+Start behavior notes:
+
+- Runtime/log paths remain relative to current workspace (`conf/`, `data/`, `logs/`).
+- Webhook runtime state now defaults to `data/webhook_runtime.json` (legacy `conf/webhook_runtime.json` is auto-migrated on read when using default runtime path).
+- `webhook start` enforces best-effort single service on the same `--addr`: if the port is already in use, it returns `already_running` and does not spawn a new process.
+- After spawn, startup is verified by checking process liveness and management endpoint readiness to avoid false-positive "started" states.
+
+Webhook management endpoints (same port):
+
+```bash
+curl http://127.0.0.1:8080/admin
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/readyz
+curl http://127.0.0.1:8080/admin/webhook/status
+curl http://127.0.0.1:8080/metrics
+# stop current webhook instance (POST only)
+curl -X POST http://127.0.0.1:8080/admin/webhook/stop
+```
+
+Admin stop behavior:
+
+- `/admin` includes a **Stop Current Webhook** button with browser confirm dialog to reduce mis-clicks.
+- `POST /admin/webhook/stop` only requests shutdown for the current webhook process.
+- Runtime file cleanup is best-effort and only removes runtime state when runtime `pid` matches the current process PID.
+
+Generate a signed webhook request package:
+
+```bash
+go run . webhook sign \
+  --third-party-id partner-a \
+  --token your_raw_token \
+  --data '{"hello":"world"}'
+```
+
+Quickly send a signed webhook test request:
+
+```bash
+go run . webhook send \
+  --url http://127.0.0.1:8080/webhook/events \
+  --third-party-id partner-a \
+  --token your_raw_token \
+  --data '{"hello":"world"}'
+
+# send to a route path
+go run . webhook send \
+  --url http://127.0.0.1:8080/webhook/orders \
+  --third-party-id partner-a \
+  --token your_raw_token \
+  --data '{"order_id":"o-1001"}'
+```
+
+Webhook `POST` example:
+
+```bash
+curl -X POST http://127.0.0.1:8080/webhook/events \
+  -H "X-Third-Party-ID: partner-a" \
+  -H "X-Webhook-Timestamp: 1710000000" \
+  -H "X-Webhook-Token: <signature>" \
+  -H "Content-Type: application/json" \
+  -d '{"hello":"world"}'
+```
+
+Webhook downstream processing model:
+
+- Route mode `sync`: execute configured downstream pipeline in request path and return `200` on success.
+- Route mode `async`: enqueue and return `202` immediately; background worker retries with backoff, then dead-letters on max attempts.
+- Downstream allowlist is enabled by default; `sys/shell` requires explicit `--allow-sys-downstream`.
+- Webhook endpoints only accept `POST`; non-POST requests return `405`.
+- Token verification uses in-memory cache with periodic refresh from token store file.
+
+Webhook logs and audit:
+
+- Accepted events: `data/webhook_events.json` (`meta + data`)
+- Async queue: `data/webhook_dispatch_queue.json`
+- Async history: `data/webhook_dispatch_history.jsonl`
+- Dead letter: `data/webhook_dead_letters.jsonl`
+- Full request/response audit (raw headers/body + response): `logs/webhook_audit.log` (with rotation)
+- Event/audit writes are buffered asynchronously (batch flush) and use sync fallback when queue is full.
+- Backward-compatible raw fields are kept (`request_body`, `response_body`), while structured fields (`request_json`, `response_json`) are preferred for debugging and search.
+
+Quick lookup examples (jq):
+
+```bash
+# recent webhook send results from command log (event id + status)
+jq -r 'select(.request.command=="webhook" and .request.symbols[0]=="send") | [.timestamp,.result.response_event_id,.result.http_status,.result.response_meta_error] | @tsv' logs/command.log | tail -n 20
+
+# locate one audit record by response_event_id
+jq -r 'select(.response_event_id=="evt-1777592565341649000-0d5220c2") | [.timestamp,.path,.response_status,.response_third_party_id,.response_meta_error] | @tsv' logs/webhook_audit.log
+
+# inspect structured request json directly (without escaped \\n noise)
+jq -r 'select(.response_event_id=="evt-1777592565341649000-0d5220c2") | .request_json' logs/webhook_audit.log
+
+# inspect structured response json directly (without escaped \\n noise)
+jq -r 'select(.response_event_id=="evt-1777592565341649000-0d5220c2") | .response_json' logs/webhook_audit.log
+
+# quickly find audit lines whose request body is valid json
+jq -r 'select(.request_json_valid==true) | [.timestamp,.event_id,.path,.response_status] | @tsv' logs/webhook_audit.log
+
+# find sys command results that emitted structured json in stdout
+jq -r 'select(.result.stdout_json_valid==true) | [.timestamp,.result.command_line,.result.exit_code] | @tsv' logs/system_command.log
+```
+
+Webhook token management:
+
+```bash
+go run . webhook token generate partner-a
+go run . webhook token query partner-a
+go run . webhook token reset partner-a
+```
+
+Backward compatible symbol-first mode:
+
+```bash
+go run . AAPL.US TSLA.US
+```
+
+Daemon mode (stay alive and execute multiple commands):
+
+```bash
+go run . daemon
+```
+
+Then inside prompt:
+
+```text
+longtradego> quote AAPL.US TSLA.US 700.HK
+longtradego> email send --to alice@example.com --subject "Alert" --body "hello"
+longtradego> sys --shell "uptime"
+longtradego> q NVDA.US
+longtradego> monitor list
+longtradego> monitor start m-1
+longtradego> monitor stop m-1
+longtradego> monitor remove m-2 m-2
+longtradego> monitor stop all
+longtradego> mail monitor list
+longtradego> mail monitor start m-1
+longtradego> mail monitor stop m-1
+longtradego> mail monitor remove m-2 m-2
+longtradego> exit
+```
+
+When daemon starts, it checks current workspace webhook runtime and prints a hint for `running` / `stale` state (including pid/addr/path and owner summary when available).
+
+Daemon also starts an independent admin service (default base address `:18080`) for task/monitor/webhook unified management:
+
+- It tries `:18080` first, then auto-fallbacks to `+1 ... +20` if port is occupied.
+- If all candidate ports are unavailable, daemon keeps running and prints a warning.
+- This admin service is independent from webhook lifecycle, so when webhook is stopped, task/monitor admin page still works.
+- Runtime state is saved to `conf/admin_runtime.json`, and daemon exit only cleans this file when runtime `pid` matches current daemon process.
+
+Check admin runtime quickly:
+
+```bash
+go run . admin status
+```
+
+Daemon admin endpoints (default port shown as `18080`, actual port may fallback):
+
+```bash
+curl -u admin:your-password http://127.0.0.1:18080/admin
+curl -u admin:your-password http://127.0.0.1:18080/admin/status
+curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/webhook/start
+curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/webhook/stop
+curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/webhook/kill-port
+curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/task/global-pause
+curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/task/global-resume
+curl -u admin:your-password -X POST -d \"id=task-1\" http://127.0.0.1:18080/admin/task/pause
+curl -u admin:your-password -X POST -d \"id=task-1\" http://127.0.0.1:18080/admin/task/resume
+curl -u admin:your-password -X POST -d \"id=m-1\" http://127.0.0.1:18080/admin/monitor/start
+curl -u admin:your-password -X POST -d \"id=m-1\" http://127.0.0.1:18080/admin/monitor/stop
+curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/monitor/start-all
+curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/monitor/stop-all
+```
+
+The daemon admin page (`/admin`) intentionally hides the `kill-port` button to reduce accidental high-risk actions; use CLI (`webhook kill-port`) or direct API call when needed.
+
+Daemon admin auth config (`conf/admin_auth.json`, plaintext v1):
+
+```json
+{
+  "username": "admin",
+  "password": "your-password"
+}
+```
+
+If `conf/admin_auth.json` is missing or invalid, daemon keeps running but skips daemon admin service startup.
+
+Security note: daemon admin now requires HTTP Basic Auth, but it is still recommended to expose it only in trusted environments. Webhook built-in `/admin` remains unchanged.
+
+When daemon exits (`exit` / EOF), it closes runtime contexts/connections and only cleans webhook process if ownership matches current daemon session (`owner_session_id` + `owner_start_token` double check). This avoids stopping webhook instances started by other daemon sessions or external terminals.
+
+Daemon interactive shortcuts:
+
+- `↑` / `↓`: history navigation (last executed commands)
+- `←` / `→`: move cursor within current input line for editing
+- `TAB`: command/flag auto completion (supports pipeline stages after `|`, e.g. `quote AAPL.US | em` + TAB -> `email`; `task pause ` + TAB -> task IDs; `task ` + TAB -> all task subcommands including `global-pause`, `global-resume`, `remove`)
+- `TAB`: admin command completion is supported (`admin status`, `admin --runtime`)
+- `TAB`: webhook command completion is supported (`webhook start|stop|kill-port|status|route|token|sign|send` and common flags, including route flags)
+- `Ctrl+C`: clears current input; first time shows hint to use `exit` to stop daemon
+
+Daemon monitor control:
+
+- `monitor list`: show currently running background monitor jobs (such as `mail monitor`)
+- `monitor list` also shows persisted stopped/paused monitor configs for later restart
+- `monitor start <id|all>`: start one paused monitor config by id, or start all paused configs
+- `monitor stop <id>`: stop one monitor job by `MONITOR_ID` and mark it `paused` in persisted config
+- `monitor stop all`: stop all running monitor jobs and mark them `paused` in persisted config
+- `monitor remove <id> <confirm-id>`: remove one monitor config permanently (requires id confirmation)
+- Alias forms are supported: `mail monitor list`, `mail monitor start <id|all>`, `mail monitor stop <id|all>`, `mail monitor remove <id> <confirm-id>`
+- Same mailbox/filter monitor runs as single instance in daemon (duplicate start is rejected)
+- Running monitor definitions are persisted to `conf/daemon_monitors.json`; only non-paused monitors auto-restore on next daemon start
+- Pipelines that start with `mail monitor` run as background monitor jobs (non-blocking daemon input), and are included in monitor list/start/stop/persistence
+- Legacy input `webhook serve ...` in daemon is auto rewritten to `webhook start ...` to prevent blocking the prompt
+
+Daemon command templates:
+
+- Input only `quote` then press Enter:
+  - Auto generates and pre-fills `quote AAPL.US TSLA.US 700.HK`
+- Input only `email` or `email send` then press Enter:
+  - Auto generates and pre-fills `email send --to recipient@example.com --subject "Notification" --body "message"`
+
+Daemon pipeline:
+
+- You can chain commands with `|`.
+- The previous command result will be passed to next stage.
+- For `email send`, if no `--body` / `--body-file` is provided, the previous stage result is auto injected as email body.
+- For `sys`, pipeline context is injected as env vars and JSON stdin:
+  - `LONGTRADE_PIPELINE_SOURCE_COMMAND`
+  - `LONGTRADE_PIPELINE_RESULT_JSON`
+  - `LONGTRADE_PIPELINE_INPUT_JSON`
+- Pipelines starting with `mail monitor` are event-triggered monitor jobs. The daemon keeps monitor connection alive (IDLE/hybrid per your `--mode`) and runs downstream stages when each new-mail event arrives.
+
+Example:
+
+```text
+longtradego> quote AAPL.US TSLA.US | email send --to alice@example.com --subject "Quote Alert"
+longtradego> mail monitor --mode hybrid --with-body | email send --to alice@example.com --subject "Mail Alert"
+longtradego> mail monitor --mode hybrid --with-body | sys --shell 'echo "$LONGTRADE_PIPELINE_INPUT_JSON" | jq .'
+```
+
+Daemon scheduled tasks:
+
+Tasks can be added, listed, paused, resumed, and removed. Each task runs periodically according to its configured interval. The daemon maintains a global pause switch that can pause all tasks at once without affecting individual task settings.
+
+- `task` is also registered as a root command for command discovery/help output, while actual task operations run inside daemon interactive mode.
+
+- Add periodic task:
+
+```text
+longtradego> task add --every 1m -- quote AAPL.US | email send --to alice@example.com --subject "Scheduled Alert"
+longtradego> task add --cron "*/5 * * * *" -- quote AAPL.US | email send --to alice@example.com --subject "Cron Alert"
+longtradego> task add --cron "*/5 * * * *" --auto-resume -- quote AAPL.US | email send --to alice@example.com --subject "Cron Alert"
+```
+
+`task add` schedule options:
+
+- `--every <duration>`: interval schedule, e.g. `30s`, `5m`, `1h`
+- `--cron "<expr>"`: cron schedule (robfig/cron v3 parser), e.g. `"*/5 * * * *"`, `"0 9 * * 1-5"`, `"@hourly"`
+- `--auto-resume`: automatically run `task resume <task-id>` right after create
+- Use exactly one of `--every` or `--cron`
+
+Tasks are persisted automatically. When daemon restarts, previously saved tasks are restored from:
+
+- `conf/daemon_tasks.json`
+
+Newly added tasks are `paused` by default. Use `--auto-resume` to skip the manual step, or resume explicitly:
+
+```text
+longtradego> task resume task-1
+```
+
+- List tasks:
+
+```text
+longtradego> task list
+```
+
+The `STATUS` column shows the current task state, such as `scheduled`, `running`, or `paused`.
+
+`task list` can be used as a pipeline stage, for example to email the current task list:
+
+```text
+longtradego> task list | email send --to alice@example.com --subject "Task List Snapshot"
+```
+
+- Pause/resume task by id without deleting it:
+
+```text
+longtradego> task pause task-1
+longtradego> task resume task-1
+```
+
+- Pause/resume all tasks globally (master switch):
+
+```text
+longtradego> task global-pause
+longtradego> task global-resume
+```
+
+When global pause is enabled, all tasks are paused regardless of their individual pause states. Global pause state is persisted, so it survives daemon restarts.
+
+- Remove task by id (confirmation required):
+
+```text
+longtradego> task remove task-1 task-1
+```
+
+Each successful remove also appends a backup record (including deletion timestamp) to:
+
+- `data/daemon_tasks_history.json`
+
+Default behavior:
+
+```bash
+go run .
+```
+
+Equivalent to:
+
+```bash
+go run . quote AAPL.US
+```
+
+## Logging
+
+Command execution logs are written to:
+
+- `logs/command.log`
+- `logs/system_command.log`
+- `logs/mail_monitor.log`
+
+Format:
+
+- JSON Lines (one JSON object per line)
+- Includes `run_id`, `status`, `duration_ms`, `request`, `result`, `error`
+- Includes copyable `request.command_line` for quick replay/debug
+
+Rotation:
+
+- All logs above rotate at `5MB`.
+- If next write would exceed `5MB`, current file is rotated to:
+  - `logs/command_YYYYMMDD_HHMMSS.log`
+  - `logs/system_command_YYYYMMDD_HHMMSS.log`
+  - `logs/mail_monitor_YYYYMMDD_HHMMSS.log`
+- Then a new active log file is created for continued writes.
+
+## Release Packaging
+
+GitHub Actions workflow: `.github/workflows/release.yml`
+
+- Trigger: push tag `v*` (for example `v1.2.3`)
+- Build targets (v1): `darwin/amd64`, `darwin/arm64`
+- Release assets:
+  - `longtradego_<version>_darwin_amd64.tar.gz`
+  - `longtradego_<version>_darwin_arm64.tar.gz`
+  - `checksums.txt` (SHA256)
+- Build metadata injected via ldflags:
+  - `main.buildVersion`
+  - `main.buildCommit`
+  - `main.buildDate`
+
+Install script (user-writable bin directory by default):
+
+```bash
+# latest
+./scripts/install.sh
+
+# specific version
+./scripts/install.sh v1.2.3
+```
+
+The installer defaults to `~/.local/bin` and does not require sudo.
+
+## Add a New Command
+
+Recommended pattern:
+
+1. Create a new file like `kline_command.go`
+2. Implement a `cobra.Command` constructor (similar to `newQuoteCommand`)
+3. Register it in `newRootCommand` in `root_command.go`
+4. Set execution metadata in command run function:
+   - `app.SetExecution("<command>", symbolsOrNil)`
+   - `app.SetResult(resultObject)`
+
+This keeps command logic isolated and makes future maintenance easier.

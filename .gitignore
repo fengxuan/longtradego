@@ -1,0 +1,6 @@
+.env
+/logs
+/data
+/conf
+.DS_Store
+longtradego

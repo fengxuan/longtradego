@@ -1,0 +1,7 @@
+{
+  "aliases": {
+    "qa": ["test@sohu.com"],
+    "dev": ["test@163.com", "test@gmail.com"],
+    "trading": ["test@gmail.com"]
+  }
+}

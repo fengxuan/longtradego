@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          for ARCH in amd64 arm64; do
+            BIN_DIR="dist/longtradego_${VERSION}_darwin_${ARCH}"
+            BIN_PATH="${BIN_DIR}/longtradego"
+            mkdir -p "${BIN_DIR}"
+            GOOS=darwin GOARCH="${ARCH}" CGO_ENABLED=0 \
+              go build -trimpath \
+              -ldflags "-s -w -X main.buildVersion=${TAG} -X main.buildCommit=${GITHUB_SHA} -X main.buildDate=${BUILD_DATE}" \
+              -o "${BIN_PATH}" .
+            tar -C "dist" -czf "dist/longtradego_${VERSION}_darwin_${ARCH}.tar.gz" "longtradego_${VERSION}_darwin_${ARCH}"
+            rm -rf "${BIN_DIR}"
+          done
+
+          (cd dist && sha256sum longtradego_*.tar.gz > checksums.txt)
+
+      - name: Publish GitHub Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/longtradego_*.tar.gz
+            dist/checksums.txt
