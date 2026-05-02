@@ -17,6 +17,7 @@ func newRootCommand(app *appContext, commandLogger *commandFileLogger) *cobra.Co
 	rootCmd.AddCommand(newDaemonCommand(app, commandLogger))
 	rootCmd.AddCommand(newTaskCommand())
 	rootCmd.AddCommand(newWebhookCommand(app))
+	rootCmd.AddCommand(newBookingCommand(app))
 	rootCmd.AddCommand(newVersionCommand(app))
 	rootCmd.AddCommand(newUpgradeCommand(app))
 	return rootCmd

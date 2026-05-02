@@ -217,6 +217,9 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 	stubWebhookStartCalls := 0
 	stubWebhookStopCalls := 0
 	stubWebhookKillCalls := 0
+	stubBookingStartCalls := 0
+	stubBookingStopCalls := 0
+	stubBookingStatusCalls := 0
 	authConfig := daemonAdminAuthConfig{
 		Username: testDaemonAdminUsername,
 		Password: testDaemonAdminPassword,
@@ -261,6 +264,40 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 		WebhookKillFn: func() (webhookKillPortResult, error) {
 			stubWebhookKillCalls++
 			return webhookKillPortResult{Mode: "kill-port", Status: "stopped", Port: 8080}, nil
+		},
+		BookingStartFn: func() (bookingServiceStartResult, error) {
+			stubBookingStartCalls++
+			return bookingServiceStartResult{
+				Mode:   "service_start",
+				Status: "started",
+				Runtime: &bookingServiceRuntimeInfo{
+					PID:       12001,
+					Address:   "127.0.0.1:18081",
+					StartedAt: time.Now().Format(time.RFC3339Nano),
+				},
+			}, nil
+		},
+		BookingStopFn: func() (bookingServiceStopResult, error) {
+			stubBookingStopCalls++
+			return bookingServiceStopResult{
+				Mode:   "service_stop",
+				Status: "stopped",
+				PID:    12001,
+			}, nil
+		},
+		BookingStatusFn: func() (bookingServiceStatusResult, error) {
+			stubBookingStatusCalls++
+			return bookingServiceStatusResult{
+				Mode:    "service_status",
+				Status:  "running",
+				Running: true,
+				Runtime: &bookingServiceRuntimeInfo{
+					PID:       12001,
+					Address:   "127.0.0.1:18081",
+					StartedAt: time.Now().Format(time.RFC3339Nano),
+				},
+				URL: "http://127.0.0.1:18081/admin/booking/status",
+			}, nil
 		},
 		AuthConfig: authConfig,
 	})
@@ -326,6 +363,36 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 	}
 	_ = unauthPostResp.Body.Close()
 
+	unauthBookingAdminResp, err := http.Get(baseURL + daemonAdminBookingServiceStatusPath)
+	if err != nil {
+		t.Fatalf("GET admin booking service status without auth failed: %v", err)
+	}
+	if unauthBookingAdminResp.StatusCode != http.StatusUnauthorized {
+		body := readAllAndClose(t, unauthBookingAdminResp)
+		t.Fatalf("expected /admin/booking/service/status unauthorized without auth, got %d body=%s", unauthBookingAdminResp.StatusCode, body)
+	}
+	_ = unauthBookingAdminResp.Body.Close()
+
+	publicCatalogResp, err := http.Get(baseURL + bookingPublicCatalogPath)
+	if err != nil {
+		t.Fatalf("GET daemon legacy public booking catalog failed: %v", err)
+	}
+	if publicCatalogResp.StatusCode != http.StatusNotFound {
+		body := readAllAndClose(t, publicCatalogResp)
+		t.Fatalf("expected daemon legacy /booking/catalog removed (404), got %d body=%s", publicCatalogResp.StatusCode, body)
+	}
+	_ = publicCatalogResp.Body.Close()
+
+	legacyAdminBookingResp, err := httpGetWithBasicAuth(baseURL+bookingAdminStatusPath, authConfig.Username, authConfig.Password)
+	if err != nil {
+		t.Fatalf("GET daemon legacy /admin/booking/status failed: %v", err)
+	}
+	if legacyAdminBookingResp.StatusCode != http.StatusNotFound {
+		body := readAllAndClose(t, legacyAdminBookingResp)
+		t.Fatalf("expected daemon legacy /admin/booking/status removed (404), got %d body=%s", legacyAdminBookingResp.StatusCode, body)
+	}
+	_ = legacyAdminBookingResp.Body.Close()
+
 	wrongAuthResp, err := httpGetWithBasicAuth(svc.URL(), "wrong-user", "wrong-password")
 	if err != nil {
 		t.Fatalf("GET admin home with wrong auth failed: %v", err)
@@ -348,6 +415,9 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 		!strings.Contains(homeBody, "Refresh Page") ||
 		!strings.Contains(homeBody, "Start Webhook") ||
 		!strings.Contains(homeBody, "Stop Webhook") ||
+		!strings.Contains(homeBody, "Start Booking Service") ||
+		!strings.Contains(homeBody, "Stop Booking Service") ||
+		!strings.Contains(homeBody, daemonAdminBookingServiceStatusPath) ||
 		!strings.Contains(homeBody, daemonAdminTaskGlobalPausePath) ||
 		!strings.Contains(homeBody, "State</th>") ||
 		!strings.Contains(homeBody, "Last Result</th>") ||
@@ -396,6 +466,27 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 	}
 	if statusPayload.Monitor.Total != 1 || len(statusPayload.Monitor.Monitors) != 1 {
 		t.Fatalf("expected one monitor in status, got %+v", statusPayload.Monitor)
+	}
+	if statusPayload.Booking.Status != "running" || !statusPayload.Booking.Running {
+		t.Fatalf("expected booking service running in status payload, got %+v", statusPayload.Booking)
+	}
+	if statusPayload.Booking.PID != 12001 {
+		t.Fatalf("expected booking service pid=12001, got %+v", statusPayload.Booking)
+	}
+	if stubBookingStatusCalls == 0 {
+		t.Fatalf("expected booking status callback invoked")
+	}
+
+	bookingServiceStatusResp, err := httpGetWithBasicAuth(baseURL+daemonAdminBookingServiceStatusPath, authConfig.Username, authConfig.Password)
+	if err != nil {
+		t.Fatalf("GET /admin/booking/service/status failed: %v", err)
+	}
+	bookingServiceStatusBody := readAllAndClose(t, bookingServiceStatusResp)
+	if bookingServiceStatusResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected /admin/booking/service/status 200, got %d body=%s", bookingServiceStatusResp.StatusCode, bookingServiceStatusBody)
+	}
+	if !strings.Contains(bookingServiceStatusBody, "\"running\": true") {
+		t.Fatalf("expected running booking service payload, got: %s", bookingServiceStatusBody)
 	}
 
 	var statusRaw map[string]any
@@ -476,6 +567,20 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 	if stubWebhookStartCalls != 1 || stubWebhookStopCalls != 1 || stubWebhookKillCalls != 1 {
 		t.Fatalf("expected webhook action stubs called once, got start=%d stop=%d kill=%d", stubWebhookStartCalls, stubWebhookStopCalls, stubWebhookKillCalls)
 	}
+	mustPOSTFormWithBasicAuth(t, baseURL+daemonAdminBookingServiceStartPath, url.Values{}, authConfig.Username, authConfig.Password, http.StatusOK)
+	mustPOSTFormWithBasicAuth(t, baseURL+daemonAdminBookingServiceStopPath, url.Values{}, authConfig.Username, authConfig.Password, http.StatusOK)
+	if stubBookingStartCalls != 1 || stubBookingStopCalls != 1 {
+		t.Fatalf("expected booking service start/stop callbacks once, got start=%d stop=%d", stubBookingStartCalls, stubBookingStopCalls)
+	}
+	getBookingActionResp, err := httpGetWithBasicAuth(baseURL+daemonAdminBookingServiceStartPath, authConfig.Username, authConfig.Password)
+	if err != nil {
+		t.Fatalf("GET booking service action endpoint failed: %v", err)
+	}
+	if getBookingActionResp.StatusCode != http.StatusMethodNotAllowed {
+		body := readAllAndClose(t, getBookingActionResp)
+		t.Fatalf("expected GET /admin/booking/service/start 405, got %d body=%s", getBookingActionResp.StatusCode, body)
+	}
+	_ = getBookingActionResp.Body.Close()
 
 	resp405, err := httpGetWithBasicAuth(baseURL+daemonAdminTaskPausePath, authConfig.Username, authConfig.Password)
 	if err != nil {
@@ -648,6 +753,27 @@ func mustPOSTFormWithBasicAuth(t *testing.T, endpoint string, form url.Values, u
 		t.Fatalf("POST %s expected %d got %d body=%s", endpoint, expectedCode, resp.StatusCode, body)
 	}
 	_ = resp.Body.Close()
+}
+
+func mustPostJSON(t *testing.T, endpoint string, body string, username string, password string, expectedCode int) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build POST %s failed: %v", endpoint, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(username) != "" || strings.TrimSpace(password) != "" {
+		req.SetBasicAuth(username, password)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s failed: %v", endpoint, err)
+	}
+	responseBody := readAllAndClose(t, resp)
+	if resp.StatusCode != expectedCode {
+		t.Fatalf("POST %s expected %d got %d body=%s", endpoint, expectedCode, resp.StatusCode, responseBody)
+	}
+	return responseBody
 }
 
 func httpGetWithBasicAuth(endpoint string, username string, password string) (*http.Response, error) {

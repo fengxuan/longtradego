@@ -111,6 +111,9 @@ func TestDaemonCompletionPipelineRootAfterPipe(t *testing.T) {
 	if !slices.Contains(candidates, "task") || !slices.Contains(candidates, "sys") || !slices.Contains(candidates, "admin") {
 		t.Fatalf("expected root command completion after pipe to include task/sys/admin, got: %v", candidates)
 	}
+	if !slices.Contains(candidates, "booking") {
+		t.Fatalf("expected root command completion after pipe to include booking, got: %v", candidates)
+	}
 	if !slices.Contains(candidates, "version") || !slices.Contains(candidates, "upgrade") {
 		t.Fatalf("expected root command completion after pipe to include version/upgrade, got: %v", candidates)
 	}
@@ -244,6 +247,48 @@ func TestDaemonCompletionUpgradeFlags(t *testing.T) {
 	}
 }
 
+func TestDaemonCompletionBookingSubcommandsAndFlags(t *testing.T) {
+	candidates := completionCandidatesFromLine("booking ")
+	if !slices.Contains(candidates, "product") ||
+		!slices.Contains(candidates, "slot") ||
+		!slices.Contains(candidates, "reservation") ||
+		!slices.Contains(candidates, "service") ||
+		!slices.Contains(candidates, "query") {
+		t.Fatalf("expected booking completion subcommands, got: %v", candidates)
+	}
+	if !slices.Contains(candidates, "--catalog") || !slices.Contains(candidates, "--reservations") {
+		t.Fatalf("expected booking global flags, got: %v", candidates)
+	}
+
+	productCandidates := completionCandidatesFromLine("booking product add --")
+	if !slices.Contains(productCandidates, "--id") || !slices.Contains(productCandidates, "--name") || !slices.Contains(productCandidates, "--enabled") {
+		t.Fatalf("expected booking product flags, got: %v", productCandidates)
+	}
+
+	slotCandidates := completionCandidatesFromLine("booking slot list --")
+	if !slices.Contains(slotCandidates, "--product-id") || !slices.Contains(slotCandidates, "--from") || !slices.Contains(slotCandidates, "--include-full") {
+		t.Fatalf("expected booking slot list flags, got: %v", slotCandidates)
+	}
+
+	reservationCandidates := completionCandidatesFromLine("booking reservation create --")
+	if !slices.Contains(reservationCandidates, "--party-size") || !slices.Contains(reservationCandidates, "--contact-name") || !slices.Contains(reservationCandidates, "--special-requirements") {
+		t.Fatalf("expected booking reservation create flags, got: %v", reservationCandidates)
+	}
+
+	queryCandidates := completionCandidatesFromLine("booking query --")
+	if !slices.Contains(queryCandidates, "--product-id") || !slices.Contains(queryCandidates, "--from") || !slices.Contains(queryCandidates, "--include-full") {
+		t.Fatalf("expected booking query flags, got: %v", queryCandidates)
+	}
+
+	serviceCandidates := completionCandidatesFromLine("booking service start --")
+	if !slices.Contains(serviceCandidates, "--addr") ||
+		!slices.Contains(serviceCandidates, "--runtime") ||
+		!slices.Contains(serviceCandidates, "--api-keys") ||
+		!slices.Contains(serviceCandidates, "--llm-config") {
+		t.Fatalf("expected booking service start flags, got: %v", serviceCandidates)
+	}
+}
+
 func TestRewriteDaemonWebhookServeToStart(t *testing.T) {
 	rewritten, ok := rewriteDaemonWebhookServeToStart([]string{"webhook", "serve", "--addr", ":8081"})
 	if !ok {
@@ -258,6 +303,23 @@ func TestRewriteDaemonWebhookServeToStart(t *testing.T) {
 
 	if _, ok := rewriteDaemonWebhookServeToStart([]string{"webhook", "start"}); ok {
 		t.Fatalf("expected webhook start not to be rewritten")
+	}
+}
+
+func TestRewriteDaemonBookingServeToStart(t *testing.T) {
+	rewritten, ok := rewriteDaemonBookingServeToStart([]string{"booking", "service", "serve", "--addr", ":18091"})
+	if !ok {
+		t.Fatalf("expected booking service serve command to be rewritten")
+	}
+	if len(rewritten) < 3 || rewritten[0] != "booking" || rewritten[1] != "service" || rewritten[2] != "start" {
+		t.Fatalf("unexpected rewritten args: %v", rewritten)
+	}
+	if !slices.Contains(rewritten, "--addr") || !slices.Contains(rewritten, ":18091") {
+		t.Fatalf("expected rewritten args to preserve flags, got: %v", rewritten)
+	}
+
+	if _, ok := rewriteDaemonBookingServeToStart([]string{"booking", "service", "start"}); ok {
+		t.Fatalf("expected booking service start not to be rewritten")
 	}
 }
 

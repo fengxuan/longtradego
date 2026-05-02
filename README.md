@@ -17,6 +17,8 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 - `upgrade` command (`check` / install / dry-run) with GitHub Releases
 - Automatic update reminder cache (`data/update_state.json`, max once per 24h check)
 - `webhook` command for signature generation, test sending, managed lifecycle (`start/status/stop/kill-port`), and management endpoints (`/admin`, `/healthz`, `/readyz`, `/admin/webhook/status`, `/metrics`, `/admin/webhook/stop`)
+- `booking` command for product/slot/reservation/query management and independent service lifecycle (`booking service start/status/stop`)
+- Booking public API key config (`conf/booking_api_keys.json`)
 - `admin` command for daemon-admin runtime inspection (`admin status`)
 - Daemon scheduled task management (`task add/list/pause/resume/global-pause/global-resume/remove`)
 - Daemon task persistence across restarts (`conf/daemon_tasks.json`)
@@ -43,6 +45,9 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 - `version_command.go`: build metadata output command
 - `upgrade_command.go`: release check/install and update reminder cache
 - `webhook_command.go`: webhook service/signature/token/runtime implementation
+- `booking_command.go`: booking CLI command tree
+- `booking_service.go`: booking domain rules and JSON persistence
+- `booking_service_runtime.go`: independent booking HTTP service lifecycle/auth/intake parsing
 - `daemon_task.go`: daemon scheduled task manager
 - `daemon_admin_service.go`: daemon-owned independent admin HTTP service
 - `args.go`: argument normalization and symbol parsing
@@ -77,6 +82,7 @@ LONGBRIDGE_CLIENT_ID=your_client_id
 # IMAP_MONITOR_POLL_INTERVAL=15s
 # IMAP_MONITOR_FALLBACK_POLL_INTERVAL=2m
 # IMAP_MONITOR_BODY_MAX_BYTES=20000
+
 ```
 
 Notes:
@@ -84,6 +90,7 @@ Notes:
 - On first OAuth run, CLI prints an authorization URL.
 - Token is managed by Longbridge SDK and persisted locally.
 - IMAP for `mail receive/monitor/analyze` reads `conf/mail_receive_setting.json` only (no IMAP credential fallback from `.env`).
+- Booking intent parse (`/booking/intents/parse`) reads `conf/booking_llm.json` only (no LLM credential fallback from environment variables).
 
 ## Run
 
@@ -487,9 +494,133 @@ curl -u admin:your-password -X POST -d \"id=m-1\" http://127.0.0.1:18080/admin/m
 curl -u admin:your-password -X POST -d \"id=m-1\" http://127.0.0.1:18080/admin/monitor/stop
 curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/monitor/start-all
 curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/monitor/stop-all
+curl -u admin:your-password http://127.0.0.1:18080/admin/booking/service/status
+curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/booking/service/start
+curl -u admin:your-password -X POST http://127.0.0.1:18080/admin/booking/service/stop
 ```
 
 The daemon admin page (`/admin`) intentionally hides the `kill-port` button to reduce accidental high-risk actions; use CLI (`webhook kill-port`) or direct API call when needed.
+
+Booking system (independent service, system-first + client-ready):
+
+- Runtime data files:
+  - `data/booking_catalog.json` (products + slots)
+  - `data/booking_reservations.json` (reservations + state transitions)
+- Reservation states: `pending -> confirmed | rejected | cancelled`
+- Capacity rule: `available_capacity = slot.capacity - sum(confirmed.party_size)`
+- Default query behavior: `/booking/catalog` only returns slots with `available_capacity > 0`; use `include_full=true` to include full slots.
+- Runtime file: `data/booking_runtime.json` (service pid/address/state)
+- Draft intake file: `data/booking_intake_drafts.json` (text parse drafts)
+
+Start/stop/status booking service (default base port `:18081`, fallback `+1...+20`):
+
+```bash
+go run . booking service start
+go run . booking service status
+go run . booking service stop
+# optional custom config path
+go run . booking service start --llm-config conf/booking_llm.json
+```
+
+Booking service security config (fail-closed on missing/invalid config):
+
+- `conf/booking_api_keys.json` (public API key allow-list)
+- `conf/booking_llm.json` (OpenAI-compatible parse config: `api_key`, `base_url`, optional `model`)
+- `conf/admin_auth.json` (booking admin basic auth, shared with daemon admin)
+
+Booking CLI examples:
+
+```bash
+# product
+go run . booking product add --id p-1 --name "Morning Session" --enabled=true
+go run . booking product list
+go run . booking product remove p-1
+
+# slot
+go run . booking slot add --id slot-1 --product-id p-1 --start 2026-05-03T10:00:00+08:00 --end 2026-05-03T11:00:00+08:00 --capacity 10 --enabled=true
+go run . booking slot list --include-full --include-disabled
+go run . booking slot remove slot-1
+
+# reservation
+go run . booking reservation create --product-id p-1 --slot-id slot-1 --user-id u-1 --party-size 2 --contact-name Alice --contact-phone 13800138000 --member Alice --member Bob --special-requirements "Window seat"
+go run . booking reservation list --user-id u-1 --status pending
+go run . booking reservation confirm r-1 --note "confirmed by system"
+go run . booking reservation reject r-2 --note "no capacity"
+go run . booking reservation cancel r-3 --note "user canceled"
+
+# user-view query
+go run . booking query --product-id p-1 --from 2026-05-03T00:00:00+08:00 --to 2026-05-03T23:59:59+08:00
+```
+
+Booking service APIs (default URL `http://127.0.0.1:18081`, actual port may fallback):
+
+- Public endpoints require header `X-Booking-API-Key: <key>`:
+- `GET /booking/catalog?product_id=<id>&from=<RFC3339>&to=<RFC3339>&include_full=<bool>`
+- `POST /booking/reservations` (JSON body)
+- `GET /booking/reservations?user_id=<id>&status=<pending|confirmed|rejected|cancelled>`
+- `POST /booking/intents/parse` (text -> draft via OpenAI-compatible API)
+- `POST /booking/intents/confirm` (confirm draft -> create pending reservation)
+- If `conf/booking_llm.json` is missing/invalid, `POST /booking/intents/parse` returns `503` while other booking APIs remain available.
+
+Intent parse follow-up behavior:
+
+- `POST /booking/intents/parse` auto-detects an existing draft for the same user and tries to continue it (instead of always creating a new one).
+- Match policy: same `user_id` and (if provided) same `channel` first; fallback to same `user_id`; only drafts within 24 hours are eligible.
+- Merge policy: always fill missing fields; overwrite existing fields only when new parse confidence is high (`new >= 0.80` and `new-old >= 0.10`).
+- Parse response keeps `status + draft` and adds:
+  - `action`: `created | continued | continued_no_change`
+  - `draft_id`
+  - `updated_fields`
+  - `override_applied`
+
+`POST /booking/reservations` JSON schema:
+
+```json
+{
+  "product_id": "p-1",
+  "slot_id": "slot-1",
+  "user_id": "u-1",
+  "party_size": 2,
+  "personnel": {
+    "contact_name": "Alice",
+    "contact_phone": "13800138000",
+    "members": ["Alice", "Bob"]
+  },
+  "special_requirements": "Window seat"
+}
+```
+
+Intent parse/confirm example:
+
+```bash
+curl -X POST http://127.0.0.1:18081/booking/intents/parse \
+  -H "X-Booking-API-Key: booking-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"u-1","channel":"chat","content":"我想明天上午两个人预约产品 p-1"}'
+
+curl -X POST http://127.0.0.1:18081/booking/intents/confirm \
+  -H "X-Booking-API-Key: booking-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"draft_id":"d-1","slot_id":"slot-1"}'
+```
+
+Admin booking APIs (Basic Auth required, hosted by booking service):
+
+- `GET /admin/booking/status`
+- `POST /admin/booking/product/upsert`
+- `POST /admin/booking/product/remove`
+- `POST /admin/booking/slot/upsert`
+- `POST /admin/booking/slot/remove`
+- `POST /admin/booking/reservation/confirm`
+- `POST /admin/booking/reservation/reject`
+- `POST /admin/booking/reservation/cancel`
+
+HTTP semantics:
+
+- `/booking/*` requires `X-Booking-API-Key`.
+- `/admin/booking/*` requires Basic Auth (`conf/admin_auth.json`).
+- Action endpoints are POST-only (`405` on wrong method).
+- Validation errors return `400`; capacity conflicts return `409`.
 
 Daemon admin auth config (`conf/admin_auth.json`, plaintext v1):
 
@@ -499,6 +630,29 @@ Daemon admin auth config (`conf/admin_auth.json`, plaintext v1):
   "password": "your-password"
 }
 ```
+
+Booking API keys config (`conf/booking_api_keys.json`):
+
+```json
+{
+  "keys": [
+    "booking-key-1",
+    "booking-key-2"
+  ]
+}
+```
+
+Booking LLM config (`conf/booking_llm.json`, OpenAI-compatible):
+
+```json
+{
+  "api_key": "your-openai-compatible-key",
+  "base_url": "https://api.openai.com",
+  "model": "gpt-4.1-mini"
+}
+```
+
+`base_url` supports root URL, `/v1`, or full chat endpoint. The service normalizes it to a single `.../chat/completions` request URL (no duplicated `/v1`).
 
 If `conf/admin_auth.json` is missing or invalid, daemon keeps running but skips daemon admin service startup.
 
@@ -513,6 +667,7 @@ Daemon interactive shortcuts:
 - `TAB`: command/flag auto completion (supports pipeline stages after `|`, e.g. `quote AAPL.US | em` + TAB -> `email`; `task pause ` + TAB -> task IDs; `task ` + TAB -> all task subcommands including `global-pause`, `global-resume`, `remove`)
 - `TAB`: admin command completion is supported (`admin status`, `admin --runtime`)
 - `TAB`: webhook command completion is supported (`webhook start|stop|kill-port|status|route|token|sign|send` and common flags, including route flags)
+- `TAB`: booking command completion is supported (`booking product|slot|reservation|query|service` and common flags)
 - `Ctrl+C`: clears current input; first time shows hint to use `exit` to stop daemon
 
 Daemon monitor control:
@@ -528,6 +683,7 @@ Daemon monitor control:
 - Running monitor definitions are persisted to `conf/daemon_monitors.json`; only non-paused monitors auto-restore on next daemon start
 - Pipelines that start with `mail monitor` run as background monitor jobs (non-blocking daemon input), and are included in monitor list/start/stop/persistence
 - Legacy input `webhook serve ...` in daemon is auto rewritten to `webhook start ...` to prevent blocking the prompt
+- `booking service serve ...` in daemon is auto rewritten to `booking service start ...`
 
 Daemon command templates:
 
