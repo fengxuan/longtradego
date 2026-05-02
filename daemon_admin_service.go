@@ -322,11 +322,18 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
     }
     .op-cell { min-width: 160px; }
     .op-row { display: flex; gap: 6px; flex-wrap: wrap; }
-    #action-feedback {
+    .feedback {
       margin-top: 8px;
       font-size: 0.86rem;
-      color: var(--muted);
       min-height: 18px;
+      color: var(--muted);
+    }
+    .feedback.error {
+      color: #b91c1c;
+      font-weight: 600;
+    }
+    .feedback.success {
+      color: #065f46;
     }
   </style>
 </head>
@@ -337,11 +344,8 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
       <div class="meta">Updated: <code>{{.Status.Now}}</code> | Daemon PID: <code>{{.Status.Daemon.PID}}</code> | Session: <code>{{.Status.Daemon.SessionID}}</code></div>
 	      <div class="toolbar">
 	        <button type="button" onclick="window.location.reload()">Refresh Page</button>
-	        <button type="button" onclick="postAction('` + daemonAdminWebhookStartPath + `', '', '', false)">Start Webhook</button>
-	        <button class="danger" type="button" onclick="postAction('` + daemonAdminWebhookStopPath + `', '', 'Stop current webhook process now?', true)">Stop Webhook</button>
 	      </div>
-      <div id="action-feedback"></div>
-      <div class="warn">HTTP Basic authentication is required for all daemon admin routes. Keep this service in trusted environments only.</div>
+      <div id="action-feedback" class="feedback" aria-live="polite"></div>
       <div class="hint">Status API: <code>` + daemonAdminStatusPath + `</code></div>
     </section>
 
@@ -358,6 +362,11 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
 
     <section class="panel">
       <h2>Webhook</h2>
+      <div class="toolbar">
+        <button type="button" onclick="postAction('` + daemonAdminWebhookStartPath + `', '', '', false, 'webhook-feedback')">Start Webhook</button>
+        <button class="danger" type="button" onclick="postAction('` + daemonAdminWebhookStopPath + `', '', 'Stop current webhook process now?', true, 'webhook-feedback')">Stop Webhook</button>
+      </div>
+      <div id="webhook-feedback" class="feedback" aria-live="polite"></div>
       <div class="status-grid">
         <div class="kv"><div class="k">Running</div><div class="v">{{.Status.Webhook.Running}}</div></div>
         <div class="kv"><div class="k">Address</div><div class="v"><code>{{.Status.Webhook.Address}}</code></div></div>
@@ -386,9 +395,10 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
     <section class="panel">
       <h2>Booking Service</h2>
       <div class="toolbar">
-        <button type="button" onclick="postAction('` + daemonAdminBookingServiceStartPath + `', '', '', false)">Start Booking Service</button>
-        <button class="danger" type="button" onclick="postAction('` + daemonAdminBookingServiceStopPath + `', '', 'Stop current booking service now?', true)">Stop Booking Service</button>
+        <button type="button" onclick="postAction('` + daemonAdminBookingServiceStartPath + `', '', '', false, 'booking-feedback')">Start Booking Service</button>
+        <button class="danger" type="button" onclick="postAction('` + daemonAdminBookingServiceStopPath + `', '', 'Stop current booking service now?', true, 'booking-feedback')">Stop Booking Service</button>
       </div>
+      <div id="booking-feedback" class="feedback" aria-live="polite"></div>
       <div class="status-grid">
         <div class="kv"><div class="k">Running</div><div class="v">{{.Status.Booking.Running}}</div></div>
         <div class="kv"><div class="k">Status</div><div class="v"><code>{{.Status.Booking.Status}}</code></div></div>
@@ -472,14 +482,27 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
   </div>
 
   <script>
-    async function postAction(path, id, confirmText, risky) {
+    function updateFeedback(node, message, state) {
+      if (!node) {
+        return;
+      }
+      node.textContent = String(message || "");
+      node.classList.remove("error", "success");
+      if (state === "error") {
+        node.classList.add("error");
+      } else if (state === "success") {
+        node.classList.add("success");
+      }
+    }
+
+    async function postAction(path, id, confirmText, risky, feedbackTargetId) {
       if (risky && confirmText && !window.confirm(confirmText)) {
         return;
       }
-      const feedback = document.getElementById("action-feedback");
-      if (feedback) {
-        feedback.textContent = "Submitting action...";
-      }
+      const globalFeedback = document.getElementById("action-feedback");
+      const targetFeedback = feedbackTargetId ? document.getElementById(feedbackTargetId) : null;
+      updateFeedback(globalFeedback, "Submitting action...", "");
+      updateFeedback(targetFeedback, "Submitting action...", "");
       try {
         const body = new URLSearchParams();
         if (id) {
@@ -493,21 +516,19 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
         const payload = await response.json().catch(function() { return {}; });
         if (!response.ok) {
           const message = payload && payload.message ? String(payload.message) : ("request failed: HTTP " + response.status);
-          if (feedback) {
-            feedback.textContent = message;
-          }
+          updateFeedback(globalFeedback, message, "error");
+          updateFeedback(targetFeedback, message, "error");
           return;
         }
-	        const message = payload && payload.message ? String(payload.message) : "ok";
-	        if (feedback) {
-	          feedback.textContent = message;
-	        }
-	        window.setTimeout(function() { window.location.reload(); }, 400);
-	      } catch (err) {
-	        if (feedback) {
-	          feedback.textContent = "request failed: " + String(err);
-	        }
-	      }
+        const message = payload && payload.message ? String(payload.message) : "ok";
+        updateFeedback(globalFeedback, message, "success");
+        updateFeedback(targetFeedback, message, "success");
+        window.setTimeout(function() { window.location.reload(); }, 400);
+      } catch (err) {
+        const message = "request failed: " + String(err);
+        updateFeedback(globalFeedback, message, "error");
+        updateFeedback(targetFeedback, message, "error");
+      }
     }
   </script>
 </body>

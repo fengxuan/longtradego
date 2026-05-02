@@ -427,6 +427,24 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 	if strings.Contains(homeBody, "Kill Port :8080") || strings.Contains(homeBody, daemonAdminWebhookKillPortPath) {
 		t.Fatalf("expected admin home to hide kill-port button, got: %s", homeBody)
 	}
+	if !strings.Contains(homeBody, `id="webhook-feedback"`) || !strings.Contains(homeBody, `id="booking-feedback"`) {
+		t.Fatalf("expected module feedback containers in admin home, got: %s", homeBody)
+	}
+	webhookSectionIndex := strings.Index(homeBody, "<h2>Webhook</h2>")
+	startWebhookIndex := strings.Index(homeBody, "Start Webhook")
+	stopWebhookIndex := strings.Index(homeBody, "Stop Webhook")
+	if webhookSectionIndex < 0 || startWebhookIndex < 0 || stopWebhookIndex < 0 {
+		t.Fatalf("expected webhook section and controls in admin home, got: %s", homeBody)
+	}
+	if startWebhookIndex < webhookSectionIndex || stopWebhookIndex < webhookSectionIndex {
+		t.Fatalf("expected webhook controls rendered inside webhook section, got: %s", homeBody)
+	}
+	if !strings.Contains(homeBody, "postAction('"+daemonAdminWebhookStartPath+"', '', '', false, 'webhook-feedback')") {
+		t.Fatalf("expected webhook start action targets webhook feedback area, got: %s", homeBody)
+	}
+	if !strings.Contains(homeBody, "postAction('"+daemonAdminWebhookStopPath+"', '', 'Stop current webhook process now?', true, 'webhook-feedback')") {
+		t.Fatalf("expected webhook stop action targets webhook feedback area, got: %s", homeBody)
+	}
 
 	statusResp, err := httpGetWithBasicAuth(baseURL+daemonAdminStatusPath, authConfig.Username, authConfig.Password)
 	if err != nil {

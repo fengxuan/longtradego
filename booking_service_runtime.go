@@ -304,6 +304,9 @@ func loadBookingAPIKeys(path string) ([]string, error) {
 	}
 	raw, err := os.ReadFile(trimmedPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("booking api keys config %s not found; copy conf-example/booking_api_keys.json to %s and set at least one key", trimmedPath, trimmedPath)
+		}
 		return nil, err
 	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
@@ -334,6 +337,30 @@ func loadBookingAPIKeys(path string) ([]string, error) {
 	}
 	sort.Strings(clean)
 	return clean, nil
+}
+
+func appendBookingServiceLogLine(logPath string, line string) {
+	trimmedPath := strings.TrimSpace(logPath)
+	trimmedLine := strings.TrimSpace(line)
+	if trimmedPath == "" || trimmedLine == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(trimmedPath), 0o755); err != nil {
+		return
+	}
+	file, err := os.OpenFile(trimmedPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	_, _ = fmt.Fprintf(file, "%s %s\n", time.Now().Format(time.RFC3339Nano), trimmedLine)
+}
+
+func appendBookingServiceStartFailureLog(logPath string, err error) {
+	if err == nil {
+		return
+	}
+	appendBookingServiceLogLine(logPath, fmt.Sprintf("booking service start failed: %v", err))
 }
 
 func loadBookingLLMConfig(path string) (bookingLLMConfig, error) {
@@ -563,18 +590,22 @@ func startBookingServiceInBackground(runtimePath string, logPath string, cfg *bo
 		return bookingServiceStartResult{}, fmt.Errorf("log path is empty")
 	}
 	if err := cfg.validate(); err != nil {
+		appendBookingServiceStartFailureLog(logPath, err)
 		return bookingServiceStartResult{}, err
 	}
 	if _, err := loadBookingAPIKeys(cfg.APIKeysPath); err != nil {
+		appendBookingServiceStartFailureLog(logPath, err)
 		return bookingServiceStartResult{}, err
 	}
 	authCfg, err := loadDaemonAdminAuthConfig(cfg.AdminAuthPath)
 	if err != nil {
+		appendBookingServiceStartFailureLog(logPath, err)
 		return bookingServiceStartResult{}, err
 	}
 
 	status, runtime, err := bookingRuntimeStatus(runtimePath)
 	if err != nil {
+		appendBookingServiceStartFailureLog(logPath, err)
 		return bookingServiceStartResult{}, err
 	}
 	if status == "running" {
@@ -598,6 +629,7 @@ func startBookingServiceInBackground(runtimePath string, logPath string, cfg *bo
 	for offset := 0; offset <= maxFallback; offset++ {
 		candidateAddr, addrErr := daemonAdminAddrWithPortOffset(cfg.Addr, offset)
 		if addrErr != nil {
+			appendBookingServiceStartFailureLog(logPath, addrErr)
 			return bookingServiceStartResult{}, addrErr
 		}
 		if err := ensureBookingAddrAvailable(candidateAddr); err != nil {
@@ -627,6 +659,7 @@ func startBookingServiceInBackground(runtimePath string, logPath string, cfg *bo
 		}
 		if err := writeBookingRuntimeState(runtimePath, runtimeInfo); err != nil {
 			_ = killProcessByPID(pid)
+			appendBookingServiceStartFailureLog(logPath, err)
 			return bookingServiceStartResult{}, err
 		}
 
@@ -646,7 +679,9 @@ func startBookingServiceInBackground(runtimePath string, logPath string, cfg *bo
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all booking service ports unavailable")
 	}
-	return bookingServiceStartResult{}, fmt.Errorf("booking service start failed: %w", lastErr)
+	startErr := fmt.Errorf("booking service start failed: %w", lastErr)
+	appendBookingServiceStartFailureLog(logPath, startErr)
+	return bookingServiceStartResult{}, startErr
 }
 
 func ensureBookingAddrAvailable(addr string) error {

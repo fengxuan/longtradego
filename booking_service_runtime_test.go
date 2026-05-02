@@ -276,6 +276,53 @@ func TestBookingServiceStartStopWithFallback(t *testing.T) {
 	}
 }
 
+func TestBookingServiceStartFailsWhenAPIKeysConfigMissing(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "booking_runtime.json")
+	logPath := filepath.Join(dir, "booking_service.log")
+	apiKeysPath := filepath.Join(dir, "booking_api_keys.json")
+	adminAuthPath := filepath.Join(dir, "admin_auth.json")
+
+	if err := os.WriteFile(adminAuthPath, []byte(`{"username":"admin","password":"secret"}`), 0o644); err != nil {
+		t.Fatalf("write admin auth failed: %v", err)
+	}
+
+	cfg := &bookingServiceServeConfig{
+		Addr:             "127.0.0.1:18081",
+		RuntimePath:      runtimePath,
+		CatalogPath:      filepath.Join(dir, "booking_catalog.json"),
+		ReservationsPath: filepath.Join(dir, "booking_reservations.json"),
+		DraftsPath:       filepath.Join(dir, "booking_intake_drafts.json"),
+		APIKeysPath:      apiKeysPath,
+		LLMConfigPath:    filepath.Join(dir, "booking_llm.json"),
+		AdminAuthPath:    adminAuthPath,
+		MaxPortFallback:  0,
+	}
+
+	_, err := startBookingServiceInBackground(runtimePath, logPath, cfg)
+	if err == nil {
+		t.Fatalf("expected booking start failure when api keys config missing")
+	}
+	if !strings.Contains(err.Error(), apiKeysPath) {
+		t.Fatalf("expected error includes missing api keys path %s, got %v", apiKeysPath, err)
+	}
+	if !strings.Contains(err.Error(), "copy conf-example/booking_api_keys.json") {
+		t.Fatalf("expected error includes copy hint, got %v", err)
+	}
+
+	rawLog, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatalf("read booking service log failed: %v", readErr)
+	}
+	logText := string(rawLog)
+	if !strings.Contains(logText, "booking service start failed:") {
+		t.Fatalf("expected booking service start failure log line, got %s", logText)
+	}
+	if !strings.Contains(logText, apiKeysPath) {
+		t.Fatalf("expected booking service log includes missing api keys path %s, got %s", apiKeysPath, logText)
+	}
+}
+
 func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	dir := t.TempDir()
 	runtimePath := filepath.Join(dir, "booking_runtime.json")
