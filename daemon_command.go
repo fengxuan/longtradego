@@ -388,25 +388,34 @@ func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.
 				fmt.Printf("daemon admin service unavailable: load auth config %s failed: %v\n", adminAuthPath, adminAuthErr)
 			} else {
 				adminSvc, adminErr := startDaemonAdminService(daemonAdminServiceOptions{
-					PreferredAddr:    defaultDaemonAdminAddr,
-					MaxPortFallback:  defaultDaemonAdminPortFallback,
-					RuntimePath:      defaultDaemonAdminRuntimePath(),
-					DaemonPID:        os.Getpid(),
-					DaemonSessionID:  daemonSessionID,
-					DaemonStartedAt:  daemonStartedAt,
-					Out:              daemonOut,
-					TaskManager:      taskManager,
-					MonitorMu:        &monitorMu,
-					Monitors:         monitors,
-					MonitorRecords:   monitorRecords,
-					SaveMonitorState: saveMonitorRecords,
-					StartMonitorByID: startMonitorByConfigID,
-					StartAllMonitors: startAllPausedMonitorConfigs,
-					WebhookOwnedMu:   &daemonWebhookMu,
-					WebhookOwnedPIDs: daemonWebhookPIDs,
-					WebhookRuntime:   defaultWebhookRuntimeStatePath(),
-					WebhookLogPath:   defaultWebhookServerLogPath(),
-					AuthConfig:       adminAuthConfig,
+					PreferredAddr:       defaultDaemonAdminAddr,
+					MaxPortFallback:     defaultDaemonAdminPortFallback,
+					RuntimePath:         defaultDaemonAdminRuntimePath(),
+					DaemonPID:           os.Getpid(),
+					DaemonSessionID:     daemonSessionID,
+					DaemonStartedAt:     daemonStartedAt,
+					Out:                 daemonOut,
+					TaskManager:         taskManager,
+					MonitorMu:           &monitorMu,
+					Monitors:            monitors,
+					MonitorRecords:      monitorRecords,
+					SaveMonitorState:    saveMonitorRecords,
+					StartMonitorByID:    startMonitorByConfigID,
+					StartAllMonitors:    startAllPausedMonitorConfigs,
+					WebhookOwnedMu:      &daemonWebhookMu,
+					WebhookOwnedPIDs:    daemonWebhookPIDs,
+					WebhookRuntime:      defaultWebhookRuntimeStatePath(),
+					WebhookLogPath:      defaultWebhookServerLogPath(),
+					BookingRuntime:      defaultBookingRuntimeStatePath(),
+					BookingLogPath:      defaultBookingServiceLogPath(),
+					BookingAddr:         defaultBookingServiceAddr,
+					BookingCatalog:      defaultBookingCatalogStatePath(),
+					BookingReservations: defaultBookingReservationsStatePath(),
+					BookingDrafts:       defaultBookingIntakeDraftsPath(),
+					BookingAPIKeys:      defaultBookingAPIKeysConfigPath(),
+					BookingLLMConfig:    defaultBookingLLMConfigPath(),
+					BookingAdminAuth:    defaultDaemonAdminAuthConfigPath(),
+					AuthConfig:          adminAuthConfig,
 				})
 				if adminErr != nil {
 					fmt.Printf("daemon admin service unavailable: %v\n", adminErr)
@@ -493,6 +502,10 @@ func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.
 				parsedArgs := pipelineCommands[0]
 				if rewritten, ok := rewriteDaemonWebhookServeToStart(parsedArgs); ok {
 					fmt.Println("daemon note: webhook serve is rewritten to background mode via webhook start")
+					parsedArgs = rewritten
+				}
+				if rewritten, ok := rewriteDaemonBookingServeToStart(parsedArgs); ok {
+					fmt.Println("daemon note: booking service serve is rewritten to background mode via booking service start")
 					parsedArgs = rewritten
 				}
 				first := strings.ToLower(parsedArgs[0])
@@ -1689,6 +1702,7 @@ var (
 		"admin",
 		"task",
 		"webhook",
+		"booking",
 		"monitor",
 		"version",
 		"upgrade",
@@ -1888,6 +1902,104 @@ var (
 		"check",
 		"help",
 	}
+	daemonBookingSubcommandCandidates = []string{
+		"product",
+		"slot",
+		"reservation",
+		"query",
+		"service",
+		"help",
+	}
+	daemonBookingGlobalFlagCandidates = []string{
+		"--catalog",
+		"--reservations",
+	}
+	daemonBookingProductSubcommandCandidates = []string{
+		"add",
+		"update",
+		"list",
+		"remove",
+	}
+	daemonBookingProductFlagCandidates = []string{
+		"--id",
+		"--name",
+		"--description",
+		"--enabled",
+	}
+	daemonBookingSlotSubcommandCandidates = []string{
+		"add",
+		"update",
+		"list",
+		"remove",
+	}
+	daemonBookingSlotUpsertFlagCandidates = []string{
+		"--id",
+		"--product-id",
+		"--start",
+		"--end",
+		"--capacity",
+		"--enabled",
+	}
+	daemonBookingSlotListFlagCandidates = []string{
+		"--product-id",
+		"--from",
+		"--to",
+		"--include-full",
+		"--include-disabled",
+	}
+	daemonBookingReservationSubcommandCandidates = []string{
+		"create",
+		"list",
+		"confirm",
+		"reject",
+		"cancel",
+	}
+	daemonBookingReservationCreateFlagCandidates = []string{
+		"--product-id",
+		"--slot-id",
+		"--user-id",
+		"--party-size",
+		"--contact-name",
+		"--contact-phone",
+		"--member",
+		"--special-requirements",
+	}
+	daemonBookingReservationListFlagCandidates = []string{
+		"--user-id",
+		"--status",
+	}
+	daemonBookingReservationActionFlagCandidates = []string{
+		"--note",
+	}
+	daemonBookingQueryFlagCandidates = []string{
+		"--product-id",
+		"--from",
+		"--to",
+		"--include-full",
+	}
+	daemonBookingServiceSubcommandCandidates = []string{
+		"start",
+		"stop",
+		"status",
+		"help",
+	}
+	daemonBookingServiceStartFlagCandidates = []string{
+		"--addr",
+		"--runtime",
+		"--log-file",
+		"--drafts",
+		"--api-keys",
+		"--llm-config",
+		"--admin-auth",
+		"--max-port-fallback",
+	}
+	daemonBookingServiceStopFlagCandidates = []string{
+		"--runtime",
+		"--timeout",
+	}
+	daemonBookingServiceStatusFlagCandidates = []string{
+		"--runtime",
+	}
 )
 
 func newDaemonCompleter() readline.AutoCompleter {
@@ -1922,6 +2034,8 @@ func daemonCompletionCandidates(segments [][]rune) [][]rune {
 		return monitorCompletionCandidates(stageParts)
 	case "webhook":
 		return webhookCompletionCandidates(stageParts)
+	case "booking":
+		return bookingCompletionCandidates(stageParts)
 	case "version":
 		return nil
 	case "upgrade":
@@ -2294,6 +2408,149 @@ func adminCompletionCandidates(parts []string) [][]rune {
 	return stringCandidatesToRunes([]string{"status", "help"})
 }
 
+func bookingCompletionCandidates(parts []string) [][]rune {
+	if len(parts) <= 2 {
+		candidates := append([]string{}, daemonBookingSubcommandCandidates...)
+		candidates = append(candidates, daemonBookingGlobalFlagCandidates...)
+		return stringCandidatesToRunes(candidates)
+	}
+
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	current := strings.TrimSpace(parts[len(parts)-1])
+	candidateWithGlobals := func(values []string) [][]rune {
+		candidates := append([]string{}, values...)
+		candidates = append(candidates, daemonBookingGlobalFlagCandidates...)
+		return stringCandidatesToRunes(candidates)
+	}
+
+	switch sub {
+	case "product":
+		if len(parts) <= 3 {
+			candidates := append([]string{}, daemonBookingProductSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingProductFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		productSub := strings.ToLower(strings.TrimSpace(parts[2]))
+		if productSub == "" || strings.HasPrefix(productSub, "--") {
+			candidates := append([]string{}, daemonBookingProductSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingProductFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		switch productSub {
+		case "add", "update":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingProductFlagCandidates)
+			}
+		}
+		return nil
+	case "slot":
+		if len(parts) <= 3 {
+			candidates := append([]string{}, daemonBookingSlotSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingSlotUpsertFlagCandidates...)
+			candidates = append(candidates, daemonBookingSlotListFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		slotSub := strings.ToLower(strings.TrimSpace(parts[2]))
+		if slotSub == "" || strings.HasPrefix(slotSub, "--") {
+			candidates := append([]string{}, daemonBookingSlotSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingSlotUpsertFlagCandidates...)
+			candidates = append(candidates, daemonBookingSlotListFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		switch slotSub {
+		case "add", "update":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingSlotUpsertFlagCandidates)
+			}
+		case "list":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingSlotListFlagCandidates)
+			}
+		case "remove":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return stringCandidatesToRunes([]string{"<slot-id>"})
+			}
+		}
+		return nil
+	case "reservation":
+		if len(parts) <= 3 {
+			candidates := append([]string{}, daemonBookingReservationSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingReservationCreateFlagCandidates...)
+			candidates = append(candidates, daemonBookingReservationListFlagCandidates...)
+			candidates = append(candidates, daemonBookingReservationActionFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		reservationSub := strings.ToLower(strings.TrimSpace(parts[2]))
+		if reservationSub == "" || strings.HasPrefix(reservationSub, "--") {
+			candidates := append([]string{}, daemonBookingReservationSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingReservationCreateFlagCandidates...)
+			candidates = append(candidates, daemonBookingReservationListFlagCandidates...)
+			candidates = append(candidates, daemonBookingReservationActionFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		switch reservationSub {
+		case "create":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingReservationCreateFlagCandidates)
+			}
+		case "list":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingReservationListFlagCandidates)
+			}
+		case "confirm", "reject", "cancel":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingReservationActionFlagCandidates)
+			}
+			if len(parts) <= 4 {
+				return stringCandidatesToRunes([]string{"<reservation-id>"})
+			}
+		}
+		return nil
+	case "query":
+		if current == "" || strings.HasPrefix(current, "--") {
+			return candidateWithGlobals(daemonBookingQueryFlagCandidates)
+		}
+		return nil
+	case "service":
+		if len(parts) <= 3 {
+			candidates := append([]string{}, daemonBookingServiceSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingServiceStartFlagCandidates...)
+			candidates = append(candidates, daemonBookingServiceStopFlagCandidates...)
+			candidates = append(candidates, daemonBookingServiceStatusFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		serviceSub := strings.ToLower(strings.TrimSpace(parts[2]))
+		if serviceSub == "" || strings.HasPrefix(serviceSub, "--") {
+			candidates := append([]string{}, daemonBookingServiceSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingServiceStartFlagCandidates...)
+			candidates = append(candidates, daemonBookingServiceStopFlagCandidates...)
+			candidates = append(candidates, daemonBookingServiceStatusFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		switch serviceSub {
+		case "start":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingServiceStartFlagCandidates)
+			}
+		case "stop":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingServiceStopFlagCandidates)
+			}
+		case "status":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingServiceStatusFlagCandidates)
+			}
+		}
+		return nil
+	case "help":
+		return nil
+	default:
+		candidates := append([]string{}, daemonBookingSubcommandCandidates...)
+		candidates = append(candidates, daemonBookingGlobalFlagCandidates...)
+		return stringCandidatesToRunes(candidates)
+	}
+}
+
 func upgradeCompletionCandidates(parts []string) [][]rune {
 	if len(parts) <= 2 {
 		candidates := append([]string{}, daemonUpgradeSubcommandCandidates...)
@@ -2328,6 +2585,24 @@ func rewriteDaemonWebhookServeToStart(args []string) ([]string, bool) {
 	rewritten = append(rewritten, "webhook", "start")
 	if len(args) > 2 {
 		rewritten = append(rewritten, args[2:]...)
+	}
+	return rewritten, true
+}
+
+func rewriteDaemonBookingServeToStart(args []string) ([]string, bool) {
+	if len(args) < 3 {
+		return nil, false
+	}
+	first := strings.ToLower(strings.TrimSpace(args[0]))
+	second := strings.ToLower(strings.TrimSpace(args[1]))
+	third := strings.ToLower(strings.TrimSpace(args[2]))
+	if first != "booking" || second != "service" || third != "serve" {
+		return nil, false
+	}
+	rewritten := make([]string, 0, len(args))
+	rewritten = append(rewritten, "booking", "service", "start")
+	if len(args) > 3 {
+		rewritten = append(rewritten, args[3:]...)
 	}
 	return rewritten, true
 }

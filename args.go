@@ -53,7 +53,7 @@ func inferCommandMetadata(args []string) (command string, symbols []string) {
 
 func isKnownCommandName(name string) bool {
 	switch name {
-	case "quote", "q", "email", "mail", "sys", "shell", "admin", "daemon", "d", "task", "webhook", "version", "upgrade", "help", "completion":
+	case "quote", "q", "email", "mail", "sys", "shell", "admin", "daemon", "d", "task", "webhook", "booking", "version", "upgrade", "help", "completion":
 		return true
 	default:
 		return false

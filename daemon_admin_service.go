@@ -28,20 +28,23 @@ const (
 	defaultDaemonAdminAddr         = ":18080"
 	defaultDaemonAdminPortFallback = 20
 
-	daemonAdminHomePath             = "/admin"
-	daemonAdminHomeSlash            = "/admin/"
-	daemonAdminStatusPath           = "/admin/status"
-	daemonAdminWebhookStartPath     = "/admin/webhook/start"
-	daemonAdminWebhookStopPath      = "/admin/webhook/stop"
-	daemonAdminWebhookKillPortPath  = "/admin/webhook/kill-port"
-	daemonAdminTaskGlobalPausePath  = "/admin/task/global-pause"
-	daemonAdminTaskGlobalResumePath = "/admin/task/global-resume"
-	daemonAdminTaskPausePath        = "/admin/task/pause"
-	daemonAdminTaskResumePath       = "/admin/task/resume"
-	daemonAdminMonitorStartPath     = "/admin/monitor/start"
-	daemonAdminMonitorStopPath      = "/admin/monitor/stop"
-	daemonAdminMonitorStartAllPath  = "/admin/monitor/start-all"
-	daemonAdminMonitorStopAllPath   = "/admin/monitor/stop-all"
+	daemonAdminHomePath                 = "/admin"
+	daemonAdminHomeSlash                = "/admin/"
+	daemonAdminStatusPath               = "/admin/status"
+	daemonAdminWebhookStartPath         = "/admin/webhook/start"
+	daemonAdminWebhookStopPath          = "/admin/webhook/stop"
+	daemonAdminWebhookKillPortPath      = "/admin/webhook/kill-port"
+	daemonAdminBookingServiceStatusPath = "/admin/booking/service/status"
+	daemonAdminBookingServiceStartPath  = "/admin/booking/service/start"
+	daemonAdminBookingServiceStopPath   = "/admin/booking/service/stop"
+	daemonAdminTaskGlobalPausePath      = "/admin/task/global-pause"
+	daemonAdminTaskGlobalResumePath     = "/admin/task/global-resume"
+	daemonAdminTaskPausePath            = "/admin/task/pause"
+	daemonAdminTaskResumePath           = "/admin/task/resume"
+	daemonAdminMonitorStartPath         = "/admin/monitor/start"
+	daemonAdminMonitorStopPath          = "/admin/monitor/stop"
+	daemonAdminMonitorStartAllPath      = "/admin/monitor/start-all"
+	daemonAdminMonitorStopAllPath       = "/admin/monitor/stop-all"
 )
 
 type daemonAdminRuntimeState struct {
@@ -62,28 +65,40 @@ type daemonAdminAuthConfig struct {
 }
 
 type daemonAdminServiceOptions struct {
-	PreferredAddr    string
-	MaxPortFallback  int
-	RuntimePath      string
-	DaemonPID        int
-	DaemonSessionID  string
-	DaemonStartedAt  time.Time
-	Out              io.Writer
-	TaskManager      *daemonTaskManager
-	MonitorMu        *sync.Mutex
-	Monitors         map[int]*daemonMonitorRuntime
-	MonitorRecords   map[string]daemonMonitorRecord
-	SaveMonitorState func() error
-	StartMonitorByID func(string) error
-	StartAllMonitors func() (int, error)
-	WebhookOwnedMu   *sync.Mutex
-	WebhookOwnedPIDs map[int]daemonOwnedWebhookRuntime
-	WebhookRuntime   string
-	WebhookLogPath   string
-	WebhookStartFn   func() (webhookStartResult, error)
-	WebhookStopFn    func() (webhookStopResult, error)
-	WebhookKillFn    func() (webhookKillPortResult, error)
-	AuthConfig       daemonAdminAuthConfig
+	PreferredAddr       string
+	MaxPortFallback     int
+	RuntimePath         string
+	DaemonPID           int
+	DaemonSessionID     string
+	DaemonStartedAt     time.Time
+	Out                 io.Writer
+	TaskManager         *daemonTaskManager
+	MonitorMu           *sync.Mutex
+	Monitors            map[int]*daemonMonitorRuntime
+	MonitorRecords      map[string]daemonMonitorRecord
+	SaveMonitorState    func() error
+	StartMonitorByID    func(string) error
+	StartAllMonitors    func() (int, error)
+	WebhookOwnedMu      *sync.Mutex
+	WebhookOwnedPIDs    map[int]daemonOwnedWebhookRuntime
+	WebhookRuntime      string
+	WebhookLogPath      string
+	WebhookStartFn      func() (webhookStartResult, error)
+	WebhookStopFn       func() (webhookStopResult, error)
+	WebhookKillFn       func() (webhookKillPortResult, error)
+	BookingStartFn      func() (bookingServiceStartResult, error)
+	BookingStopFn       func() (bookingServiceStopResult, error)
+	BookingStatusFn     func() (bookingServiceStatusResult, error)
+	BookingRuntime      string
+	BookingLogPath      string
+	BookingAddr         string
+	BookingCatalog      string
+	BookingReservations string
+	BookingDrafts       string
+	BookingAPIKeys      string
+	BookingLLMConfig    string
+	BookingAdminAuth    string
+	AuthConfig          daemonAdminAuthConfig
 }
 
 type daemonAdminService struct {
@@ -96,13 +111,14 @@ type daemonAdminService struct {
 }
 
 type daemonAdminStatusResponse struct {
-	Name    string                   `json:"name"`
-	Now     string                   `json:"now"`
-	Daemon  daemonAdminDaemonStatus  `json:"daemon"`
-	Admin   daemonAdminServiceStatus `json:"admin"`
-	Webhook daemonAdminWebhookStatus `json:"webhook"`
-	Task    daemonAdminTaskStatus    `json:"task"`
-	Monitor daemonAdminMonitorStatus `json:"monitor"`
+	Name    string                          `json:"name"`
+	Now     string                          `json:"now"`
+	Daemon  daemonAdminDaemonStatus         `json:"daemon"`
+	Admin   daemonAdminServiceStatus        `json:"admin"`
+	Webhook daemonAdminWebhookStatus        `json:"webhook"`
+	Booking daemonAdminBookingServiceStatus `json:"booking"`
+	Task    daemonAdminTaskStatus           `json:"task"`
+	Monitor daemonAdminMonitorStatus        `json:"monitor"`
 }
 
 type daemonAdminDaemonStatus struct {
@@ -127,6 +143,16 @@ type daemonAdminWebhookStatus struct {
 	Metrics    *webhookMetricsSnapshot `json:"metrics,omitempty"`
 	LogQueue   *webhookLogQueueDepth   `json:"log_queue_depth,omitempty"`
 	Message    string                  `json:"message,omitempty"`
+}
+
+type daemonAdminBookingServiceStatus struct {
+	Status  string                     `json:"status"`
+	Running bool                       `json:"running"`
+	PID     int                        `json:"pid,omitempty"`
+	Address string                     `json:"address,omitempty"`
+	URL     string                     `json:"url,omitempty"`
+	Message string                     `json:"message,omitempty"`
+	Runtime *bookingServiceRuntimeInfo `json:"runtime,omitempty"`
 }
 
 type daemonAdminTaskStatus struct {
@@ -163,25 +189,37 @@ type daemonAdminHomeView struct {
 }
 
 type daemonAdminController struct {
-	daemonPID        int
-	daemonSessionID  string
-	daemonStartedAt  time.Time
-	adminAddress     string
-	taskManager      *daemonTaskManager
-	monitorMu        *sync.Mutex
-	monitors         map[int]*daemonMonitorRuntime
-	monitorRecords   map[string]daemonMonitorRecord
-	saveMonitorState func() error
-	startMonitorByID func(string) error
-	startAllMonitors func() (int, error)
-	webhookOwnedMu   *sync.Mutex
-	webhookOwnedPIDs map[int]daemonOwnedWebhookRuntime
-	webhookRuntime   string
-	webhookLogPath   string
-	webhookStartFn   func() (webhookStartResult, error)
-	webhookStopFn    func() (webhookStopResult, error)
-	webhookKillFn    func() (webhookKillPortResult, error)
-	authConfig       daemonAdminAuthConfig
+	daemonPID           int
+	daemonSessionID     string
+	daemonStartedAt     time.Time
+	adminAddress        string
+	taskManager         *daemonTaskManager
+	monitorMu           *sync.Mutex
+	monitors            map[int]*daemonMonitorRuntime
+	monitorRecords      map[string]daemonMonitorRecord
+	saveMonitorState    func() error
+	startMonitorByID    func(string) error
+	startAllMonitors    func() (int, error)
+	webhookOwnedMu      *sync.Mutex
+	webhookOwnedPIDs    map[int]daemonOwnedWebhookRuntime
+	webhookRuntime      string
+	webhookLogPath      string
+	webhookStartFn      func() (webhookStartResult, error)
+	webhookStopFn       func() (webhookStopResult, error)
+	webhookKillFn       func() (webhookKillPortResult, error)
+	bookingStartFn      func() (bookingServiceStartResult, error)
+	bookingStopFn       func() (bookingServiceStopResult, error)
+	bookingStatusFn     func() (bookingServiceStatusResult, error)
+	bookingRuntime      string
+	bookingLogPath      string
+	bookingAddr         string
+	bookingCatalog      string
+	bookingReservations string
+	bookingDrafts       string
+	bookingAPIKeys      string
+	bookingLLMConfig    string
+	bookingAdminAuth    string
+	authConfig          daemonAdminAuthConfig
 }
 
 var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Parse(`<!DOCTYPE html>
@@ -314,6 +352,7 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
         <div class="kv"><div class="k">Admin Address</div><div class="v"><code>{{.Status.Admin.Address}}</code></div></div>
         <div class="kv"><div class="k">Admin URL</div><div class="v"><code>{{.Status.Admin.URL}}</code></div></div>
         <div class="kv"><div class="k">Webhook Status</div><div class="v"><code>{{.Status.Webhook.Status}}</code></div></div>
+        <div class="kv"><div class="k">Booking Status</div><div class="v"><code>{{.Status.Booking.Status}}</code></div></div>
       </div>
     </section>
 
@@ -342,6 +381,23 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
         </tbody>
       </table>
       {{end}}
+    </section>
+
+    <section class="panel">
+      <h2>Booking Service</h2>
+      <div class="toolbar">
+        <button type="button" onclick="postAction('` + daemonAdminBookingServiceStartPath + `', '', '', false)">Start Booking Service</button>
+        <button class="danger" type="button" onclick="postAction('` + daemonAdminBookingServiceStopPath + `', '', 'Stop current booking service now?', true)">Stop Booking Service</button>
+      </div>
+      <div class="status-grid">
+        <div class="kv"><div class="k">Running</div><div class="v">{{.Status.Booking.Running}}</div></div>
+        <div class="kv"><div class="k">Status</div><div class="v"><code>{{.Status.Booking.Status}}</code></div></div>
+        <div class="kv"><div class="k">PID</div><div class="v">{{.Status.Booking.PID}}</div></div>
+        <div class="kv"><div class="k">Address</div><div class="v"><code>{{.Status.Booking.Address}}</code></div></div>
+        <div class="kv"><div class="k">Admin URL</div><div class="v"><code>{{.Status.Booking.URL}}</code></div></div>
+      </div>
+      {{if .Status.Booking.Message}}<div class="hint">Message: <code>{{.Status.Booking.Message}}</code></div>{{end}}
+      <div class="hint">Service status API: <code>` + daemonAdminBookingServiceStatusPath + `</code></div>
     </section>
 
 	    <section class="panel">
@@ -620,23 +676,35 @@ func startDaemonAdminService(options daemonAdminServiceOptions) (*daemonAdminSer
 	}
 
 	controller := &daemonAdminController{
-		daemonPID:        options.DaemonPID,
-		daemonSessionID:  strings.TrimSpace(options.DaemonSessionID),
-		daemonStartedAt:  options.DaemonStartedAt,
-		taskManager:      options.TaskManager,
-		monitorMu:        options.MonitorMu,
-		monitors:         options.Monitors,
-		monitorRecords:   options.MonitorRecords,
-		saveMonitorState: options.SaveMonitorState,
-		startMonitorByID: options.StartMonitorByID,
-		startAllMonitors: options.StartAllMonitors,
-		webhookOwnedMu:   options.WebhookOwnedMu,
-		webhookOwnedPIDs: options.WebhookOwnedPIDs,
-		webhookRuntime:   strings.TrimSpace(options.WebhookRuntime),
-		webhookLogPath:   strings.TrimSpace(options.WebhookLogPath),
-		webhookStartFn:   options.WebhookStartFn,
-		webhookStopFn:    options.WebhookStopFn,
-		webhookKillFn:    options.WebhookKillFn,
+		daemonPID:           options.DaemonPID,
+		daemonSessionID:     strings.TrimSpace(options.DaemonSessionID),
+		daemonStartedAt:     options.DaemonStartedAt,
+		taskManager:         options.TaskManager,
+		monitorMu:           options.MonitorMu,
+		monitors:            options.Monitors,
+		monitorRecords:      options.MonitorRecords,
+		saveMonitorState:    options.SaveMonitorState,
+		startMonitorByID:    options.StartMonitorByID,
+		startAllMonitors:    options.StartAllMonitors,
+		webhookOwnedMu:      options.WebhookOwnedMu,
+		webhookOwnedPIDs:    options.WebhookOwnedPIDs,
+		webhookRuntime:      strings.TrimSpace(options.WebhookRuntime),
+		webhookLogPath:      strings.TrimSpace(options.WebhookLogPath),
+		webhookStartFn:      options.WebhookStartFn,
+		webhookStopFn:       options.WebhookStopFn,
+		webhookKillFn:       options.WebhookKillFn,
+		bookingStartFn:      options.BookingStartFn,
+		bookingStopFn:       options.BookingStopFn,
+		bookingStatusFn:     options.BookingStatusFn,
+		bookingRuntime:      strings.TrimSpace(options.BookingRuntime),
+		bookingLogPath:      strings.TrimSpace(options.BookingLogPath),
+		bookingAddr:         strings.TrimSpace(options.BookingAddr),
+		bookingCatalog:      strings.TrimSpace(options.BookingCatalog),
+		bookingReservations: strings.TrimSpace(options.BookingReservations),
+		bookingDrafts:       strings.TrimSpace(options.BookingDrafts),
+		bookingAPIKeys:      strings.TrimSpace(options.BookingAPIKeys),
+		bookingLLMConfig:    strings.TrimSpace(options.BookingLLMConfig),
+		bookingAdminAuth:    strings.TrimSpace(options.BookingAdminAuth),
 		authConfig: daemonAdminAuthConfig{
 			Username: strings.TrimSpace(options.AuthConfig.Username),
 			Password: strings.TrimSpace(options.AuthConfig.Password),
@@ -653,6 +721,33 @@ func startDaemonAdminService(options daemonAdminServiceOptions) (*daemonAdminSer
 	}
 	if controller.webhookLogPath == "" {
 		controller.webhookLogPath = defaultWebhookServerLogPath()
+	}
+	if controller.bookingRuntime == "" {
+		controller.bookingRuntime = defaultBookingRuntimeStatePath()
+	}
+	if controller.bookingLogPath == "" {
+		controller.bookingLogPath = defaultBookingServiceLogPath()
+	}
+	if controller.bookingAddr == "" {
+		controller.bookingAddr = defaultBookingServiceAddr
+	}
+	if controller.bookingCatalog == "" {
+		controller.bookingCatalog = defaultBookingCatalogStatePath()
+	}
+	if controller.bookingReservations == "" {
+		controller.bookingReservations = defaultBookingReservationsStatePath()
+	}
+	if controller.bookingDrafts == "" {
+		controller.bookingDrafts = defaultBookingIntakeDraftsPath()
+	}
+	if controller.bookingAPIKeys == "" {
+		controller.bookingAPIKeys = defaultBookingAPIKeysConfigPath()
+	}
+	if controller.bookingLLMConfig == "" {
+		controller.bookingLLMConfig = defaultBookingLLMConfigPath()
+	}
+	if controller.bookingAdminAuth == "" {
+		controller.bookingAdminAuth = defaultDaemonAdminAuthConfigPath()
 	}
 	if err := validateDaemonAdminAuthConfig(controller.authConfig); err != nil {
 		return nil, fmt.Errorf("daemon admin auth config invalid: %w", err)
@@ -802,10 +897,11 @@ func (c *daemonAdminController) registerHandlers(mux *http.ServeMux) {
 	if mux == nil {
 		return
 	}
-	handle := func(path string, handler http.HandlerFunc) {
+	handleAuth := func(path string, handler http.HandlerFunc) {
 		mux.HandleFunc(path, c.requireAuth(handler))
 	}
-	handle(daemonAdminHomePath, func(w http.ResponseWriter, r *http.Request) {
+
+	handleAuth(daemonAdminHomePath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -813,9 +909,13 @@ func (c *daemonAdminController) registerHandlers(mux *http.ServeMux) {
 		status := c.buildStatus()
 		renderDaemonAdminHome(w, daemonAdminHomeView{Status: status})
 	})
-	handle(daemonAdminHomeSlash, func(w http.ResponseWriter, r *http.Request) {
+	handleAuth(daemonAdminHomeSlash, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if strings.TrimSpace(r.URL.Path) != daemonAdminHomeSlash {
+			http.NotFound(w, r)
 			return
 		}
 		target := daemonAdminHomePath
@@ -824,16 +924,31 @@ func (c *daemonAdminController) registerHandlers(mux *http.ServeMux) {
 		}
 		http.Redirect(w, r, target, http.StatusPermanentRedirect)
 	})
-	handle(daemonAdminStatusPath, func(w http.ResponseWriter, r *http.Request) {
+	handleAuth(daemonAdminStatusPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		writeDaemonAdminJSON(w, http.StatusOK, c.buildStatus())
 	})
+	handleAuth(daemonAdminBookingServiceStatusPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		result, err := c.bookingServiceStatus()
+		if err != nil {
+			writeDaemonAdminJSON(w, daemonAdminActionHTTPStatus(err), map[string]any{
+				"status":  "error",
+				"message": err.Error(),
+			})
+			return
+		}
+		writeDaemonAdminJSON(w, http.StatusOK, result)
+	})
 
 	register := func(path string, handler func(*http.Request) (any, error)) {
-		handle(path, func(w http.ResponseWriter, r *http.Request) {
+		handleAuth(path, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -905,6 +1020,12 @@ func (c *daemonAdminController) registerHandlers(mux *http.ServeMux) {
 	register(daemonAdminMonitorStopAllPath, func(r *http.Request) (any, error) {
 		return c.monitorStopAll()
 	})
+	register(daemonAdminBookingServiceStartPath, func(r *http.Request) (any, error) {
+		return c.bookingServiceStart()
+	})
+	register(daemonAdminBookingServiceStopPath, func(r *http.Request) (any, error) {
+		return c.bookingServiceStop()
+	})
 }
 
 func (c *daemonAdminController) requireAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -946,6 +1067,117 @@ func daemonAdminRequestID(r *http.Request) string {
 	return strings.TrimSpace(r.URL.Query().Get("id"))
 }
 
+type daemonBookingProductUpsertRequest struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Enabled     *bool  `json:"enabled,omitempty"`
+}
+
+type daemonBookingSlotUpsertRequest struct {
+	ID        string `json:"id"`
+	ProductID string `json:"product_id"`
+	StartAt   string `json:"start_at"`
+	EndAt     string `json:"end_at"`
+	Capacity  *int   `json:"capacity,omitempty"`
+	Enabled   *bool  `json:"enabled,omitempty"`
+}
+
+type daemonBookingCreateReservationRequest struct {
+	ProductID           string                      `json:"product_id"`
+	SlotID              string                      `json:"slot_id"`
+	UserID              string                      `json:"user_id"`
+	PartySize           int                         `json:"party_size"`
+	Personnel           bookingReservationPersonnel `json:"personnel"`
+	SpecialRequirements string                      `json:"special_requirements"`
+}
+
+type daemonBookingReservationActionRequest struct {
+	ID   string `json:"id"`
+	Note string `json:"note"`
+}
+
+func parseDaemonBookingCatalogQuery(r *http.Request) (bookingCatalogQuery, error) {
+	if r == nil {
+		return bookingCatalogQuery{}, bookingValidationf("request is required")
+	}
+	query := bookingCatalogQuery{
+		ProductID: strings.TrimSpace(r.URL.Query().Get("product_id")),
+	}
+
+	fromRaw := strings.TrimSpace(r.URL.Query().Get("from"))
+	if fromRaw != "" {
+		from, err := parseBookingRFC3339(fromRaw, "from")
+		if err != nil {
+			return bookingCatalogQuery{}, err
+		}
+		query.From = &from
+	}
+	toRaw := strings.TrimSpace(r.URL.Query().Get("to"))
+	if toRaw != "" {
+		to, err := parseBookingRFC3339(toRaw, "to")
+		if err != nil {
+			return bookingCatalogQuery{}, err
+		}
+		query.To = &to
+	}
+	includeFullRaw := strings.TrimSpace(r.URL.Query().Get("include_full"))
+	if includeFullRaw != "" {
+		value, err := strconv.ParseBool(includeFullRaw)
+		if err != nil {
+			return bookingCatalogQuery{}, bookingValidationf("invalid include_full value %q", includeFullRaw)
+		}
+		query.IncludeFull = value
+	}
+	return query, nil
+}
+
+func decodeDaemonAdminJSONBody(r *http.Request, payload any) error {
+	if r == nil {
+		return bookingValidationf("request is required")
+	}
+	if payload == nil {
+		return bookingValidationf("request payload target is required")
+	}
+	if r.Body == nil {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, defaultWebhookMaxBodyBytes))
+	if err != nil {
+		return bookingValidationf("read request body failed: %v", err)
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil
+	}
+	if err := json.Unmarshal(raw, payload); err != nil {
+		return bookingValidationf("invalid json body: %v", err)
+	}
+	return nil
+}
+
+func daemonBookingRoutePath(path string) bool {
+	trimmed := strings.TrimSpace(path)
+	return strings.HasPrefix(trimmed, "/admin/booking/")
+}
+
+func daemonBookingHTTPStatus(err error) int {
+	if err == nil {
+		return http.StatusOK
+	}
+	if isBookingConflictError(err) {
+		return http.StatusConflict
+	}
+	if isBookingValidationError(err) {
+		return http.StatusBadRequest
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(message, "required") || strings.Contains(message, "invalid") || strings.Contains(message, "not found") || strings.Contains(message, "missing") {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
 func daemonAdminActionHTTPStatus(err error) int {
 	if err == nil {
 		return http.StatusOK
@@ -970,6 +1202,9 @@ func (c *daemonAdminController) buildStatus() daemonAdminStatusResponse {
 		Admin: daemonAdminServiceStatus{
 			Address: c.adminAddress,
 			URL:     defaultDaemonAdminURL(c.adminAddress),
+		},
+		Booking: daemonAdminBookingServiceStatus{
+			Status: "stopped",
 		},
 		Task:    daemonAdminTaskStatus{Tasks: []daemonAdminTaskView{}},
 		Monitor: daemonAdminMonitorStatus{Monitors: []daemonMonitorSnapshot{}},
@@ -1008,6 +1243,27 @@ func (c *daemonAdminController) buildStatus() daemonAdminStatusResponse {
 			default:
 				status.Monitor.Scheduled++
 			}
+		}
+	}
+
+	bookingResult, bookingErr := c.bookingServiceStatus()
+	if bookingErr != nil {
+		status.Booking = daemonAdminBookingServiceStatus{
+			Status:  "error",
+			Running: false,
+			Message: bookingErr.Error(),
+		}
+	} else {
+		status.Booking = daemonAdminBookingServiceStatus{
+			Status:  bookingResult.Status,
+			Running: bookingResult.Running,
+			URL:     strings.TrimSpace(bookingResult.URL),
+			Message: strings.TrimSpace(bookingResult.Message),
+			Runtime: bookingResult.Runtime,
+		}
+		if bookingResult.Runtime != nil {
+			status.Booking.PID = bookingResult.Runtime.PID
+			status.Booking.Address = bookingResult.Runtime.Address
 		}
 	}
 
@@ -1210,6 +1466,38 @@ func (c *daemonAdminController) monitorStopAll() (map[string]any, error) {
 	return map[string]any{"status": "stopped", "count": stopped}, nil
 }
 
+func (c *daemonAdminController) bookingServiceStatus() (bookingServiceStatusResult, error) {
+	if c.bookingStatusFn != nil {
+		return c.bookingStatusFn()
+	}
+	return bookingServiceStatus(c.bookingRuntime)
+}
+
+func (c *daemonAdminController) bookingServiceStart() (bookingServiceStartResult, error) {
+	if c.bookingStartFn != nil {
+		return c.bookingStartFn()
+	}
+	cfg := &bookingServiceServeConfig{
+		Addr:             c.bookingAddr,
+		RuntimePath:      c.bookingRuntime,
+		CatalogPath:      c.bookingCatalog,
+		ReservationsPath: c.bookingReservations,
+		DraftsPath:       c.bookingDrafts,
+		APIKeysPath:      c.bookingAPIKeys,
+		LLMConfigPath:    c.bookingLLMConfig,
+		AdminAuthPath:    c.bookingAdminAuth,
+		MaxPortFallback:  defaultBookingServicePortFallback,
+	}
+	return startBookingServiceInBackground(c.bookingRuntime, c.bookingLogPath, cfg)
+}
+
+func (c *daemonAdminController) bookingServiceStop() (bookingServiceStopResult, error) {
+	if c.bookingStopFn != nil {
+		return c.bookingStopFn()
+	}
+	return stopBookingService(c.bookingRuntime, defaultBookingServiceStopTimeout)
+}
+
 func (c *daemonAdminController) trackWebhookLifecycle(args []string, result any) {
 	if c.webhookOwnedMu == nil || c.webhookOwnedPIDs == nil {
 		return
@@ -1262,6 +1550,9 @@ func daemonAdminRoutes() []string {
 		daemonAdminWebhookStartPath,
 		daemonAdminWebhookStopPath,
 		daemonAdminWebhookKillPortPath,
+		daemonAdminBookingServiceStatusPath,
+		daemonAdminBookingServiceStartPath,
+		daemonAdminBookingServiceStopPath,
 		daemonAdminTaskGlobalPausePath,
 		daemonAdminTaskGlobalResumePath,
 		daemonAdminTaskPausePath,
