@@ -1,1 +1,0 @@
-test/email_receive_command_test.go
