@@ -19,6 +19,7 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 - `webhook` command for signature generation, test sending, managed lifecycle (`start/status/stop/kill-port`), and management endpoints (`/admin`, `/healthz`, `/readyz`, `/admin/webhook/status`, `/metrics`, `/admin/webhook/stop`)
 - `booking` command for product/slot/reservation/query management and independent service lifecycle (`booking service start/status/stop`)
 - Unified external security key config (`conf/security_keys.json`, scopes: `booking` / `webhook`)
+- Cloudflare Named Tunnel example config for booking-only public exposure (`conf-example/cloudflared_booking_tunnel.yml`)
 - `admin` command for daemon-admin runtime inspection (`admin status`)
 - Daemon scheduled task management (`task add/list/pause/resume/global-pause/global-resume/remove`)
 - Daemon task persistence across restarts (`conf/daemon_tasks.json`)
@@ -53,6 +54,7 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 - `args.go`: argument normalization and symbol parsing
 - `app_context.go`: shared app state and Longbridge config bootstrap
 - `command_log.go`: JSON lines command logs and file rotation
+- `scripts/booking_public_start.sh`: start booking service for stable public tunnel origin (`127.0.0.1:18081`, no port fallback)
 
 ## Requirements
 
@@ -699,6 +701,14 @@ go run . booking service start --llm-config conf/booking_llm.json
 
 Flag compatibility: prefer `--security-keys`; legacy `--api-keys` is still accepted.
 
+For public exposure via Cloudflare Tunnel, use fixed origin address and disable port fallback:
+
+```bash
+go run . booking service start --addr 127.0.0.1:18081 --max-port-fallback 0 --security-keys conf/security_keys.json
+# or helper script
+./scripts/booking_public_start.sh
+```
+
 Booking service security config (fail-closed on missing/invalid config):
 
 - `conf/security_keys.json` (unified external tokens, scopes: `booking` / `webhook`)
@@ -806,6 +816,77 @@ HTTP semantics:
 - `/admin/booking/*` requires Basic Auth (`conf/admin_auth.json`).
 - Action endpoints are POST-only (`405` on wrong method).
 - Validation errors return `400`; capacity conflicts return `409`.
+
+### Expose Booking Public APIs via Cloudflare Named Tunnel
+
+This setup exposes only `/booking/*` and blocks `/admin/*` at tunnel ingress level.
+
+1. Start booking service on fixed local origin:
+
+```bash
+./scripts/booking_public_start.sh
+```
+
+2. Create a remotely-managed Cloudflare Tunnel and a hostname (for example `booking-api.<your-domain>`), mapped to:
+
+```text
+http://127.0.0.1:18081
+```
+
+3. Configure ingress rules (order matters: block admin -> allow booking -> deny all):
+
+```yaml
+ingress:
+  - hostname: booking-api.example.com
+    path: ^/admin(/.*)?$
+    service: http_status:403
+  - hostname: booking-api.example.com
+    path: ^/booking(/.*)?$
+    service: http://127.0.0.1:18081
+  - hostname: booking-api.example.com
+    service: http_status:404
+  - service: http_status:404
+```
+
+Template file: `conf-example/cloudflared_booking_tunnel.yml`.
+
+4. Run `cloudflared` as service (token mode), for example:
+
+```bash
+sudo cloudflared service install <TUNNEL_TOKEN>
+sudo systemctl enable --now cloudflared
+sudo systemctl status cloudflared
+```
+
+5. Client integration:
+
+- Public base URL: `https://booking-api.<your-domain>`
+- Keep using the same signed headers and algorithm from [Public API Signing Guide](#public-api-signing-guide).
+- Legacy `X-Booking-API-Key` remains compatible, but new integrations should use unified signed headers.
+
+6. Verification checklist:
+
+```bash
+# admin path should be blocked by tunnel ingress
+curl -i https://booking-api.<your-domain>/admin/booking/status
+
+# unknown path should return 404
+curl -i https://booking-api.<your-domain>/not-allowed
+```
+
+For signed booking endpoint checks, reuse the JS/Python helper methods in [Public API Signing Guide](#public-api-signing-guide) and only replace URL with:
+
+```text
+https://booking-api.<your-domain>/booking/intents/parse
+```
+
+7. Rollback:
+
+```bash
+sudo systemctl stop cloudflared
+```
+
+This removes public ingress immediately while keeping local booking service running.
 
 Daemon admin auth config (`conf/admin_auth.json`, hash-first):
 
