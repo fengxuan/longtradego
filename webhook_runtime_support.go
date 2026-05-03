@@ -26,13 +26,17 @@ const (
 	defaultWebhookMetricsWindowSize      = 2048
 	defaultWebhookManagementHTTPTimeout  = 500 * time.Millisecond
 
-	webhookHealthzPath     = "/healthz"
-	webhookReadyzPath      = "/readyz"
-	webhookMetricsPath     = "/metrics"
+	webhookHealthzPath     = "/admin/healthz"
+	webhookReadyzPath      = "/admin/readyz"
+	webhookMetricsPath     = "/admin/metrics"
 	webhookAdminHomePath   = "/admin"
 	webhookAdminHomeSlash  = "/admin/"
 	webhookAdminStatusPath = "/admin/webhook/status"
 	webhookAdminStopPath   = "/admin/webhook/stop"
+
+	legacyWebhookHealthzPath = "/healthz"
+	legacyWebhookReadyzPath  = "/readyz"
+	legacyWebhookMetricsPath = "/metrics"
 )
 
 type webhookTokenFinder func(thirdPartyID string) (webhookTokenRecord, bool, error)
@@ -66,6 +70,8 @@ type webhookAdminStatusResponse struct {
 	Now           string                  `json:"now"`
 	UptimeSeconds int64                   `json:"uptime_seconds"`
 	Address       string                  `json:"address"`
+	PublicAddress string                  `json:"public_address,omitempty"`
+	AdminAddress  string                  `json:"admin_address,omitempty"`
 	Path          string                  `json:"path"`
 	RouteCount    int                     `json:"route_count"`
 	Routes        []webhookRouteSummary   `json:"routes"`
@@ -955,15 +961,21 @@ func appendWebhookAuditLogAsync(writer *webhookAsyncLineWriter, entry webhookAud
 
 func validateWebhookManagementPathConflicts(routes []webhookResolvedRoute) error {
 	reserved := map[string]struct{}{
-		webhookHealthzPath:     {},
-		webhookReadyzPath:      {},
-		webhookMetricsPath:     {},
-		webhookAdminHomePath:   {},
-		webhookAdminHomeSlash:  {},
-		webhookAdminStatusPath: {},
-		webhookAdminStopPath:   {},
+		webhookHealthzPath:       {},
+		webhookReadyzPath:        {},
+		webhookMetricsPath:       {},
+		legacyWebhookHealthzPath: {},
+		legacyWebhookReadyzPath:  {},
+		legacyWebhookMetricsPath: {},
+		webhookAdminHomePath:     {},
+		webhookAdminHomeSlash:    {},
+		webhookAdminStatusPath:   {},
+		webhookAdminStopPath:     {},
 	}
 	for _, route := range routes {
+		if strings.HasPrefix(route.Record.Path, "/admin") {
+			return fmt.Errorf("route path %s conflicts with reserved admin namespace", route.Record.Path)
+		}
 		if _, exists := reserved[route.Record.Path]; exists {
 			return fmt.Errorf("route path %s conflicts with reserved management endpoint", route.Record.Path)
 		}
@@ -1005,7 +1017,9 @@ func registerWebhookManagementHandlers(
 			Name:          "longtradego webhook",
 			Now:           nowFn().Format(time.RFC3339Nano),
 			UptimeSeconds: int64(uptime.Seconds()),
-			Address:       cfg.Addr,
+			Address:       cfg.PublicAddr,
+			PublicAddress: cfg.PublicAddr,
+			AdminAddress:  cfg.AdminAddr,
 			Path:          cfg.Path,
 			RouteCount:    len(summaries),
 			Routes:        summaries,

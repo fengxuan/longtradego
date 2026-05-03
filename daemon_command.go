@@ -430,6 +430,7 @@ func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.
 					BookingRuntime:      defaultBookingRuntimeStatePath(),
 					BookingLogPath:      defaultBookingServiceLogPath(),
 					BookingAddr:         defaultBookingServiceAddr,
+					BookingAdminAddr:    defaultBookingServiceAdminAddr,
 					BookingCatalog:      defaultBookingCatalogStatePath(),
 					BookingReservations: defaultBookingReservationsStatePath(),
 					BookingDrafts:       defaultBookingIntakeDraftsPath(),
@@ -1819,6 +1820,8 @@ var (
 	}
 	daemonWebhookServeFlagCandidates = []string{
 		"--addr",
+		"--public-addr",
+		"--admin-addr",
 		"--path",
 		"--routes-file",
 		"--security-keys",
@@ -1839,6 +1842,8 @@ var (
 	}
 	daemonWebhookStartFlagCandidates = []string{
 		"--addr",
+		"--public-addr",
+		"--admin-addr",
 		"--path",
 		"--routes-file",
 		"--security-keys",
@@ -2013,6 +2018,8 @@ var (
 	}
 	daemonBookingServiceStartFlagCandidates = []string{
 		"--addr",
+		"--public-addr",
+		"--admin-addr",
 		"--runtime",
 		"--log-file",
 		"--drafts",

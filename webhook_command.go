@@ -34,6 +34,7 @@ const (
 	webhookEventLogFile        = "webhook_events.json"
 
 	defaultWebhookServeAddr      = ":8080"
+	defaultWebhookAdminAddr      = "127.0.0.1:8081"
 	defaultWebhookServePath      = "/webhook/events"
 	defaultWebhookTimestampSkew  = 5 * time.Minute
 	defaultWebhookMaxBodyBytes   = int64(1024 * 1024)
@@ -67,6 +68,8 @@ type webhookTokenRecord struct {
 type webhookRuntimeInfo struct {
 	PID                int    `json:"pid"`
 	Address            string `json:"address"`
+	PublicAddress      string `json:"public_address,omitempty"`
+	AdminAddress       string `json:"admin_address,omitempty"`
 	Path               string `json:"path"`
 	TokenStore         string `json:"token_store"`
 	EventLog           string `json:"event_log"`
@@ -145,6 +148,8 @@ type webhookDebugPipelineResult struct {
 type webhookServeResult struct {
 	Mode          string                `json:"mode"`
 	Address       string                `json:"address"`
+	PublicAddress string                `json:"public_address,omitempty"`
+	AdminAddress  string                `json:"admin_address,omitempty"`
 	Path          string                `json:"path"`
 	TokenStore    string                `json:"token_store"`
 	EventLog      string                `json:"event_log"`
@@ -242,6 +247,8 @@ type webhookServeOptions struct {
 
 type webhookServeConfig struct {
 	Addr                     string
+	PublicAddr               string
+	AdminAddr                string
 	Path                     string
 	RuntimePath              string
 	RoutesPath               string
@@ -389,10 +396,12 @@ func newWebhookServeCommand(app *appContext) *cobra.Command {
 			startedAt := time.Now()
 			runtimePath := strings.TrimSpace(os.Getenv(webhookServeRuntimePathEnv))
 
-			app.SetExecution("webhook", []string{"serve", cfg.Addr, cfg.Path})
+			app.SetExecution("webhook", []string{"serve", cfg.PublicAddr, cfg.Path})
 			app.SetResult(webhookServeResult{
 				Mode:          "serve",
-				Address:       cfg.Addr,
+				Address:       cfg.PublicAddr,
+				PublicAddress: cfg.PublicAddr,
+				AdminAddress:  cfg.AdminAddr,
 				Path:          cfg.Path,
 				TokenStore:    cfg.TokenStore,
 				EventLog:      cfg.EventLogPath,
@@ -403,9 +412,24 @@ func newWebhookServeCommand(app *appContext) *cobra.Command {
 				TimestampSkew: cfg.TimeSkew.String(),
 			})
 
-			mux := http.NewServeMux()
+			publicListener, err := net.Listen("tcp", cfg.PublicAddr)
+			if err != nil {
+				return err
+			}
+			adminListener, err := net.Listen("tcp", cfg.AdminAddr)
+			if err != nil {
+				_ = publicListener.Close()
+				return err
+			}
+			cfg.PublicAddr = webhookListenerAddress(publicListener)
+			cfg.AdminAddr = webhookListenerAddress(adminListener)
+			cfg.Addr = cfg.PublicAddr
+
+			publicMux := http.NewServeMux()
+			adminMux := http.NewServeMux()
 			var (
-				server       *http.Server
+				publicServer *http.Server
+				adminServer  *http.Server
 				shutdownOnce sync.Once
 			)
 			requestShutdown := func(source string) {
@@ -415,15 +439,17 @@ func newWebhookServeCommand(app *appContext) *cobra.Command {
 					} else if removed {
 						fmt.Printf("webhook runtime state removed on shutdown source=%s\n", source)
 					}
-					if server == nil {
-						return
-					}
 					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer cancel()
-					_ = server.Shutdown(shutdownCtx)
+					if publicServer != nil {
+						_ = publicServer.Shutdown(shutdownCtx)
+					}
+					if adminServer != nil {
+						_ = adminServer.Shutdown(shutdownCtx)
+					}
 				})
 			}
-			registerWebhookManagementHandlers(mux, cfg, routes, metrics, tokenCache, eventLogWriter, auditLogWriter, startedAt, requestShutdown)
+			registerWebhookManagementHandlers(adminMux, cfg, routes, metrics, tokenCache, eventLogWriter, auditLogWriter, startedAt, requestShutdown)
 
 			tokenFinder := func(thirdPartyID string) (webhookTokenRecord, bool, error) {
 				return tokenCache.Find(thirdPartyID)
@@ -456,16 +482,21 @@ func newWebhookServeCommand(app *appContext) *cobra.Command {
 					AuditLogAppender:   auditAppender,
 					Metrics:            metrics,
 				})
-				mux.Handle(route.Record.Path, handler)
+				publicMux.Handle(route.Record.Path, handler)
 			}
 
-			server = &http.Server{
-				Addr:              cfg.Addr,
-				Handler:           mux,
+			publicServer = &http.Server{
+				Addr:              cfg.PublicAddr,
+				Handler:           publicMux,
+				ReadHeaderTimeout: 5 * time.Second,
+			}
+			adminServer = &http.Server{
+				Addr:              cfg.AdminAddr,
+				Handler:           adminMux,
 				ReadHeaderTimeout: 5 * time.Second,
 			}
 
-			fmt.Printf("Webhook server listening on %s (routes=%d)\n", cfg.Addr, len(routes))
+			fmt.Printf("Webhook server listening on public=%s admin=%s (routes=%d)\n", cfg.PublicAddr, cfg.AdminAddr, len(routes))
 			for _, route := range routes {
 				fmt.Printf("  - %s %s mode=%s\n", route.Record.ID, route.Record.Path, route.Mode)
 			}
@@ -475,9 +506,30 @@ func newWebhookServeCommand(app *appContext) *cobra.Command {
 				requestShutdown("context_done")
 			}()
 
-			err = server.ListenAndServe()
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				return err
+			serveErrCh := make(chan error, 2)
+			serveOnce := func(server *http.Server, listener net.Listener) {
+				go func() {
+					serveErr := server.Serve(listener)
+					if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+						serveErrCh <- serveErr
+						return
+					}
+					serveErrCh <- nil
+				}()
+			}
+			serveOnce(publicServer, publicListener)
+			serveOnce(adminServer, adminListener)
+
+			var firstErr error
+			for index := 0; index < 2; index++ {
+				serveErr := <-serveErrCh
+				if serveErr != nil && firstErr == nil {
+					firstErr = serveErr
+					requestShutdown("serve_error")
+				}
+			}
+			if firstErr != nil {
+				return firstErr
 			}
 			return nil
 		},
@@ -519,10 +571,17 @@ func newWebhookStartCommand(app *appContext) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			app.SetExecution("webhook", []string{"start", cfg.Addr, cfg.Path})
+			app.SetExecution("webhook", []string{"start", cfg.PublicAddr, cfg.Path})
 			app.SetResult(result)
 			if result.Runtime != nil {
-				fmt.Printf("webhook %s: pid=%d addr=%s path=%s\n", result.Status, result.Runtime.PID, result.Runtime.Address, result.Runtime.Path)
+				fmt.Printf(
+					"webhook %s: pid=%d public=%s admin=%s path=%s\n",
+					result.Status,
+					result.Runtime.PID,
+					webhookRuntimePublicAddress(result.Runtime),
+					webhookRuntimeAdminAddress(result.Runtime),
+					result.Runtime.Path,
+				)
 			} else {
 				fmt.Printf("webhook %s\n", result.Status)
 			}
@@ -553,11 +612,12 @@ func newWebhookStatusCommand(app *appContext) *cobra.Command {
 			app.SetResult(result)
 			if result.Runtime != nil {
 				base := fmt.Sprintf(
-					"webhook status=%s running=%t pid=%d addr=%s path=%s routes=%d queue(pending=%d retrying=%d dead=%d)",
+					"webhook status=%s running=%t pid=%d public=%s admin=%s path=%s routes=%d queue(pending=%d retrying=%d dead=%d)",
 					result.Status,
 					result.Running,
 					result.Runtime.PID,
-					result.Runtime.Address,
+					webhookRuntimePublicAddress(result.Runtime),
+					webhookRuntimeAdminAddress(result.Runtime),
 					result.Runtime.Path,
 					result.RouteCount,
 					result.Dispatch.Pending,
@@ -966,7 +1026,9 @@ func newWebhookDebugPipelineCommand(app *appContext) *cobra.Command {
 }
 
 func bindWebhookServeFlags(cmd *cobra.Command, cfg *webhookServeConfig) {
-	cmd.Flags().StringVar(&cfg.Addr, "addr", defaultWebhookServeAddr, "Listen address, e.g. :8080")
+	cmd.Flags().StringVar(&cfg.PublicAddr, "public-addr", defaultWebhookServeAddr, "Public listen address, e.g. :8080")
+	cmd.Flags().StringVar(&cfg.PublicAddr, "addr", defaultWebhookServeAddr, "Public listen address (legacy alias of --public-addr)")
+	cmd.Flags().StringVar(&cfg.AdminAddr, "admin-addr", defaultWebhookAdminAddr, "Admin listen address, e.g. 127.0.0.1:8081")
 	cmd.Flags().StringVar(&cfg.Path, "path", defaultWebhookServePath, "Webhook endpoint path")
 	cmd.Flags().StringVar(&cfg.RoutesPath, "routes-file", defaultWebhookRouteStatePath(), "Path to webhook route definitions JSON")
 	cmd.Flags().StringVar(&cfg.TokenStore, "security-keys", "", "Path to unified security keys JSON")
@@ -989,6 +1051,8 @@ func bindWebhookServeFlags(cmd *cobra.Command, cfg *webhookServeConfig) {
 func newWebhookServeConfig() *webhookServeConfig {
 	return &webhookServeConfig{
 		Addr:                     defaultWebhookServeAddr,
+		PublicAddr:               defaultWebhookServeAddr,
+		AdminAddr:                defaultWebhookAdminAddr,
 		Path:                     defaultWebhookServePath,
 		RoutesPath:               defaultWebhookRouteStatePath(),
 		TokenStore:               "",
@@ -1012,6 +1076,18 @@ func newWebhookServeConfig() *webhookServeConfig {
 func (c *webhookServeConfig) validate() error {
 	c.Path = ensureWebhookPath(c.Path)
 	c.Addr = strings.TrimSpace(c.Addr)
+	c.PublicAddr = strings.TrimSpace(c.PublicAddr)
+	c.AdminAddr = strings.TrimSpace(c.AdminAddr)
+	if c.PublicAddr == "" {
+		c.PublicAddr = c.Addr
+	}
+	if c.PublicAddr == "" {
+		c.PublicAddr = defaultWebhookServeAddr
+	}
+	c.Addr = c.PublicAddr
+	if c.AdminAddr == "" {
+		c.AdminAddr = defaultWebhookAdminAddr
+	}
 	c.RuntimePath = strings.TrimSpace(c.RuntimePath)
 	c.RoutesPath = strings.TrimSpace(c.RoutesPath)
 	c.TokenStore = strings.TrimSpace(c.TokenStore)
@@ -1027,8 +1103,11 @@ func (c *webhookServeConfig) validate() error {
 	}
 	c.TokenStore = resolvedSecurityPath
 	c.LegacyTokenStore = resolvedSecurityPath
-	if c.Addr == "" {
-		return fmt.Errorf("addr is required")
+	if c.PublicAddr == "" {
+		return fmt.Errorf("public-addr is required")
+	}
+	if c.AdminAddr == "" {
+		return fmt.Errorf("admin-addr is required")
 	}
 	if c.TimeSkew <= 0 {
 		return fmt.Errorf("timestamp-skew must be > 0")
@@ -1105,12 +1184,23 @@ func startWebhookInBackground(runtimePath string, logPath string, cfg *webhookSe
 	if status == "stale" {
 		_ = removeWebhookRuntimeState(runtimePath)
 	}
-	if err := ensureWebhookAddrAvailable(cfg.Addr); err != nil {
+	if err := ensureWebhookAddrAvailable(cfg.PublicAddr); err != nil {
 		if errors.Is(err, errWebhookAddrAlreadyInUse) {
 			return webhookStartResult{
 				Mode:    "start",
 				Status:  "already_running",
-				Message: fmt.Sprintf("webhook address %s is already in use; another service may be running on this port", cfg.Addr),
+				Message: fmt.Sprintf("webhook public address %s is already in use; another service may be running on this port", cfg.PublicAddr),
+				LogPath: logPath,
+			}, nil
+		}
+		return webhookStartResult{}, err
+	}
+	if err := ensureWebhookAddrAvailable(cfg.AdminAddr); err != nil {
+		if errors.Is(err, errWebhookAddrAlreadyInUse) {
+			return webhookStartResult{
+				Mode:    "start",
+				Status:  "already_running",
+				Message: fmt.Sprintf("webhook admin address %s is already in use; another service may be running on this port", cfg.AdminAddr),
 				LogPath: logPath,
 			}, nil
 		}
@@ -1127,7 +1217,9 @@ func startWebhookInBackground(runtimePath string, logPath string, cfg *webhookSe
 	now := time.Now().Format(time.RFC3339Nano)
 	runtime := webhookRuntimeInfo{
 		PID:                pid,
-		Address:            cfg.Addr,
+		Address:            cfg.PublicAddr,
+		PublicAddress:      cfg.PublicAddr,
+		AdminAddress:       cfg.AdminAddr,
 		Path:               cfg.Path,
 		TokenStore:         cfg.TokenStore,
 		EventLog:           cfg.EventLogPath,
@@ -1204,7 +1296,7 @@ func verifyWebhookBackgroundStart(cfg *webhookServeConfig, pid int) error {
 			return fmt.Errorf("webhook process exited before becoming ready")
 		}
 
-		if _, err := fetchWebhookAdminStatus(cfg.Addr, defaultWebhookManagementHTTPTimeout); err == nil {
+		if _, err := fetchWebhookAdminStatus(cfg.AdminAddr, defaultWebhookManagementHTTPTimeout); err == nil {
 			return nil
 		} else {
 			lastAdminErr = err
@@ -1271,8 +1363,9 @@ func killProcessByPID(pid int) error {
 }
 
 func buildWebhookServeArgs(cfg *webhookServeConfig) []string {
-	args := make([]string, 0, 32)
-	args = append(args, "--addr", cfg.Addr)
+	args := make([]string, 0, 34)
+	args = append(args, "--public-addr", cfg.PublicAddr)
+	args = append(args, "--admin-addr", cfg.AdminAddr)
 	args = append(args, "--path", cfg.Path)
 	args = append(args, "--routes-file", cfg.RoutesPath)
 	args = append(args, "--security-keys", cfg.TokenStore)
@@ -1356,7 +1449,7 @@ func webhookStatus(runtimePath string) (webhookStatusResult, error) {
 	result.Dispatch = stats
 
 	if status == "running" && runtime != nil {
-		adminStatus, adminErr := fetchWebhookAdminStatus(runtime.Address, defaultWebhookManagementHTTPTimeout)
+		adminStatus, adminErr := fetchWebhookAdminStatus(webhookRuntimeAdminAddress(runtime), defaultWebhookManagementHTTPTimeout)
 		if adminErr == nil {
 			metrics := adminStatus.Metrics
 			queueDepth := adminStatus.LogQueueDepth
@@ -1695,6 +1788,21 @@ func ensureWebhookPath(path string) string {
 		return trimmed
 	}
 	return "/" + trimmed
+}
+
+func webhookListenerAddress(listener net.Listener) string {
+	if listener == nil {
+		return ""
+	}
+	actualAddr := listener.Addr().String()
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		host := "127.0.0.1"
+		if tcpAddr.IP != nil && !tcpAddr.IP.IsUnspecified() {
+			host = tcpAddr.IP.String()
+		}
+		actualAddr = net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port))
+	}
+	return actualAddr
 }
 
 func resolveWebhookTimestamp(raw string, now time.Time) (string, error) {
@@ -2622,8 +2730,20 @@ func readWebhookRuntimeState(path string) (*webhookRuntimeInfo, bool, error) {
 	if err := json.Unmarshal(raw, &state); err != nil {
 		return nil, false, err
 	}
-	if state.Runtime.PID == 0 && strings.TrimSpace(state.Runtime.Address) == "" {
+	if state.Runtime.PID == 0 &&
+		strings.TrimSpace(state.Runtime.Address) == "" &&
+		strings.TrimSpace(state.Runtime.PublicAddress) == "" &&
+		strings.TrimSpace(state.Runtime.AdminAddress) == "" {
 		return nil, false, nil
+	}
+	state.Runtime.Address = strings.TrimSpace(state.Runtime.Address)
+	state.Runtime.PublicAddress = strings.TrimSpace(state.Runtime.PublicAddress)
+	state.Runtime.AdminAddress = strings.TrimSpace(state.Runtime.AdminAddress)
+	if state.Runtime.PublicAddress == "" {
+		state.Runtime.PublicAddress = state.Runtime.Address
+	}
+	if state.Runtime.Address == "" {
+		state.Runtime.Address = state.Runtime.PublicAddress
 	}
 	state.Runtime.Path = ensureWebhookPath(state.Runtime.Path)
 	return &state.Runtime, true, nil
@@ -2633,6 +2753,15 @@ func writeWebhookRuntimeState(path string, runtime webhookRuntimeInfo) error {
 	trimmedPath := strings.TrimSpace(path)
 	if trimmedPath == "" {
 		return fmt.Errorf("runtime path is empty")
+	}
+	runtime.Address = strings.TrimSpace(runtime.Address)
+	runtime.PublicAddress = strings.TrimSpace(runtime.PublicAddress)
+	runtime.AdminAddress = strings.TrimSpace(runtime.AdminAddress)
+	if runtime.PublicAddress == "" {
+		runtime.PublicAddress = runtime.Address
+	}
+	if runtime.Address == "" {
+		runtime.Address = runtime.PublicAddress
 	}
 	runtime.Path = ensureWebhookPath(runtime.Path)
 	if strings.TrimSpace(runtime.UpdatedAt) == "" {
@@ -2647,6 +2776,28 @@ func writeWebhookRuntimeState(path string, runtime webhookRuntimeInfo) error {
 		return err
 	}
 	return writeFileAtomic(trimmedPath, append(data, '\n'), 0o644)
+}
+
+func webhookRuntimePublicAddress(runtime *webhookRuntimeInfo) string {
+	if runtime == nil {
+		return ""
+	}
+	publicAddr := strings.TrimSpace(runtime.PublicAddress)
+	if publicAddr != "" {
+		return publicAddr
+	}
+	return strings.TrimSpace(runtime.Address)
+}
+
+func webhookRuntimeAdminAddress(runtime *webhookRuntimeInfo) string {
+	if runtime == nil {
+		return ""
+	}
+	adminAddr := strings.TrimSpace(runtime.AdminAddress)
+	if adminAddr != "" {
+		return adminAddr
+	}
+	return strings.TrimSpace(runtime.Address)
 }
 
 func migrateWebhookRuntimeStateIfNeeded(path string) error {

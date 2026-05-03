@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -132,9 +133,10 @@ func TestBookingPublicAuthFailureReasons(t *testing.T) {
 		},
 		nowFn: func() time.Time { return now },
 	}
-	mux := http.NewServeMux()
-	controller.registerHandlers(mux)
-	server := httptest.NewServer(mux)
+	publicMux := http.NewServeMux()
+	adminMux := http.NewServeMux()
+	controller.registerHandlers(publicMux, adminMux)
+	server := httptest.NewServer(publicMux)
 	defer server.Close()
 
 	noKeyResp, err := http.Get(server.URL + bookingPublicCatalogPath)
@@ -282,6 +284,7 @@ func TestBookingSignedAuthTokenHotReloadWithoutRestart(t *testing.T) {
 
 	handle, err := startBookingHTTPService(context.Background(), &bookingServiceServeConfig{
 		Addr:             "127.0.0.1:0",
+		AdminAddr:        "127.0.0.1:0",
 		RuntimePath:      runtimePath,
 		CatalogPath:      catalogPath,
 		ReservationsPath: reservationsPath,
@@ -302,14 +305,14 @@ func TestBookingSignedAuthTokenHotReloadWithoutRestart(t *testing.T) {
 	if err != nil || !exists || runtime == nil {
 		t.Fatalf("read runtime failed: %v runtime=%+v", err, runtime)
 	}
-	baseURL := "http://" + runtime.Address
+	publicBaseURL := "http://" + bookingRuntimePublicAddress(runtime)
 
 	callSignedParseStatus := func(token string) (int, string) {
 		t.Helper()
 		body := `{"user_id":"u-1","channel":"chat","content":"hot reload test"}`
 		timestampText := strconv.FormatInt(time.Now().UTC().Unix(), 10)
 		signature := computeWebhookSignature(thirdPartyID, timestampText, token, []byte(body))
-		req, _ := http.NewRequest(http.MethodPost, baseURL+bookingPublicIntentParsePath, strings.NewReader(body))
+		req, _ := http.NewRequest(http.MethodPost, publicBaseURL+bookingPublicIntentParsePath, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set(webhookHeaderThirdPartyID, thirdPartyID)
 		req.Header.Set(webhookHeaderTimestamp, timestampText)
@@ -508,6 +511,7 @@ func TestBookingServiceServeConfigDefaultsIncludeLLMConfig(t *testing.T) {
 func TestBuildBookingServiceServeArgsIncludesLLMConfig(t *testing.T) {
 	cfg := &bookingServiceServeConfig{
 		Addr:             "127.0.0.1:18081",
+		AdminAddr:        "127.0.0.1:18082",
 		RuntimePath:      "/tmp/runtime.json",
 		CatalogPath:      "/tmp/catalog.json",
 		ReservationsPath: "/tmp/reservations.json",
@@ -562,6 +566,7 @@ func TestBookingServiceStartStopWithFallback(t *testing.T) {
 
 	cfg := &bookingServiceServeConfig{
 		Addr:             baseAddr,
+		AdminAddr:        "127.0.0.1:" + pickFreePort(t),
 		RuntimePath:      runtimePath,
 		CatalogPath:      catalogPath,
 		ReservationsPath: reservationsPath,
@@ -637,6 +642,7 @@ func TestBookingServiceStartWithOwnerClaimWritesRuntimeOwner(t *testing.T) {
 
 	cfg := &bookingServiceServeConfig{
 		Addr:             "127.0.0.1:" + pickFreePort(t),
+		AdminAddr:        "127.0.0.1:" + pickFreePort(t),
 		RuntimePath:      runtimePath,
 		CatalogPath:      catalogPath,
 		ReservationsPath: reservationsPath,
@@ -694,6 +700,7 @@ func TestBookingServiceStartFailsWhenAPIKeysConfigMissing(t *testing.T) {
 
 	cfg := &bookingServiceServeConfig{
 		Addr:             "127.0.0.1:18081",
+		AdminAddr:        "127.0.0.1:18082",
 		RuntimePath:      runtimePath,
 		CatalogPath:      filepath.Join(dir, "booking_catalog.json"),
 		ReservationsPath: filepath.Join(dir, "booking_reservations.json"),
@@ -767,6 +774,7 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 
 	cfg := &bookingServiceServeConfig{
 		Addr:             "127.0.0.1:0",
+		AdminAddr:        "127.0.0.1:0",
 		RuntimePath:      runtimePath,
 		CatalogPath:      catalogPath,
 		ReservationsPath: reservationsPath,
@@ -805,9 +813,10 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	if !exists || runtime == nil {
 		t.Fatalf("expected runtime after service start")
 	}
-	baseURL := "http://" + runtime.Address
+	publicBaseURL := "http://" + bookingRuntimePublicAddress(runtime)
+	adminBaseURL := "http://" + bookingRuntimeAdminAddress(runtime)
 
-	unauthCatalogResp, err := http.Get(baseURL + bookingPublicCatalogPath)
+	unauthCatalogResp, err := http.Get(publicBaseURL + bookingPublicCatalogPath)
 	if err != nil {
 		t.Fatalf("GET catalog without key failed: %v", err)
 	}
@@ -817,7 +826,7 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	}
 	_ = unauthCatalogResp.Body.Close()
 
-	authCatalogReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingPublicCatalogPath, nil)
+	authCatalogReq, _ := http.NewRequest(http.MethodGet, publicBaseURL+bookingPublicCatalogPath, nil)
 	authCatalogReq.Header.Set(bookingHeaderAPIKey, "booking-key")
 	authCatalogResp, err := http.DefaultClient.Do(authCatalogReq)
 	if err != nil {
@@ -830,7 +839,7 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	_ = authCatalogResp.Body.Close()
 
 	parseBody := `{"user_id":"u-1","content":"我想预定明天两个人"}`
-	parseReq, _ := http.NewRequest(http.MethodPost, baseURL+bookingPublicIntentParsePath, strings.NewReader(parseBody))
+	parseReq, _ := http.NewRequest(http.MethodPost, publicBaseURL+bookingPublicIntentParsePath, strings.NewReader(parseBody))
 	parseReq.Header.Set("Content-Type", "application/json")
 	parseReq.Header.Set(bookingHeaderAPIKey, "booking-key")
 	parseResp, err := http.DefaultClient.Do(parseReq)
@@ -855,7 +864,7 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	}
 
 	confirmBody := `{"draft_id":"` + draftID + `","slot_id":"slot-1"}`
-	confirmReq, _ := http.NewRequest(http.MethodPost, baseURL+bookingPublicIntentConfirmPath, strings.NewReader(confirmBody))
+	confirmReq, _ := http.NewRequest(http.MethodPost, publicBaseURL+bookingPublicIntentConfirmPath, strings.NewReader(confirmBody))
 	confirmReq.Header.Set("Content-Type", "application/json")
 	confirmReq.Header.Set(bookingHeaderAPIKey, "booking-key")
 	confirmResp, err := http.DefaultClient.Do(confirmReq)
@@ -870,7 +879,7 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 		t.Fatalf("expected pending reservation in confirm response: %s", confirmRespBody)
 	}
 
-	reservationsReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingPublicReservationsPath+"?user_id=u-1&status=pending", nil)
+	reservationsReq, _ := http.NewRequest(http.MethodGet, publicBaseURL+bookingPublicReservationsPath+"?user_id=u-1&status=pending", nil)
 	reservationsReq.Header.Set(bookingHeaderAPIKey, "booking-key")
 	reservationsResp, err := http.DefaultClient.Do(reservationsReq)
 	if err != nil {
@@ -884,7 +893,17 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 		t.Fatalf("expected reservation id in reservation list: %s", reservationsBody)
 	}
 
-	adminStatusResp, err := http.Get(baseURL + bookingAdminStatusPath)
+	adminHomeResp, err := http.Get(adminBaseURL + bookingAdminHomePath)
+	if err != nil {
+		t.Fatalf("GET booking admin home without auth failed: %v", err)
+	}
+	if adminHomeResp.StatusCode != http.StatusUnauthorized {
+		body := readAllAndClose(t, adminHomeResp)
+		t.Fatalf("expected booking admin home 401 without basic auth, got %d body=%s", adminHomeResp.StatusCode, body)
+	}
+	_ = adminHomeResp.Body.Close()
+
+	adminStatusResp, err := http.Get(adminBaseURL + bookingAdminStatusPath)
 	if err != nil {
 		t.Fatalf("GET booking admin status without auth failed: %v", err)
 	}
@@ -894,7 +913,7 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	}
 	_ = adminStatusResp.Body.Close()
 
-	adminStatusReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	adminStatusReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingAdminStatusPath, nil)
 	adminStatusReq.SetBasicAuth("admin", "secret")
 	adminStatusRespOK, err := http.DefaultClient.Do(adminStatusReq)
 	if err != nil {
@@ -906,7 +925,71 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	}
 	_ = adminStatusRespOK.Body.Close()
 
-	adminActionReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminProductUpsertPath, nil)
+	adminHomeReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingAdminHomePath, nil)
+	adminHomeReq.SetBasicAuth("admin", "secret")
+	adminHomeRespOK, err := http.DefaultClient.Do(adminHomeReq)
+	if err != nil {
+		t.Fatalf("GET booking admin home with auth failed: %v", err)
+	}
+	if adminHomeRespOK.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, adminHomeRespOK)
+		t.Fatalf("expected booking admin home 200 with auth, got %d body=%s", adminHomeRespOK.StatusCode, body)
+	}
+	adminHomeContentType := adminHomeRespOK.Header.Get("Content-Type")
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(adminHomeContentType)), "text/html") {
+		t.Fatalf("expected booking admin home text/html content-type, got %q", adminHomeContentType)
+	}
+	adminHomeBody := readAllAndClose(t, adminHomeRespOK)
+	for _, snippet := range []string{
+		"Booking Admin Home",
+		"Refresh Page",
+		bookingAdminReservationConfirmPath,
+		bookingAdminReservationRejectPath,
+		bookingAdminReservationCancelPath,
+		bookingAdminStopPath,
+	} {
+		if !strings.Contains(adminHomeBody, snippet) {
+			t.Fatalf("expected booking admin home contains %q", snippet)
+		}
+	}
+
+	publicAdminReq, _ := http.NewRequest(http.MethodGet, publicBaseURL+bookingAdminStatusPath, nil)
+	publicAdminReq.SetBasicAuth("admin", "secret")
+	publicAdminResp, err := http.DefaultClient.Do(publicAdminReq)
+	if err != nil {
+		t.Fatalf("GET public booking admin endpoint failed: %v", err)
+	}
+	if publicAdminResp.StatusCode != http.StatusNotFound {
+		body := readAllAndClose(t, publicAdminResp)
+		t.Fatalf("expected public booking admin endpoint 404, got %d body=%s", publicAdminResp.StatusCode, body)
+	}
+	_ = publicAdminResp.Body.Close()
+
+	publicAdminHomeReq, _ := http.NewRequest(http.MethodGet, publicBaseURL+bookingAdminHomePath, nil)
+	publicAdminHomeReq.SetBasicAuth("admin", "secret")
+	publicAdminHomeResp, err := http.DefaultClient.Do(publicAdminHomeReq)
+	if err != nil {
+		t.Fatalf("GET public booking admin home endpoint failed: %v", err)
+	}
+	if publicAdminHomeResp.StatusCode != http.StatusNotFound {
+		body := readAllAndClose(t, publicAdminHomeResp)
+		t.Fatalf("expected public booking admin home endpoint 404, got %d body=%s", publicAdminHomeResp.StatusCode, body)
+	}
+	_ = publicAdminHomeResp.Body.Close()
+
+	adminPublicReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingPublicCatalogPath, nil)
+	adminPublicReq.Header.Set(bookingHeaderAPIKey, "booking-key")
+	adminPublicResp, err := http.DefaultClient.Do(adminPublicReq)
+	if err != nil {
+		t.Fatalf("GET admin listener booking public endpoint failed: %v", err)
+	}
+	if adminPublicResp.StatusCode != http.StatusNotFound {
+		body := readAllAndClose(t, adminPublicResp)
+		t.Fatalf("expected booking public endpoint on admin listener 404, got %d body=%s", adminPublicResp.StatusCode, body)
+	}
+	_ = adminPublicResp.Body.Close()
+
+	adminActionReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingAdminProductUpsertPath, nil)
 	adminActionReq.SetBasicAuth("admin", "secret")
 	adminActionResp, err := http.DefaultClient.Do(adminActionReq)
 	if err != nil {
@@ -917,6 +1000,127 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 		t.Fatalf("expected booking admin action GET 405, got %d body=%s", adminActionResp.StatusCode, body)
 	}
 	_ = adminActionResp.Body.Close()
+}
+
+func TestBookingAdminHomeSlashRedirectKeepsQuery(t *testing.T) {
+	dir := t.TempDir()
+	controller := &bookingServiceController{
+		service: newBookingService(
+			filepath.Join(dir, "booking_catalog.json"),
+			filepath.Join(dir, "booking_reservations.json"),
+		),
+		authConfig: daemonAdminAuthConfig{
+			Username: "admin",
+			Password: "secret",
+		},
+		nowFn: time.Now,
+	}
+	publicMux := http.NewServeMux()
+	adminMux := http.NewServeMux()
+	controller.registerHandlers(publicMux, adminMux)
+	server := httptest.NewServer(adminMux)
+	defer server.Close()
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, server.URL+bookingAdminHomeSlash+"?from=test", nil)
+	if err != nil {
+		t.Fatalf("build GET /admin/ request failed: %v", err)
+	}
+	req.SetBasicAuth("admin", "secret")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /admin/?from=test failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusPermanentRedirect {
+		t.Fatalf("expected /admin/ redirect 308, got %d", resp.StatusCode)
+	}
+	location := strings.TrimSpace(resp.Header.Get("Location"))
+	if location != bookingAdminHomePath+"?from=test" {
+		t.Fatalf("expected redirect location %q, got %q", bookingAdminHomePath+"?from=test", location)
+	}
+	_ = resp.Body.Close()
+}
+
+func TestBookingAdminStopEndpointTriggersShutdownOnce(t *testing.T) {
+	dir := t.TempDir()
+	triggerCh := make(chan string, 2)
+	controller := &bookingServiceController{
+		service: newBookingService(
+			filepath.Join(dir, "booking_catalog.json"),
+			filepath.Join(dir, "booking_reservations.json"),
+		),
+		authConfig: daemonAdminAuthConfig{
+			Username: "admin",
+			Password: "secret",
+		},
+		nowFn: time.Now,
+		requestShutdown: func(source string) {
+			triggerCh <- source
+		},
+	}
+	publicMux := http.NewServeMux()
+	adminMux := http.NewServeMux()
+	controller.registerHandlers(publicMux, adminMux)
+	server := httptest.NewServer(adminMux)
+	defer server.Close()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	for i := 0; i < 2; i++ {
+		req, err := http.NewRequest(http.MethodPost, server.URL+bookingAdminStopPath, nil)
+		if err != nil {
+			t.Fatalf("build POST /admin/booking/stop failed: %v", err)
+		}
+		req.SetBasicAuth("admin", "secret")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST /admin/booking/stop failed: %v", err)
+		}
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected POST /admin/booking/stop 202, got %d", resp.StatusCode)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode stop response failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		if strings.TrimSpace(fmt.Sprintf("%v", payload["status"])) != "stopping" {
+			t.Fatalf("expected stop response status=stopping, got %#v", payload["status"])
+		}
+	}
+
+	select {
+	case source := <-triggerCh:
+		if source != "admin_stop" {
+			t.Fatalf("expected shutdown source admin_stop, got %q", source)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("expected admin stop callback to be triggered")
+	}
+
+	select {
+	case source := <-triggerCh:
+		t.Fatalf("expected admin stop callback only once, got extra source=%q", source)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	getReq, err := http.NewRequest(http.MethodGet, server.URL+bookingAdminStopPath, nil)
+	if err != nil {
+		t.Fatalf("build GET /admin/booking/stop failed: %v", err)
+	}
+	getReq.SetBasicAuth("admin", "secret")
+	getResp, err := client.Do(getReq)
+	if err != nil {
+		t.Fatalf("GET /admin/booking/stop failed: %v", err)
+	}
+	if getResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected GET /admin/booking/stop 405, got %d", getResp.StatusCode)
+	}
+	_ = getResp.Body.Close()
 }
 
 func TestStartBookingHTTPServiceAdminAuthSupportsPasswordHash(t *testing.T) {
@@ -945,6 +1149,7 @@ func TestStartBookingHTTPServiceAdminAuthSupportsPasswordHash(t *testing.T) {
 
 	handle, err := startBookingHTTPService(context.Background(), &bookingServiceServeConfig{
 		Addr:             "127.0.0.1:0",
+		AdminAddr:        "127.0.0.1:0",
 		RuntimePath:      runtimePath,
 		CatalogPath:      catalogPath,
 		ReservationsPath: reservationsPath,
@@ -967,9 +1172,9 @@ func TestStartBookingHTTPServiceAdminAuthSupportsPasswordHash(t *testing.T) {
 	if !exists || runtime == nil {
 		t.Fatalf("expected runtime after service start")
 	}
-	baseURL := "http://" + runtime.Address
+	adminBaseURL := "http://" + bookingRuntimeAdminAddress(runtime)
 
-	okReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	okReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingAdminStatusPath, nil)
 	okReq.SetBasicAuth("admin", "hash-secret")
 	okResp, err := http.DefaultClient.Do(okReq)
 	if err != nil {
@@ -981,7 +1186,7 @@ func TestStartBookingHTTPServiceAdminAuthSupportsPasswordHash(t *testing.T) {
 	}
 	_ = okResp.Body.Close()
 
-	badReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	badReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingAdminStatusPath, nil)
 	badReq.SetBasicAuth("admin", "wrong-secret")
 	badResp, err := http.DefaultClient.Do(badReq)
 	if err != nil {
@@ -1019,6 +1224,7 @@ func TestStartBookingHTTPServiceReloadsAdminAuthConfigWithoutRestart(t *testing.
 
 	handle, err := startBookingHTTPService(context.Background(), &bookingServiceServeConfig{
 		Addr:             "127.0.0.1:0",
+		AdminAddr:        "127.0.0.1:0",
 		RuntimePath:      runtimePath,
 		CatalogPath:      catalogPath,
 		ReservationsPath: reservationsPath,
@@ -1040,9 +1246,9 @@ func TestStartBookingHTTPServiceReloadsAdminAuthConfigWithoutRestart(t *testing.
 	if !exists || runtime == nil {
 		t.Fatalf("expected runtime after service start")
 	}
-	baseURL := "http://" + runtime.Address
+	adminBaseURL := "http://" + bookingRuntimeAdminAddress(runtime)
 
-	oldReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	oldReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingAdminStatusPath, nil)
 	oldReq.SetBasicAuth("admin", "old-secret")
 	oldResp, err := http.DefaultClient.Do(oldReq)
 	if err != nil {
@@ -1065,7 +1271,7 @@ func TestStartBookingHTTPServiceReloadsAdminAuthConfigWithoutRestart(t *testing.
 		t.Fatalf("write updated booking admin auth failed: %v", err)
 	}
 
-	oldAfterReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	oldAfterReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingAdminStatusPath, nil)
 	oldAfterReq.SetBasicAuth("admin", "old-secret")
 	oldAfterResp, err := http.DefaultClient.Do(oldAfterReq)
 	if err != nil {
@@ -1077,7 +1283,7 @@ func TestStartBookingHTTPServiceReloadsAdminAuthConfigWithoutRestart(t *testing.
 	}
 	_ = oldAfterResp.Body.Close()
 
-	newReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	newReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingAdminStatusPath, nil)
 	newReq.SetBasicAuth("admin", "new-secret")
 	newResp, err := http.DefaultClient.Do(newReq)
 	if err != nil {
@@ -1118,6 +1324,7 @@ func TestBookingIntentParseLLMUnavailable(t *testing.T) {
 
 	handle, err := startBookingHTTPService(context.Background(), &bookingServiceServeConfig{
 		Addr:             "127.0.0.1:0",
+		AdminAddr:        "127.0.0.1:0",
 		RuntimePath:      runtimePath,
 		CatalogPath:      catalogPath,
 		ReservationsPath: reservationsPath,
@@ -1138,7 +1345,8 @@ func TestBookingIntentParseLLMUnavailable(t *testing.T) {
 		t.Fatalf("read runtime failed: %v runtime=%+v", err, runtime)
 	}
 
-	catalogReq, _ := http.NewRequest(http.MethodGet, "http://"+runtime.Address+bookingPublicCatalogPath, nil)
+	publicBaseURL := "http://" + bookingRuntimePublicAddress(runtime)
+	catalogReq, _ := http.NewRequest(http.MethodGet, publicBaseURL+bookingPublicCatalogPath, nil)
 	catalogReq.Header.Set(bookingHeaderAPIKey, "booking-key")
 	catalogResp, err := http.DefaultClient.Do(catalogReq)
 	if err != nil {
@@ -1149,7 +1357,7 @@ func TestBookingIntentParseLLMUnavailable(t *testing.T) {
 		t.Fatalf("expected catalog still available when llm config missing, got %d body=%s", catalogResp.StatusCode, catalogBody)
 	}
 
-	parseReq, _ := http.NewRequest(http.MethodPost, "http://"+runtime.Address+bookingPublicIntentParsePath, strings.NewReader(`{"user_id":"u-1","content":"test"}`))
+	parseReq, _ := http.NewRequest(http.MethodPost, publicBaseURL+bookingPublicIntentParsePath, strings.NewReader(`{"user_id":"u-1","content":"test"}`))
 	parseReq.Header.Set("Content-Type", "application/json")
 	parseReq.Header.Set(bookingHeaderAPIKey, "booking-key")
 	parseResp, err := http.DefaultClient.Do(parseReq)
@@ -1261,6 +1469,7 @@ func TestBookingIntentParseAutoContinueDraft(t *testing.T) {
 
 	handle, err := startBookingHTTPService(context.Background(), &bookingServiceServeConfig{
 		Addr:             "127.0.0.1:0",
+		AdminAddr:        "127.0.0.1:0",
 		RuntimePath:      runtimePath,
 		CatalogPath:      catalogPath,
 		ReservationsPath: reservationsPath,
@@ -1280,7 +1489,7 @@ func TestBookingIntentParseAutoContinueDraft(t *testing.T) {
 	if err != nil || runtime == nil {
 		t.Fatalf("read runtime failed: %v runtime=%+v", err, runtime)
 	}
-	baseURL := "http://" + runtime.Address
+	baseURL := "http://" + bookingRuntimePublicAddress(runtime)
 
 	parseOnce := func(body string) map[string]any {
 		t.Helper()

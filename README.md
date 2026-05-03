@@ -16,8 +16,8 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 - `version` command for build metadata (`version/commit/build date/platform`)
 - `upgrade` command (`check` / install / dry-run) with GitHub Releases
 - Automatic update reminder cache (`data/update_state.json`, max once per 24h check)
-- `webhook` command for signature generation, test sending, managed lifecycle (`start/status/stop/kill-port`), and management endpoints (`/admin`, `/healthz`, `/readyz`, `/admin/webhook/status`, `/metrics`, `/admin/webhook/stop`)
-- `booking` command for product/slot/reservation/query management and independent service lifecycle (`booking service start/status/stop`)
+- `webhook` command for signature generation, test sending, managed lifecycle (`start/status/stop/kill-port`), and dual-surface endpoints (public `/webhook/*`; admin `/admin`, `/admin/healthz`, `/admin/readyz`, `/admin/webhook/status`, `/admin/metrics`, `/admin/webhook/stop`)
+- `booking` command for product/slot/reservation/query management and independent dual-surface service lifecycle (`booking service start/status/stop`)
 - Unified external security key config (`conf/security_keys.json`, scopes: `booking` / `webhook`)
 - Cloudflare Named Tunnel example config for booking-only public exposure (`conf-example/cloudflared_booking_tunnel.yml`)
 - `admin` command for daemon-admin runtime inspection (`admin status`)
@@ -321,27 +321,35 @@ Compatibility note:
 Webhook start mode (background only):
 
 ```bash
-go run . webhook start --addr :8080 --path /webhook/events
+go run . webhook start \
+  --public-addr :8080 \
+  --admin-addr 127.0.0.1:8081 \
+  --path /webhook/events
 ```
 
 Start behavior notes:
 
 - Runtime/log paths remain relative to current workspace (`conf/`, `data/`, `logs/`).
 - Webhook runtime state now defaults to `data/webhook_runtime.json` (legacy `conf/webhook_runtime.json` is auto-migrated on read when using default runtime path).
-- `webhook start` enforces best-effort single service on the same `--addr`: if the port is already in use, it returns `already_running` and does not spawn a new process.
+- `webhook start` enforces best-effort single service on the same address pair (`--public-addr` + `--admin-addr`): if either port is already in use, it returns `already_running` and does not spawn a new process.
 - After spawn, startup is verified by checking process liveness and management endpoint readiness to avoid false-positive "started" states.
 
-Webhook management endpoints (same port):
+Webhook admin/health endpoints (admin listener only, default `127.0.0.1:8081`):
 
 ```bash
-curl http://127.0.0.1:8080/admin
-curl http://127.0.0.1:8080/healthz
-curl http://127.0.0.1:8080/readyz
-curl http://127.0.0.1:8080/admin/webhook/status
-curl http://127.0.0.1:8080/metrics
+curl http://127.0.0.1:8081/admin
+curl http://127.0.0.1:8081/admin/healthz
+curl http://127.0.0.1:8081/admin/readyz
+curl http://127.0.0.1:8081/admin/webhook/status
+curl http://127.0.0.1:8081/admin/metrics
 # stop current webhook instance (POST only)
-curl -X POST http://127.0.0.1:8080/admin/webhook/stop
+curl -X POST http://127.0.0.1:8081/admin/webhook/stop
 ```
+
+Public listener security behavior:
+
+- `:8080` only serves webhook business routes (`/webhook/*`).
+- Accessing `/admin/*`, `/healthz`, `/readyz`, `/metrics` on the public listener returns `404`.
 
 Admin stop behavior:
 
@@ -686,10 +694,10 @@ Booking system (independent service, system-first + client-ready):
 - Reservation states: `pending -> confirmed | rejected | cancelled`
 - Capacity rule: `available_capacity = slot.capacity - sum(confirmed.party_size)`
 - Default query behavior: `/booking/catalog` only returns slots with `available_capacity > 0`; use `include_full=true` to include full slots.
-- Runtime file: `data/booking_runtime.json` (service pid/address/state)
+- Runtime file: `data/booking_runtime.json` (service pid/public+admin address/state)
 - Draft intake file: `data/booking_intake_drafts.json` (text parse drafts)
 
-Start/stop/status booking service (default base port `:18081`, fallback `+1...+20`):
+Start/stop/status booking service (public default `:18081`, admin default `127.0.0.1:18082`, fallback `+1...+20` with same offset on both):
 
 ```bash
 go run . booking service start
@@ -704,7 +712,11 @@ Flag compatibility: prefer `--security-keys`; legacy `--api-keys` is still accep
 For public exposure via Cloudflare Tunnel, use fixed origin address and disable port fallback:
 
 ```bash
-go run . booking service start --addr 127.0.0.1:18081 --max-port-fallback 0 --security-keys conf/security_keys.json
+go run . booking service start \
+  --public-addr 127.0.0.1:18081 \
+  --admin-addr 127.0.0.1:18082 \
+  --max-port-fallback 0 \
+  --security-keys conf/security_keys.json
 # or helper script
 ./scripts/booking_public_start.sh
 ```
@@ -739,8 +751,10 @@ go run . booking reservation cancel r-3 --note "user canceled"
 go run . booking query --product-id p-1 --from 2026-05-03T00:00:00+08:00 --to 2026-05-03T23:59:59+08:00
 ```
 
-Booking service APIs (default URL `http://127.0.0.1:18081`, actual port may fallback):
+Booking service APIs:
 
+- Public base URL default: `http://127.0.0.1:18081` (actual port may fallback).
+- Admin base URL default: `http://127.0.0.1:18082` (same fallback offset as public).
 - Public endpoints accept unified signed headers (see [Public API Signing Guide](#public-api-signing-guide)):
   - `X-Third-Party-ID`
   - `X-Webhook-Timestamp`
@@ -801,6 +815,9 @@ curl -X POST http://127.0.0.1:18081/booking/intents/confirm \
 
 Admin booking APIs (Basic Auth required, hosted by booking service):
 
+- `GET /admin` (Booking Admin Home HTML)
+- `GET /admin/` (redirect to `/admin`)
+- `POST /admin/booking/stop` (graceful stop current booking process, async `202`)
 - `GET /admin/booking/status`
 - `POST /admin/booking/product/upsert`
 - `POST /admin/booking/product/remove`
@@ -813,13 +830,15 @@ Admin booking APIs (Basic Auth required, hosted by booking service):
 HTTP semantics:
 
 - `/booking/*` validates unified signed headers; if signed headers are absent, it falls back to `X-Booking-API-Key`.
-- `/admin/booking/*` requires Basic Auth (`conf/admin_auth.json`).
+- `/admin/*` requires Basic Auth (`conf/admin_auth.json`).
+- Booking public listener does not expose admin routes (`/admin/*` returns `404` on public address).
 - Action endpoints are POST-only (`405` on wrong method).
 - Validation errors return `400`; capacity conflicts return `409`.
+- Booking Admin Home default URL: `http://127.0.0.1:18082/admin`.
 
 ### Expose Booking Public APIs via Cloudflare Named Tunnel
 
-This setup exposes only `/booking/*` and blocks `/admin/*` at tunnel ingress level.
+This setup exposes only `/booking/*` from booking public listener and blocks `/admin/*` at tunnel ingress level.
 
 1. Start booking service on fixed local origin:
 
@@ -827,7 +846,7 @@ This setup exposes only `/booking/*` and blocks `/admin/*` at tunnel ingress lev
 ./scripts/booking_public_start.sh
 ```
 
-2. Create a remotely-managed Cloudflare Tunnel and a hostname (for example `booking-api.<your-domain>`), mapped to:
+2. Create a remotely-managed Cloudflare Tunnel and a hostname (for example `booking-api.<your-domain>`), mapped to booking public listener only:
 
 ```text
 http://127.0.0.1:18081

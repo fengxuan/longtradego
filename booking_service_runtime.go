@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net"
@@ -32,6 +33,7 @@ const (
 	bookingIntakeDraftsFile    = "booking_intake_drafts.json"
 
 	defaultBookingServiceAddr         = ":18081"
+	defaultBookingServiceAdminAddr    = "127.0.0.1:18082"
 	defaultBookingServicePortFallback = 20
 	defaultBookingServiceStopTimeout  = 5 * time.Second
 	defaultBookingServiceStartTimeout = 3 * time.Second
@@ -44,6 +46,9 @@ const (
 	bookingPublicIntentParsePath   = "/booking/intents/parse"
 	bookingPublicIntentConfirmPath = "/booking/intents/confirm"
 
+	bookingAdminHomePath               = "/admin"
+	bookingAdminHomeSlash              = "/admin/"
+	bookingAdminStopPath               = "/admin/booking/stop"
 	bookingAdminStatusPath             = "/admin/booking/status"
 	bookingAdminProductUpsertPath      = "/admin/booking/product/upsert"
 	bookingAdminProductRemovePath      = "/admin/booking/product/remove"
@@ -76,6 +81,8 @@ type bookingServiceRuntimeState struct {
 type bookingServiceRuntimeInfo struct {
 	PID             int    `json:"pid"`
 	Address         string `json:"address"`
+	PublicAddress   string `json:"public_address,omitempty"`
+	AdminAddress    string `json:"admin_address,omitempty"`
 	StartedAt       string `json:"started_at"`
 	UpdatedAt       string `json:"updated_at,omitempty"`
 	OwnerSessionID  string `json:"owner_session_id,omitempty"`
@@ -94,12 +101,14 @@ type bookingServiceStartResult struct {
 }
 
 type bookingServiceStatusResult struct {
-	Mode    string                     `json:"mode"`
-	Status  string                     `json:"status"`
-	Running bool                       `json:"running"`
-	Runtime *bookingServiceRuntimeInfo `json:"runtime,omitempty"`
-	URL     string                     `json:"url,omitempty"`
-	Message string                     `json:"message,omitempty"`
+	Mode      string                     `json:"mode"`
+	Status    string                     `json:"status"`
+	Running   bool                       `json:"running"`
+	Runtime   *bookingServiceRuntimeInfo `json:"runtime,omitempty"`
+	URL       string                     `json:"url,omitempty"`
+	PublicURL string                     `json:"public_url,omitempty"`
+	AdminURL  string                     `json:"admin_url,omitempty"`
+	Message   string                     `json:"message,omitempty"`
 }
 
 type bookingServiceStopResult struct {
@@ -131,6 +140,8 @@ type bookingLLMConfig struct {
 
 type bookingServiceServeConfig struct {
 	Addr             string
+	PublicAddr       string
+	AdminAddr        string
 	RuntimePath      string
 	CatalogPath      string
 	ReservationsPath string
@@ -142,27 +153,410 @@ type bookingServiceServeConfig struct {
 }
 
 type bookingServiceHandle struct {
-	server      *http.Server
-	listener    net.Listener
-	runtimePath string
-	tokenCache  *webhookTokenCache
-	out         io.Writer
-	stopOnce    sync.Once
-	errCh       chan error
+	publicServer   *http.Server
+	publicListener net.Listener
+	adminServer    *http.Server
+	adminListener  net.Listener
+	runtimePath    string
+	tokenCache     *webhookTokenCache
+	out            io.Writer
+	stopOnce       sync.Once
+	errCh          chan error
 }
 
 type bookingServiceController struct {
-	service        *bookingService
-	apiKeys        map[string]struct{}
-	tokenRecords   map[string]webhookTokenRecord
-	tokenCache     *webhookTokenCache
-	authConfig     daemonAdminAuthConfig
-	authConfigPath string
-	draftsPath     string
-	llmConfigPath  string
-	nowFn          func() time.Time
-	parseWithLLM   bookingIntentParseFn
+	service         *bookingService
+	apiKeys         map[string]struct{}
+	tokenRecords    map[string]webhookTokenRecord
+	tokenCache      *webhookTokenCache
+	authConfig      daemonAdminAuthConfig
+	authConfigPath  string
+	draftsPath      string
+	llmConfigPath   string
+	nowFn           func() time.Time
+	parseWithLLM    bookingIntentParseFn
+	requestShutdown func(source string)
 }
+
+type bookingAdminHomeLink struct {
+	Label string
+	Path  string
+	Note  string
+}
+
+type bookingAdminHomeView struct {
+	Name              string
+	Now               string
+	PublicAddress     string
+	AdminAddress      string
+	Status            bookingAdminStatus
+	ManagementLinks   []bookingAdminHomeLink
+	StopActionPath    string
+	ConfirmActionPath string
+	RejectActionPath  string
+	CancelActionPath  string
+}
+
+var bookingAdminHomeTemplate = template.Must(template.New("booking_admin_home").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Booking Admin</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f7fb;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #6b7280;
+      --accent: #0f766e;
+      --border: #d1d5db;
+      --warn: #9f1239;
+      --warn-bg: #fff1f2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 20px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: grid;
+      gap: 14px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+    }
+    .header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    h1, h2 {
+      margin: 0;
+      line-height: 1.2;
+    }
+    h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.05rem; margin-bottom: 8px; }
+    .meta {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-top: 6px;
+    }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    button {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 7px 10px;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    button:hover { border-color: #9ca3af; }
+    button.danger {
+      border-color: #b91c1c;
+      background: #b91c1c;
+      color: #fff;
+      font-weight: 600;
+    }
+    button.danger:hover {
+      border-color: #991b1b;
+      background: #991b1b;
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .kv {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fafafa;
+    }
+    .kv .k {
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .kv .v {
+      font-weight: 600;
+      margin-top: 2px;
+      word-break: break-word;
+    }
+    .links {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .link-card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fafafa;
+    }
+    .link-card a {
+      color: var(--accent);
+      text-decoration: none;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    .link-card a:hover { text-decoration: underline; }
+    .link-note {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 0.9rem;
+    }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      padding: 7px 6px;
+      vertical-align: top;
+    }
+    th {
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    code {
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .op-row { display: flex; gap: 6px; flex-wrap: wrap; }
+    .feedback {
+      margin-top: 8px;
+      font-size: 0.86rem;
+      min-height: 18px;
+      color: var(--muted);
+    }
+    .feedback.error {
+      color: var(--warn);
+      font-weight: 600;
+      background: var(--warn-bg);
+      border: 1px solid #fecdd3;
+      border-radius: 6px;
+      padding: 6px 8px;
+    }
+    .feedback.success {
+      color: #065f46;
+      font-weight: 600;
+    }
+    .hint {
+      color: var(--muted);
+      font-size: 0.85rem;
+      margin-top: 8px;
+    }
+    @media (max-width: 640px) {
+      body { padding: 14px; }
+      .panel { padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="panel">
+      <div class="header-row">
+        <div>
+          <h1>Booking Admin Home</h1>
+          <div class="meta">Service: <code>{{.Name}}</code> | Updated: <code>{{.Now}}</code></div>
+        </div>
+        <div class="toolbar">
+          <button type="button" onclick="window.location.reload()">Refresh Page</button>
+          <button class="danger" type="button" data-action="{{.StopActionPath}}" onclick="return stopCurrentBooking(this)">Stop Current Service</button>
+        </div>
+      </div>
+      <div id="booking-feedback" class="feedback" aria-live="polite"></div>
+      <div class="status-grid">
+        <div class="kv"><div class="k">Public Address</div><div class="v"><code>{{.PublicAddress}}</code></div></div>
+        <div class="kv"><div class="k">Admin Address</div><div class="v"><code>{{.AdminAddress}}</code></div></div>
+        <div class="kv"><div class="k">Products</div><div class="v">{{.Status.Summary.ProductCount}}</div></div>
+        <div class="kv"><div class="k">Slots</div><div class="v">{{.Status.Summary.SlotCount}}</div></div>
+        <div class="kv"><div class="k">Reservations</div><div class="v">{{.Status.Summary.ReservationCount}}</div></div>
+      </div>
+      <div class="status-grid">
+        <div class="kv"><div class="k">Pending</div><div class="v">{{.Status.Summary.Pending}}</div></div>
+        <div class="kv"><div class="k">Confirmed</div><div class="v">{{.Status.Summary.Confirmed}}</div></div>
+        <div class="kv"><div class="k">Rejected</div><div class="v">{{.Status.Summary.Rejected}}</div></div>
+        <div class="kv"><div class="k">Cancelled</div><div class="v">{{.Status.Summary.Cancelled}}</div></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Management Endpoints</h2>
+      <div class="links">
+        {{range .ManagementLinks}}
+        <div class="link-card">
+          <div><a href="{{.Path}}">{{.Path}}</a></div>
+          <div class="link-note">{{.Label}}. {{.Note}}</div>
+        </div>
+        {{end}}
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Products</h2>
+      {{if .Status.Products}}
+      <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Description</th><th>Enabled</th><th>Updated</th></tr></thead>
+        <tbody>
+          {{range .Status.Products}}
+          <tr>
+            <td><code>{{.ID}}</code></td>
+            <td>{{.Name}}</td>
+            <td>{{if .Description}}{{.Description}}{{else}}-{{end}}</td>
+            <td>{{.Enabled}}</td>
+            <td><code>{{if .UpdatedAt}}{{.UpdatedAt}}{{else}}-{{end}}</code></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      {{else}}
+      <div class="hint">No products found.</div>
+      {{end}}
+    </section>
+
+    <section class="panel">
+      <h2>Slots</h2>
+      {{if .Status.Slots}}
+      <table>
+        <thead><tr><th>ID</th><th>Product</th><th>Start</th><th>End</th><th>Capacity</th><th>Available</th><th>Enabled</th></tr></thead>
+        <tbody>
+          {{range .Status.Slots}}
+          <tr>
+            <td><code>{{.ID}}</code></td>
+            <td><code>{{.ProductID}}</code></td>
+            <td><code>{{.StartAt}}</code></td>
+            <td><code>{{.EndAt}}</code></td>
+            <td>{{.Capacity}}</td>
+            <td>{{.AvailableCapacity}}</td>
+            <td>{{.Enabled}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      {{else}}
+      <div class="hint">No slots found.</div>
+      {{end}}
+    </section>
+
+    <section class="panel">
+      <h2>Reservations</h2>
+      {{if .Status.Reservations}}
+      <table>
+        <thead><tr><th>ID</th><th>Status</th><th>User</th><th>Product</th><th>Slot</th><th>Party</th><th>Contact</th><th>Phone</th><th>Operation</th></tr></thead>
+        <tbody>
+          {{range .Status.Reservations}}
+          <tr>
+            <td><code>{{.ID}}</code></td>
+            <td>{{.Status}}</td>
+            <td><code>{{.UserID}}</code></td>
+            <td><code>{{.ProductID}}</code></td>
+            <td><code>{{.SlotID}}</code></td>
+            <td>{{.PartySize}}</td>
+            <td>{{.Personnel.ContactName}}</td>
+            <td>{{.Personnel.ContactPhone}}</td>
+            <td>
+              <div class="op-row">
+                <button type="button" onclick="postReservationAction('{{$.ConfirmActionPath}}', '{{.ID}}', 'Confirm reservation {{.ID}}?')">Confirm</button>
+                <button type="button" onclick="postReservationAction('{{$.RejectActionPath}}', '{{.ID}}', 'Reject reservation {{.ID}}?')">Reject</button>
+                <button type="button" onclick="postReservationAction('{{$.CancelActionPath}}', '{{.ID}}', 'Cancel reservation {{.ID}}?')">Cancel</button>
+              </div>
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      {{else}}
+      <div class="hint">No reservations found.</div>
+      {{end}}
+    </section>
+  </div>
+
+  <script>
+    function updateFeedback(message, state) {
+      var node = document.getElementById("booking-feedback");
+      if (!node) {
+        return;
+      }
+      node.textContent = String(message || "");
+      node.classList.remove("error", "success");
+      if (state === "error") {
+        node.classList.add("error");
+      } else if (state === "success") {
+        node.classList.add("success");
+      }
+    }
+
+    async function postAction(path) {
+      updateFeedback("Submitting action...", "");
+      try {
+        var response = await fetch(path, { method: "POST" });
+        var payload = await response.json().catch(function() { return {}; });
+        if (!response.ok) {
+          var failed = (payload && payload.message) ? String(payload.message) : ("request failed: HTTP " + response.status);
+          updateFeedback(failed, "error");
+          return false;
+        }
+        var ok = (payload && payload.message) ? String(payload.message) : "ok";
+        updateFeedback(ok, "success");
+        window.setTimeout(function() { window.location.reload(); }, 400);
+      } catch (err) {
+        updateFeedback("request failed: " + String(err), "error");
+      }
+      return false;
+    }
+
+    function postReservationAction(path, id, confirmText) {
+      if (confirmText && !window.confirm(confirmText)) {
+        return false;
+      }
+      var target = String(path || "");
+      if (String(id || "") !== "") {
+        target += "?id=" + encodeURIComponent(String(id));
+      }
+      return postAction(target);
+    }
+
+    function stopCurrentBooking(button) {
+      var action = button && button.dataset ? String(button.dataset.action || "") : "";
+      if (!action) {
+        return false;
+      }
+      if (!window.confirm("Stop current booking service now? This will terminate this booking process.")) {
+        return false;
+      }
+      return postAction(action);
+    }
+  </script>
+</body>
+</html>
+`))
 
 type bookingIntentParseFn func(context.Context, bookingIntentParseRequest, bookingIntentParseContext) (bookingIntentParseExtracted, error)
 
@@ -288,6 +682,8 @@ func defaultBookingIntakeDraftsPath() string {
 func newBookingServiceServeConfig() *bookingServiceServeConfig {
 	return &bookingServiceServeConfig{
 		Addr:             defaultBookingServiceAddr,
+		PublicAddr:       defaultBookingServiceAddr,
+		AdminAddr:        defaultBookingServiceAdminAddr,
 		RuntimePath:      defaultBookingRuntimeStatePath(),
 		CatalogPath:      defaultBookingCatalogStatePath(),
 		ReservationsPath: defaultBookingReservationsStatePath(),
@@ -304,6 +700,18 @@ func (cfg *bookingServiceServeConfig) validate() error {
 		return fmt.Errorf("booking service config is required")
 	}
 	cfg.Addr = strings.TrimSpace(cfg.Addr)
+	cfg.PublicAddr = strings.TrimSpace(cfg.PublicAddr)
+	cfg.AdminAddr = strings.TrimSpace(cfg.AdminAddr)
+	if cfg.PublicAddr == "" {
+		cfg.PublicAddr = cfg.Addr
+	}
+	if cfg.PublicAddr == "" {
+		cfg.PublicAddr = defaultBookingServiceAddr
+	}
+	cfg.Addr = cfg.PublicAddr
+	if cfg.AdminAddr == "" {
+		cfg.AdminAddr = defaultBookingServiceAdminAddr
+	}
 	cfg.RuntimePath = strings.TrimSpace(cfg.RuntimePath)
 	cfg.CatalogPath = strings.TrimSpace(cfg.CatalogPath)
 	cfg.ReservationsPath = strings.TrimSpace(cfg.ReservationsPath)
@@ -311,8 +719,11 @@ func (cfg *bookingServiceServeConfig) validate() error {
 	cfg.APIKeysPath = strings.TrimSpace(cfg.APIKeysPath)
 	cfg.LLMConfigPath = strings.TrimSpace(cfg.LLMConfigPath)
 	cfg.AdminAuthPath = strings.TrimSpace(cfg.AdminAuthPath)
-	if cfg.Addr == "" {
-		return fmt.Errorf("addr is required")
+	if cfg.PublicAddr == "" {
+		return fmt.Errorf("public-addr is required")
+	}
+	if cfg.AdminAddr == "" {
+		return fmt.Errorf("admin-addr is required")
 	}
 	if cfg.RuntimePath == "" {
 		return fmt.Errorf("runtime is required")
@@ -497,8 +908,20 @@ func readBookingRuntimeState(path string) (*bookingServiceRuntimeInfo, bool, err
 	if err := json.Unmarshal(raw, &state); err != nil {
 		return nil, false, err
 	}
-	if state.Runtime.PID == 0 && strings.TrimSpace(state.Runtime.Address) == "" {
+	if state.Runtime.PID == 0 &&
+		strings.TrimSpace(state.Runtime.Address) == "" &&
+		strings.TrimSpace(state.Runtime.PublicAddress) == "" &&
+		strings.TrimSpace(state.Runtime.AdminAddress) == "" {
 		return nil, false, nil
+	}
+	state.Runtime.Address = strings.TrimSpace(state.Runtime.Address)
+	state.Runtime.PublicAddress = strings.TrimSpace(state.Runtime.PublicAddress)
+	state.Runtime.AdminAddress = strings.TrimSpace(state.Runtime.AdminAddress)
+	if state.Runtime.PublicAddress == "" {
+		state.Runtime.PublicAddress = state.Runtime.Address
+	}
+	if state.Runtime.Address == "" {
+		state.Runtime.Address = state.Runtime.PublicAddress
 	}
 	return &state.Runtime, true, nil
 }
@@ -507,6 +930,15 @@ func writeBookingRuntimeState(path string, runtime bookingServiceRuntimeInfo) er
 	trimmedPath := strings.TrimSpace(path)
 	if trimmedPath == "" {
 		return fmt.Errorf("booking runtime path is empty")
+	}
+	runtime.Address = strings.TrimSpace(runtime.Address)
+	runtime.PublicAddress = strings.TrimSpace(runtime.PublicAddress)
+	runtime.AdminAddress = strings.TrimSpace(runtime.AdminAddress)
+	if runtime.PublicAddress == "" {
+		runtime.PublicAddress = runtime.Address
+	}
+	if runtime.Address == "" {
+		runtime.Address = runtime.PublicAddress
 	}
 	if strings.TrimSpace(runtime.UpdatedAt) == "" {
 		runtime.UpdatedAt = time.Now().Format(time.RFC3339Nano)
@@ -520,6 +952,28 @@ func writeBookingRuntimeState(path string, runtime bookingServiceRuntimeInfo) er
 		return err
 	}
 	return writeFileAtomic(trimmedPath, append(encoded, '\n'), 0o644)
+}
+
+func bookingRuntimePublicAddress(runtime *bookingServiceRuntimeInfo) string {
+	if runtime == nil {
+		return ""
+	}
+	publicAddr := strings.TrimSpace(runtime.PublicAddress)
+	if publicAddr != "" {
+		return publicAddr
+	}
+	return strings.TrimSpace(runtime.Address)
+}
+
+func bookingRuntimeAdminAddress(runtime *bookingServiceRuntimeInfo) string {
+	if runtime == nil {
+		return ""
+	}
+	adminAddr := strings.TrimSpace(runtime.AdminAddress)
+	if adminAddr != "" {
+		return adminAddr
+	}
+	return strings.TrimSpace(runtime.Address)
 }
 
 func removeBookingRuntimeState(path string) error {
@@ -567,7 +1021,11 @@ func bookingServiceStatus(runtimePath string) (bookingServiceStatusResult, error
 		Runtime: runtime,
 	}
 	if runtime != nil {
-		result.URL = buildWebhookManagementURL(runtime.Address, bookingAdminStatusPath)
+		publicAddr := bookingRuntimePublicAddress(runtime)
+		adminAddr := bookingRuntimeAdminAddress(runtime)
+		result.PublicURL = buildWebhookManagementURL(publicAddr, bookingPublicCatalogPath)
+		result.AdminURL = buildWebhookManagementURL(adminAddr, bookingAdminStatusPath)
+		result.URL = result.AdminURL
 	}
 	if status == "stale" {
 		result.Message = "booking runtime exists but process is not running"
@@ -663,18 +1121,29 @@ func startBookingServiceInBackgroundWithOwner(
 	}
 	var lastErr error
 	for offset := 0; offset <= maxFallback; offset++ {
-		candidateAddr, addrErr := daemonAdminAddrWithPortOffset(cfg.Addr, offset)
-		if addrErr != nil {
-			appendBookingServiceStartFailureLog(logPath, addrErr)
-			return bookingServiceStartResult{}, addrErr
+		candidatePublicAddr, publicAddrErr := daemonAdminAddrWithPortOffset(cfg.PublicAddr, offset)
+		if publicAddrErr != nil {
+			appendBookingServiceStartFailureLog(logPath, publicAddrErr)
+			return bookingServiceStartResult{}, publicAddrErr
 		}
-		if err := ensureBookingAddrAvailable(candidateAddr); err != nil {
+		candidateAdminAddr, adminAddrErr := daemonAdminAddrWithPortOffset(cfg.AdminAddr, offset)
+		if adminAddrErr != nil {
+			appendBookingServiceStartFailureLog(logPath, adminAddrErr)
+			return bookingServiceStartResult{}, adminAddrErr
+		}
+		if err := ensureBookingAddrAvailable(candidatePublicAddr); err != nil {
+			lastErr = err
+			continue
+		}
+		if err := ensureBookingAddrAvailable(candidateAdminAddr); err != nil {
 			lastErr = err
 			continue
 		}
 
 		spawnCfg := *cfg
-		spawnCfg.Addr = candidateAddr
+		spawnCfg.Addr = candidatePublicAddr
+		spawnCfg.PublicAddr = candidatePublicAddr
+		spawnCfg.AdminAddr = candidateAdminAddr
 		spawnCfg.RuntimePath = runtimePath
 		pid, cmdArgs, spawnErr := bookingSpawnBackgroundProcess(&spawnCfg, logPath)
 		if spawnErr != nil {
@@ -688,10 +1157,12 @@ func startBookingServiceInBackgroundWithOwner(
 		}
 		nowText := time.Now().Format(time.RFC3339Nano)
 		runtimeInfo := bookingServiceRuntimeInfo{
-			PID:       pid,
-			Address:   candidateAddr,
-			StartedAt: nowText,
-			UpdatedAt: nowText,
+			PID:           pid,
+			Address:       candidatePublicAddr,
+			PublicAddress: candidatePublicAddr,
+			AdminAddress:  candidateAdminAddr,
+			StartedAt:     nowText,
+			UpdatedAt:     nowText,
 		}
 		if ownerClaim != nil {
 			sessionID := strings.TrimSpace(ownerClaim.SessionID)
@@ -721,7 +1192,7 @@ func startBookingServiceInBackgroundWithOwner(
 			StartArgs: cmdArgs,
 		}
 		if offset > 0 {
-			result.Message = fmt.Sprintf("preferred addr unavailable, fallback to %s", candidateAddr)
+			result.Message = fmt.Sprintf("preferred addresses unavailable, fallback to public=%s admin=%s", candidatePublicAddr, candidateAdminAddr)
 		}
 		return result, nil
 	}
@@ -755,6 +1226,11 @@ func verifyBookingBackgroundStart(cfg *bookingServiceServeConfig, pid int, authC
 	if err != nil {
 		return fmt.Errorf("load booking api keys for readiness check failed: %w", err)
 	}
+	publicAddr := strings.TrimSpace(cfg.PublicAddr)
+	if publicAddr == "" {
+		publicAddr = strings.TrimSpace(cfg.Addr)
+	}
+	adminAddr := strings.TrimSpace(cfg.AdminAddr)
 	normalizedAuth := normalizeDaemonAdminAuthConfig(authCfg)
 	deadline := time.Now().Add(defaultBookingServiceStartTimeout)
 	var lastErr error
@@ -767,8 +1243,8 @@ func verifyBookingBackgroundStart(cfg *bookingServiceServeConfig, pid int, authC
 			return fmt.Errorf("booking process exited before becoming ready")
 		}
 
-		if normalizedAuth.Password != "" {
-			if _, err := fetchBookingAdminStatus(cfg.Addr, normalizedAuth, defaultWebhookManagementHTTPTimeout); err == nil {
+		if normalizedAuth.Password != "" && adminAddr != "" {
+			if _, err := fetchBookingAdminStatus(adminAddr, normalizedAuth, defaultWebhookManagementHTTPTimeout); err == nil {
 				return nil
 			} else {
 				lastErr = err
@@ -776,7 +1252,7 @@ func verifyBookingBackgroundStart(cfg *bookingServiceServeConfig, pid int, authC
 		}
 
 		if len(apiKeys) > 0 {
-			if err := fetchBookingPublicCatalogStatus(cfg.Addr, apiKeys[0], defaultWebhookManagementHTTPTimeout); err == nil {
+			if err := fetchBookingPublicCatalogStatus(publicAddr, apiKeys[0], defaultWebhookManagementHTTPTimeout); err == nil {
 				return nil
 			} else {
 				lastErr = err
@@ -881,8 +1357,9 @@ func spawnBookingBackgroundProcess(cfg *bookingServiceServeConfig, logPath strin
 }
 
 func buildBookingServiceServeArgs(cfg *bookingServiceServeConfig) []string {
-	args := make([]string, 0, 22)
-	args = append(args, "--addr", cfg.Addr)
+	args := make([]string, 0, 24)
+	args = append(args, "--public-addr", cfg.PublicAddr)
+	args = append(args, "--admin-addr", cfg.AdminAddr)
 	args = append(args, "--runtime", cfg.RuntimePath)
 	args = append(args, "--catalog", cfg.CatalogPath)
 	args = append(args, "--reservations", cfg.ReservationsPath)
@@ -921,74 +1398,97 @@ func startBookingHTTPService(ctx context.Context, cfg *bookingServiceServeConfig
 		return nil, err
 	}
 
-	listener, err := net.Listen("tcp", cfg.Addr)
+	publicListener, err := net.Listen("tcp", cfg.PublicAddr)
 	if err != nil {
 		return nil, err
 	}
-	actualAddr := listener.Addr().String()
-	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
-		host := "127.0.0.1"
-		if tcpAddr.IP != nil && !tcpAddr.IP.IsUnspecified() {
-			host = tcpAddr.IP.String()
+	publicAddr := bookingListenerAddress(publicListener)
+	adminListener, err := net.Listen("tcp", cfg.AdminAddr)
+	if err != nil {
+		_ = publicListener.Close()
+		return nil, err
+	}
+	adminAddr := bookingListenerAddress(adminListener)
+
+	var handle *bookingServiceHandle
+	requestShutdown := func(source string) {
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "booking shutdown requested source=%s\n", strings.TrimSpace(source))
 		}
-		actualAddr = net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port))
+		if handle != nil {
+			_ = handle.Close()
+		}
 	}
 
 	controller := &bookingServiceController{
-		service:        newBookingService(cfg.CatalogPath, cfg.ReservationsPath),
-		apiKeys:        bookingAPIKeySet(apiKeys),
-		tokenRecords:   tokenRecords,
-		tokenCache:     tokenCache,
-		authConfig:     authCfg,
-		authConfigPath: strings.TrimSpace(cfg.AdminAuthPath),
-		draftsPath:     cfg.DraftsPath,
-		llmConfigPath:  cfg.LLMConfigPath,
-		nowFn:          time.Now,
-		parseWithLLM:   bookingParseIntentWithLLM,
+		service:         newBookingService(cfg.CatalogPath, cfg.ReservationsPath),
+		apiKeys:         bookingAPIKeySet(apiKeys),
+		tokenRecords:    tokenRecords,
+		tokenCache:      tokenCache,
+		authConfig:      authCfg,
+		authConfigPath:  strings.TrimSpace(cfg.AdminAuthPath),
+		draftsPath:      cfg.DraftsPath,
+		llmConfigPath:   cfg.LLMConfigPath,
+		nowFn:           time.Now,
+		parseWithLLM:    bookingParseIntentWithLLM,
+		requestShutdown: requestShutdown,
 	}
 
-	mux := http.NewServeMux()
-	controller.registerHandlers(mux)
-	server := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           mux,
+	publicMux := http.NewServeMux()
+	adminMux := http.NewServeMux()
+	controller.registerHandlers(publicMux, adminMux)
+	publicServer := &http.Server{
+		Addr:              cfg.PublicAddr,
+		Handler:           publicMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	adminServer := &http.Server{
+		Addr:              cfg.AdminAddr,
+		Handler:           adminMux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	nowText := time.Now().Format(time.RFC3339Nano)
 	runtimeInfo := bookingServiceRuntimeInfo{
-		PID:       os.Getpid(),
-		Address:   actualAddr,
-		StartedAt: nowText,
-		UpdatedAt: nowText,
+		PID:           os.Getpid(),
+		Address:       publicAddr,
+		PublicAddress: publicAddr,
+		AdminAddress:  adminAddr,
+		StartedAt:     nowText,
+		UpdatedAt:     nowText,
 	}
 	if err := writeBookingRuntimeState(cfg.RuntimePath, runtimeInfo); err != nil {
-		_ = listener.Close()
+		_ = publicListener.Close()
+		_ = adminListener.Close()
 		return nil, err
 	}
 
-	handle := &bookingServiceHandle{
-		server:      server,
-		listener:    listener,
-		runtimePath: cfg.RuntimePath,
-		tokenCache:  tokenCache,
-		out:         out,
-		errCh:       make(chan error, 1),
+	handle = &bookingServiceHandle{
+		publicServer:   publicServer,
+		publicListener: publicListener,
+		adminServer:    adminServer,
+		adminListener:  adminListener,
+		runtimePath:    cfg.RuntimePath,
+		tokenCache:     tokenCache,
+		out:            out,
+		errCh:          make(chan error, 2),
 	}
 	tokenCacheStarted = false
-	go func() {
-		err := server.Serve(listener)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			if out != nil {
-				_, _ = fmt.Fprintf(out, "booking service stopped with error: %v\n", err)
+	serveOnce := func(name string, server *http.Server, listener net.Listener) {
+		go func() {
+			serveErr := server.Serve(listener)
+			if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				if out != nil {
+					_, _ = fmt.Fprintf(out, "booking service %s listener stopped with error: %v\n", name, serveErr)
+				}
+				handle.errCh <- serveErr
+				return
 			}
-			handle.errCh <- err
-			close(handle.errCh)
-			return
-		}
-		handle.errCh <- nil
-		close(handle.errCh)
-	}()
+			handle.errCh <- nil
+		}()
+	}
+	serveOnce("public", publicServer, publicListener)
+	serveOnce("admin", adminServer, adminListener)
 
 	go func() {
 		if ctx == nil {
@@ -1012,13 +1512,21 @@ func (s *bookingServiceHandle) Close() error {
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if s.server != nil {
-			if err := s.server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if s.publicServer != nil {
+			if err := s.publicServer.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				closeErr = err
 			}
 		}
-		if s.listener != nil {
-			_ = s.listener.Close()
+		if s.adminServer != nil {
+			if err := s.adminServer.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				closeErr = err
+			}
+		}
+		if s.publicListener != nil {
+			_ = s.publicListener.Close()
+		}
+		if s.adminListener != nil {
+			_ = s.adminListener.Close()
 		}
 		if removed, err := cleanupBookingRuntimeStateForCurrentProcess(s.runtimePath); err != nil {
 			if s.out != nil {
@@ -1035,7 +1543,29 @@ func (s *bookingServiceHandle) Wait() error {
 	if s == nil || s.errCh == nil {
 		return nil
 	}
-	return <-s.errCh
+	var firstErr error
+	for index := 0; index < 2; index++ {
+		serveErr := <-s.errCh
+		if serveErr != nil && firstErr == nil {
+			firstErr = serveErr
+		}
+	}
+	return firstErr
+}
+
+func bookingListenerAddress(listener net.Listener) string {
+	if listener == nil {
+		return ""
+	}
+	actualAddr := listener.Addr().String()
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		host := "127.0.0.1"
+		if tcpAddr.IP != nil && !tcpAddr.IP.IsUnspecified() {
+			host = tcpAddr.IP.String()
+		}
+		actualAddr = net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port))
+	}
+	return actualAddr
 }
 
 func bookingAPIKeySet(keys []string) map[string]struct{} {
@@ -1050,10 +1580,11 @@ func bookingAPIKeySet(keys []string) map[string]struct{} {
 	return set
 }
 
-func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
-	if mux == nil {
+func (c *bookingServiceController) registerHandlers(publicMux *http.ServeMux, adminMux *http.ServeMux) {
+	if publicMux == nil && adminMux == nil {
 		return
 	}
+	var adminStopOnce sync.Once
 
 	requireAPIKey := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -1080,7 +1611,123 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 		}
 	}
 
-	mux.HandleFunc(bookingPublicCatalogPath, requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+	registerPublic := func(path string, handler http.HandlerFunc) {
+		if publicMux == nil {
+			return
+		}
+		publicMux.HandleFunc(path, requireAPIKey(handler))
+	}
+	registerAdminGet := func(path string, handler http.HandlerFunc) {
+		if adminMux == nil {
+			return
+		}
+		adminMux.HandleFunc(path, requireAdmin(handler))
+	}
+	registerAdminPost := func(path string, handler func(*http.Request) (any, error)) {
+		if adminMux == nil {
+			return
+		}
+		adminMux.HandleFunc(path, requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			result, err := handler(r)
+			if err != nil {
+				writeBookingJSON(w, bookingHTTPStatus(err), map[string]any{"status": "error", "message": err.Error(), "result": result})
+				return
+			}
+			writeBookingJSON(w, http.StatusOK, map[string]any{"status": "ok", "result": result})
+		}))
+	}
+
+	registerAdminGet(bookingAdminHomePath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		status, err := c.service.AdminStatus()
+		if err != nil {
+			http.Error(w, err.Error(), bookingHTTPStatus(err))
+			return
+		}
+		adminAddress := strings.TrimSpace(r.Host)
+		if adminAddress == "" {
+			adminAddress = "127.0.0.1:18082"
+		}
+		view := bookingAdminHomeView{
+			Name:          "longtradego booking",
+			Now:           c.now().Format(time.RFC3339Nano),
+			PublicAddress: "see /admin/booking/status",
+			AdminAddress:  adminAddress,
+			Status:        status,
+			ManagementLinks: []bookingAdminHomeLink{
+				{
+					Label: "Booking admin status endpoint",
+					Path:  bookingAdminStatusPath,
+					Note:  "Structured JSON snapshot for automation.",
+				},
+				{
+					Label: "Reservation confirm endpoint",
+					Path:  bookingAdminReservationConfirmPath,
+					Note:  "POST-only reservation state transition.",
+				},
+				{
+					Label: "Reservation reject endpoint",
+					Path:  bookingAdminReservationRejectPath,
+					Note:  "POST-only reservation state transition.",
+				},
+				{
+					Label: "Reservation cancel endpoint",
+					Path:  bookingAdminReservationCancelPath,
+					Note:  "POST-only reservation state transition.",
+				},
+				{
+					Label: "Booking stop endpoint",
+					Path:  bookingAdminStopPath,
+					Note:  "POST-only graceful shutdown for current booking process.",
+				},
+			},
+			StopActionPath:    bookingAdminStopPath,
+			ConfirmActionPath: bookingAdminReservationConfirmPath,
+			RejectActionPath:  bookingAdminReservationRejectPath,
+			CancelActionPath:  bookingAdminReservationCancelPath,
+		}
+		renderBookingAdminHome(w, view)
+	})
+
+	registerAdminGet(bookingAdminHomeSlash, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		target := bookingAdminHomePath
+		if raw := strings.TrimSpace(r.URL.RawQuery); raw != "" {
+			target = target + "?" + raw
+		}
+		http.Redirect(w, r, target, http.StatusPermanentRedirect)
+	})
+
+	if adminMux != nil {
+		adminMux.HandleFunc(bookingAdminStopPath, requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			writeBookingJSON(w, http.StatusAccepted, map[string]any{
+				"status":  "stopping",
+				"message": "booking shutdown requested",
+			})
+			if c.requestShutdown == nil {
+				return
+			}
+			adminStopOnce.Do(func() {
+				go c.requestShutdown("admin_stop")
+			})
+		}))
+	}
+
+	registerPublic(bookingPublicCatalogPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1096,9 +1743,9 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 			return
 		}
 		writeBookingJSON(w, http.StatusOK, result)
-	}))
+	})
 
-	mux.HandleFunc(bookingPublicReservationsPath, requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+	registerPublic(bookingPublicReservationsPath, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			filter := bookingReservationListFilter{
@@ -1141,9 +1788,9 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-	}))
+	})
 
-	mux.HandleFunc(bookingPublicIntentParsePath, requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+	registerPublic(bookingPublicIntentParsePath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1177,9 +1824,9 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 			"override_applied": result.OverrideApplied,
 			"draft":            result.Draft,
 		})
-	}))
+	})
 
-	mux.HandleFunc(bookingPublicIntentConfirmPath, requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+	registerPublic(bookingPublicIntentConfirmPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1195,24 +1842,9 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 			return
 		}
 		writeBookingJSON(w, http.StatusCreated, map[string]any{"status": "created", "result": result})
-	}))
+	})
 
-	registerAdmin := func(path string, handler func(*http.Request) (any, error)) {
-		mux.HandleFunc(path, requireAdmin(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			result, err := handler(r)
-			if err != nil {
-				writeBookingJSON(w, bookingHTTPStatus(err), map[string]any{"status": "error", "message": err.Error(), "result": result})
-				return
-			}
-			writeBookingJSON(w, http.StatusOK, map[string]any{"status": "ok", "result": result})
-		}))
-	}
-
-	mux.HandleFunc(bookingAdminStatusPath, requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+	registerAdminGet(bookingAdminStatusPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1223,9 +1855,9 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 			return
 		}
 		writeBookingJSON(w, http.StatusOK, result)
-	}))
+	})
 
-	registerAdmin(bookingAdminProductUpsertPath, func(r *http.Request) (any, error) {
+	registerAdminPost(bookingAdminProductUpsertPath, func(r *http.Request) (any, error) {
 		var payload daemonBookingProductUpsertRequest
 		if err := decodeDaemonAdminJSONBody(r, &payload); err != nil {
 			return nil, err
@@ -1242,7 +1874,7 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 		return map[string]any{"status": "ok", "product": product}, nil
 	})
 
-	registerAdmin(bookingAdminProductRemovePath, func(r *http.Request) (any, error) {
+	registerAdminPost(bookingAdminProductRemovePath, func(r *http.Request) (any, error) {
 		id := daemonAdminRequestID(r)
 		if id == "" {
 			var payload struct {
@@ -1266,7 +1898,7 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 		return map[string]any{"status": status, "product_id": id}, nil
 	})
 
-	registerAdmin(bookingAdminSlotUpsertPath, func(r *http.Request) (any, error) {
+	registerAdminPost(bookingAdminSlotUpsertPath, func(r *http.Request) (any, error) {
 		var payload daemonBookingSlotUpsertRequest
 		if err := decodeDaemonAdminJSONBody(r, &payload); err != nil {
 			return nil, err
@@ -1285,7 +1917,7 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 		return map[string]any{"status": "ok", "slot": slot}, nil
 	})
 
-	registerAdmin(bookingAdminSlotRemovePath, func(r *http.Request) (any, error) {
+	registerAdminPost(bookingAdminSlotRemovePath, func(r *http.Request) (any, error) {
 		id := daemonAdminRequestID(r)
 		if id == "" {
 			var payload struct {
@@ -1309,7 +1941,7 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 		return map[string]any{"status": status, "slot_id": id}, nil
 	})
 
-	registerAdmin(bookingAdminReservationConfirmPath, func(r *http.Request) (any, error) {
+	registerAdminPost(bookingAdminReservationConfirmPath, func(r *http.Request) (any, error) {
 		var payload daemonBookingReservationActionRequest
 		if err := decodeDaemonAdminJSONBody(r, &payload); err != nil {
 			return nil, err
@@ -1324,7 +1956,7 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 		return map[string]any{"status": "confirmed", "reservation": reservation}, nil
 	})
 
-	registerAdmin(bookingAdminReservationRejectPath, func(r *http.Request) (any, error) {
+	registerAdminPost(bookingAdminReservationRejectPath, func(r *http.Request) (any, error) {
 		var payload daemonBookingReservationActionRequest
 		if err := decodeDaemonAdminJSONBody(r, &payload); err != nil {
 			return nil, err
@@ -1339,7 +1971,7 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 		return map[string]any{"status": "rejected", "reservation": reservation}, nil
 	})
 
-	registerAdmin(bookingAdminReservationCancelPath, func(r *http.Request) (any, error) {
+	registerAdminPost(bookingAdminReservationCancelPath, func(r *http.Request) (any, error) {
 		var payload daemonBookingReservationActionRequest
 		if err := decodeDaemonAdminJSONBody(r, &payload); err != nil {
 			return nil, err
@@ -1490,6 +2122,20 @@ func (c *bookingServiceController) isAdminAuthorized(r *http.Request) bool {
 		authCfg = reloadedCfg
 	}
 	return daemonAdminCredentialsMatch(authCfg, username, password)
+}
+
+func renderBookingAdminHome(w http.ResponseWriter, view bookingAdminHomeView) {
+	if w == nil {
+		return
+	}
+	var buffer bytes.Buffer
+	if err := bookingAdminHomeTemplate.Execute(&buffer, view); err != nil {
+		http.Error(w, "render booking admin home failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, &buffer)
 }
 
 func writeBookingJSON(w http.ResponseWriter, status int, payload any) {

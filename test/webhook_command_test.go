@@ -882,8 +882,15 @@ func TestStartWebhookInBackgroundWritesRuntimeAndStatusRunning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen free addr failed: %v", err)
 	}
-	cfg.Addr = addrListener.Addr().String()
+	cfg.PublicAddr = addrListener.Addr().String()
+	cfg.Addr = cfg.PublicAddr
 	_ = addrListener.Close()
+	adminListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen free admin addr failed: %v", err)
+	}
+	cfg.AdminAddr = adminListener.Addr().String()
+	_ = adminListener.Close()
 	cfg.TokenStore = filepath.Join(tmpDir, "webhook_tokens.json")
 	cfg.EventLogPath = filepath.Join(tmpDir, "webhook_events.json")
 	if err := cfg.validate(); err != nil {
@@ -951,7 +958,14 @@ func TestStartWebhookInBackgroundReturnsAlreadyRunningWhenAddrOccupied(t *testin
 	runtimePath := filepath.Join(tmpDir, "webhook_runtime.json")
 	logPath := filepath.Join(tmpDir, "webhook_server.log")
 	cfg := newWebhookServeConfig()
-	cfg.Addr = occupied.Addr().String()
+	cfg.PublicAddr = occupied.Addr().String()
+	cfg.Addr = cfg.PublicAddr
+	adminListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen free admin addr failed: %v", err)
+	}
+	cfg.AdminAddr = adminListener.Addr().String()
+	_ = adminListener.Close()
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("cfg validate failed: %v", err)
 	}
@@ -1007,8 +1021,15 @@ func TestStartWebhookInBackgroundFailsWhenStartupVerificationFails(t *testing.T)
 	if err != nil {
 		t.Fatalf("listen free addr failed: %v", err)
 	}
-	cfg.Addr = addrListener.Addr().String()
+	cfg.PublicAddr = addrListener.Addr().String()
+	cfg.Addr = cfg.PublicAddr
 	_ = addrListener.Close()
+	adminListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen free admin addr failed: %v", err)
+	}
+	cfg.AdminAddr = adminListener.Addr().String()
+	_ = adminListener.Close()
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("cfg validate failed: %v", err)
 	}
@@ -2196,7 +2217,8 @@ func TestWebhookManagementEndpointsExposeStatusAndMetrics(t *testing.T) {
 
 	metrics := newWebhookServerMetrics(128)
 	cfg := newWebhookServeConfig()
-	cfg.Addr = ":18080"
+	cfg.PublicAddr = ":18080"
+	cfg.Addr = cfg.PublicAddr
 	cfg.Path = "/webhook/events"
 	cfg.DispatchQueuePath = queuePath
 	cfg.DeadLetterPath = deadPath
@@ -2370,6 +2392,97 @@ func TestWebhookManagementEndpointsExposeStatusAndMetrics(t *testing.T) {
 		t.Fatalf("expected GET /admin/ redirect target path %q, got request=%v", webhookAdminHomePath, adminSlashResp.Request)
 	}
 	_ = adminSlashResp.Body.Close()
+}
+
+func TestWebhookServeDualSurfaceRouteIsolation(t *testing.T) {
+	cfg := newWebhookServeConfig()
+	cfg.PublicAddr = "127.0.0.1:18080"
+	cfg.Addr = cfg.PublicAddr
+	cfg.AdminAddr = "127.0.0.1:8081"
+	cfg.Path = "/webhook/events"
+
+	publicMux := http.NewServeMux()
+	adminMux := http.NewServeMux()
+	registerWebhookManagementHandlers(
+		adminMux,
+		cfg,
+		nil,
+		newWebhookServerMetrics(1),
+		&webhookTokenCache{},
+		&webhookAsyncLineWriter{},
+		&webhookAsyncLineWriter{},
+		time.Now(),
+		nil,
+	)
+	publicMux.Handle(cfg.Path, newWebhookEventHandler(webhookServeOptions{Path: cfg.Path}))
+
+	publicServer := httptest.NewServer(publicMux)
+	defer publicServer.Close()
+	adminServer := httptest.NewServer(adminMux)
+	defer adminServer.Close()
+
+	publicWebhookResp, err := http.Get(publicServer.URL + cfg.Path)
+	if err != nil {
+		t.Fatalf("GET public webhook path failed: %v", err)
+	}
+	if publicWebhookResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected public webhook path status 405, got %d", publicWebhookResp.StatusCode)
+	}
+	_ = publicWebhookResp.Body.Close()
+
+	publicAdminStatusResp, err := http.Get(publicServer.URL + webhookAdminStatusPath)
+	if err != nil {
+		t.Fatalf("GET public admin status path failed: %v", err)
+	}
+	if publicAdminStatusResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected public admin status path 404, got %d", publicAdminStatusResp.StatusCode)
+	}
+	_ = publicAdminStatusResp.Body.Close()
+
+	publicAdminHealthResp, err := http.Get(publicServer.URL + webhookHealthzPath)
+	if err != nil {
+		t.Fatalf("GET public admin healthz path failed: %v", err)
+	}
+	if publicAdminHealthResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected public admin healthz path 404, got %d", publicAdminHealthResp.StatusCode)
+	}
+	_ = publicAdminHealthResp.Body.Close()
+
+	publicLegacyHealthResp, err := http.Get(publicServer.URL + legacyWebhookHealthzPath)
+	if err != nil {
+		t.Fatalf("GET public legacy healthz path failed: %v", err)
+	}
+	if publicLegacyHealthResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected public legacy healthz path 404, got %d", publicLegacyHealthResp.StatusCode)
+	}
+	_ = publicLegacyHealthResp.Body.Close()
+
+	adminStatusResp, err := http.Get(adminServer.URL + webhookAdminStatusPath)
+	if err != nil {
+		t.Fatalf("GET admin status path failed: %v", err)
+	}
+	if adminStatusResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected admin status path 200, got %d", adminStatusResp.StatusCode)
+	}
+	_ = adminStatusResp.Body.Close()
+
+	adminHealthResp, err := http.Get(adminServer.URL + webhookHealthzPath)
+	if err != nil {
+		t.Fatalf("GET admin healthz path failed: %v", err)
+	}
+	if adminHealthResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected admin healthz path 200, got %d", adminHealthResp.StatusCode)
+	}
+	_ = adminHealthResp.Body.Close()
+
+	adminWebhookResp, err := http.Get(adminServer.URL + cfg.Path)
+	if err != nil {
+		t.Fatalf("GET admin webhook path failed: %v", err)
+	}
+	if adminWebhookResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected admin webhook path 404, got %d", adminWebhookResp.StatusCode)
+	}
+	_ = adminWebhookResp.Body.Close()
 }
 
 func TestValidateWebhookManagementPathConflictsIncludesAdminHome(t *testing.T) {

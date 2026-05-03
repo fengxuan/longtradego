@@ -98,6 +98,7 @@ type daemonAdminServiceOptions struct {
 	BookingRuntime      string
 	BookingLogPath      string
 	BookingAddr         string
+	BookingAdminAddr    string
 	BookingCatalog      string
 	BookingReservations string
 	BookingDrafts       string
@@ -139,26 +140,32 @@ type daemonAdminServiceStatus struct {
 }
 
 type daemonAdminWebhookStatus struct {
-	Status     string                  `json:"status"`
-	Running    bool                    `json:"running"`
-	Address    string                  `json:"address,omitempty"`
-	Path       string                  `json:"path,omitempty"`
-	RouteCount int                     `json:"route_count,omitempty"`
-	Routes     []webhookRouteSummary   `json:"routes,omitempty"`
-	Dispatch   webhookDispatchStats    `json:"dispatch"`
-	Metrics    *webhookMetricsSnapshot `json:"metrics,omitempty"`
-	LogQueue   *webhookLogQueueDepth   `json:"log_queue_depth,omitempty"`
-	Message    string                  `json:"message,omitempty"`
+	Status        string                  `json:"status"`
+	Running       bool                    `json:"running"`
+	Address       string                  `json:"address,omitempty"`
+	PublicAddress string                  `json:"public_address,omitempty"`
+	AdminAddress  string                  `json:"admin_address,omitempty"`
+	Path          string                  `json:"path,omitempty"`
+	RouteCount    int                     `json:"route_count,omitempty"`
+	Routes        []webhookRouteSummary   `json:"routes,omitempty"`
+	Dispatch      webhookDispatchStats    `json:"dispatch"`
+	Metrics       *webhookMetricsSnapshot `json:"metrics,omitempty"`
+	LogQueue      *webhookLogQueueDepth   `json:"log_queue_depth,omitempty"`
+	Message       string                  `json:"message,omitempty"`
 }
 
 type daemonAdminBookingServiceStatus struct {
-	Status  string                     `json:"status"`
-	Running bool                       `json:"running"`
-	PID     int                        `json:"pid,omitempty"`
-	Address string                     `json:"address,omitempty"`
-	URL     string                     `json:"url,omitempty"`
-	Message string                     `json:"message,omitempty"`
-	Runtime *bookingServiceRuntimeInfo `json:"runtime,omitempty"`
+	Status        string                     `json:"status"`
+	Running       bool                       `json:"running"`
+	PID           int                        `json:"pid,omitempty"`
+	Address       string                     `json:"address,omitempty"`
+	PublicAddress string                     `json:"public_address,omitempty"`
+	AdminAddress  string                     `json:"admin_address,omitempty"`
+	URL           string                     `json:"url,omitempty"`
+	PublicURL     string                     `json:"public_url,omitempty"`
+	AdminURL      string                     `json:"admin_url,omitempty"`
+	Message       string                     `json:"message,omitempty"`
+	Runtime       *bookingServiceRuntimeInfo `json:"runtime,omitempty"`
 }
 
 type daemonAdminTaskStatus struct {
@@ -221,6 +228,7 @@ type daemonAdminController struct {
 	bookingRuntime      string
 	bookingLogPath      string
 	bookingAddr         string
+	bookingAdminAddr    string
 	bookingCatalog      string
 	bookingReservations string
 	bookingDrafts       string
@@ -378,7 +386,8 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
       <div id="webhook-feedback" class="feedback" aria-live="polite"></div>
       <div class="status-grid">
         <div class="kv"><div class="k">Running</div><div class="v">{{.Status.Webhook.Running}}</div></div>
-        <div class="kv"><div class="k">Address</div><div class="v"><code>{{.Status.Webhook.Address}}</code></div></div>
+        <div class="kv"><div class="k">Public Address</div><div class="v"><code>{{.Status.Webhook.PublicAddress}}</code></div></div>
+        <div class="kv"><div class="k">Admin Address</div><div class="v"><code>{{.Status.Webhook.AdminAddress}}</code></div></div>
         <div class="kv"><div class="k">Path</div><div class="v"><code>{{.Status.Webhook.Path}}</code></div></div>
         <div class="kv"><div class="k">Route Count</div><div class="v">{{.Status.Webhook.RouteCount}}</div></div>
       </div>
@@ -412,8 +421,10 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
         <div class="kv"><div class="k">Running</div><div class="v">{{.Status.Booking.Running}}</div></div>
         <div class="kv"><div class="k">Status</div><div class="v"><code>{{.Status.Booking.Status}}</code></div></div>
         <div class="kv"><div class="k">PID</div><div class="v">{{.Status.Booking.PID}}</div></div>
-        <div class="kv"><div class="k">Address</div><div class="v"><code>{{.Status.Booking.Address}}</code></div></div>
-        <div class="kv"><div class="k">Admin URL</div><div class="v"><code>{{.Status.Booking.URL}}</code></div></div>
+        <div class="kv"><div class="k">Public Address</div><div class="v"><code>{{.Status.Booking.PublicAddress}}</code></div></div>
+        <div class="kv"><div class="k">Admin Address</div><div class="v"><code>{{.Status.Booking.AdminAddress}}</code></div></div>
+        <div class="kv"><div class="k">Public URL</div><div class="v"><code>{{.Status.Booking.PublicURL}}</code></div></div>
+        <div class="kv"><div class="k">Admin URL</div><div class="v"><code>{{.Status.Booking.AdminURL}}</code></div></div>
       </div>
       {{if .Status.Booking.Message}}<div class="hint">Message: <code>{{.Status.Booking.Message}}</code></div>{{end}}
       <div class="hint">Service status API: <code>` + daemonAdminBookingServiceStatusPath + `</code></div>
@@ -760,6 +771,7 @@ func startDaemonAdminService(options daemonAdminServiceOptions) (*daemonAdminSer
 		bookingRuntime:      strings.TrimSpace(options.BookingRuntime),
 		bookingLogPath:      strings.TrimSpace(options.BookingLogPath),
 		bookingAddr:         strings.TrimSpace(options.BookingAddr),
+		bookingAdminAddr:    strings.TrimSpace(options.BookingAdminAddr),
 		bookingCatalog:      strings.TrimSpace(options.BookingCatalog),
 		bookingReservations: strings.TrimSpace(options.BookingReservations),
 		bookingDrafts:       strings.TrimSpace(options.BookingDrafts),
@@ -789,6 +801,9 @@ func startDaemonAdminService(options daemonAdminServiceOptions) (*daemonAdminSer
 	}
 	if controller.bookingAddr == "" {
 		controller.bookingAddr = defaultBookingServiceAddr
+	}
+	if controller.bookingAdminAddr == "" {
+		controller.bookingAdminAddr = defaultBookingServiceAdminAddr
 	}
 	if controller.bookingCatalog == "" {
 		controller.bookingCatalog = defaultBookingCatalogStatePath()
@@ -1331,16 +1346,26 @@ func (c *daemonAdminController) buildStatus() daemonAdminStatusResponse {
 			Message: bookingErr.Error(),
 		}
 	} else {
+		publicAddr := ""
+		adminAddr := ""
+		if bookingResult.Runtime != nil {
+			publicAddr = bookingRuntimePublicAddress(bookingResult.Runtime)
+			adminAddr = bookingRuntimeAdminAddress(bookingResult.Runtime)
+		}
 		status.Booking = daemonAdminBookingServiceStatus{
-			Status:  bookingResult.Status,
-			Running: bookingResult.Running,
-			URL:     strings.TrimSpace(bookingResult.URL),
-			Message: strings.TrimSpace(bookingResult.Message),
-			Runtime: bookingResult.Runtime,
+			Status:        bookingResult.Status,
+			Running:       bookingResult.Running,
+			Address:       publicAddr,
+			PublicAddress: publicAddr,
+			AdminAddress:  adminAddr,
+			URL:           strings.TrimSpace(bookingResult.URL),
+			PublicURL:     strings.TrimSpace(bookingResult.PublicURL),
+			AdminURL:      strings.TrimSpace(bookingResult.AdminURL),
+			Message:       strings.TrimSpace(bookingResult.Message),
+			Runtime:       bookingResult.Runtime,
 		}
 		if bookingResult.Runtime != nil {
 			status.Booking.PID = bookingResult.Runtime.PID
-			status.Booking.Address = bookingResult.Runtime.Address
 		}
 	}
 
@@ -1363,7 +1388,9 @@ func (c *daemonAdminController) buildStatus() daemonAdminStatusResponse {
 		LogQueue:   webhookResult.LogQueue,
 	}
 	if webhookResult.Runtime != nil {
-		status.Webhook.Address = webhookResult.Runtime.Address
+		status.Webhook.Address = strings.TrimSpace(webhookResult.Runtime.Address)
+		status.Webhook.PublicAddress = webhookRuntimePublicAddress(webhookResult.Runtime)
+		status.Webhook.AdminAddress = webhookRuntimeAdminAddress(webhookResult.Runtime)
 		status.Webhook.Path = webhookResult.Runtime.Path
 	}
 	if !webhookResult.Running {
@@ -1560,6 +1587,8 @@ func (c *daemonAdminController) bookingServiceStart() (bookingServiceStartResult
 	}
 	cfg := &bookingServiceServeConfig{
 		Addr:             c.bookingAddr,
+		PublicAddr:       c.bookingAddr,
+		AdminAddr:        c.bookingAdminAddr,
 		RuntimePath:      c.bookingRuntime,
 		CatalogPath:      c.bookingCatalog,
 		ReservationsPath: c.bookingReservations,

@@ -59,7 +59,8 @@ func newBookingCommand(app *appContext) *cobra.Command {
 
 func newBookingServiceCommand(app *appContext, configFactory func() *bookingServiceServeConfig) *cobra.Command {
 	var (
-		addr              string
+		publicAddr        string
+		adminAddr         string
 		runtimePath       string
 		logPath           string
 		draftsPath        string
@@ -85,7 +86,9 @@ func newBookingServiceCommand(app *appContext, configFactory func() *bookingServ
 			if err != nil {
 				return err
 			}
-			cfg.Addr = strings.TrimSpace(addr)
+			cfg.PublicAddr = strings.TrimSpace(publicAddr)
+			cfg.Addr = cfg.PublicAddr
+			cfg.AdminAddr = strings.TrimSpace(adminAddr)
 			cfg.RuntimePath = strings.TrimSpace(runtimePath)
 			cfg.DraftsPath = strings.TrimSpace(draftsPath)
 			cfg.APIKeysPath = resolvedSecurityPath
@@ -110,7 +113,13 @@ func newBookingServiceCommand(app *appContext, configFactory func() *bookingServ
 				})
 			}
 			if result.Runtime != nil {
-				fmt.Printf("booking service %s: pid=%d addr=%s\n", result.Status, result.Runtime.PID, result.Runtime.Address)
+				fmt.Printf(
+					"booking service %s: pid=%d public=%s admin=%s\n",
+					result.Status,
+					result.Runtime.PID,
+					bookingRuntimePublicAddress(result.Runtime),
+					bookingRuntimeAdminAddress(result.Runtime),
+				)
 			} else {
 				fmt.Printf("booking service %s\n", result.Status)
 			}
@@ -168,7 +177,14 @@ func newBookingServiceCommand(app *appContext, configFactory func() *bookingServ
 				})
 			}
 			if result.Runtime != nil {
-				fmt.Printf("booking service status=%s running=%t pid=%d addr=%s\n", result.Status, result.Running, result.Runtime.PID, result.Runtime.Address)
+				fmt.Printf(
+					"booking service status=%s running=%t pid=%d public=%s admin=%s\n",
+					result.Status,
+					result.Running,
+					result.Runtime.PID,
+					bookingRuntimePublicAddress(result.Runtime),
+					bookingRuntimeAdminAddress(result.Runtime),
+				)
 			} else {
 				fmt.Printf("booking service status=%s running=%t\n", result.Status, result.Running)
 			}
@@ -192,7 +208,9 @@ func newBookingServiceCommand(app *appContext, configFactory func() *bookingServ
 			if err != nil {
 				return err
 			}
-			cfg.Addr = strings.TrimSpace(addr)
+			cfg.PublicAddr = strings.TrimSpace(publicAddr)
+			cfg.Addr = cfg.PublicAddr
+			cfg.AdminAddr = strings.TrimSpace(adminAddr)
 			cfg.RuntimePath = strings.TrimSpace(runtimePath)
 			cfg.DraftsPath = strings.TrimSpace(draftsPath)
 			cfg.APIKeysPath = resolvedSecurityPath
@@ -206,12 +224,14 @@ func newBookingServiceCommand(app *appContext, configFactory func() *bookingServ
 			defer func() {
 				_ = handle.Close()
 			}()
-			fmt.Printf("Booking service listening on %s\n", cfg.Addr)
+			fmt.Printf("Booking service listening on public=%s admin=%s\n", cfg.PublicAddr, cfg.AdminAddr)
 			return handle.Wait()
 		},
 	}
 
-	serviceCmd.PersistentFlags().StringVar(&addr, "addr", defaultBookingServiceAddr, "Listen address, e.g. :18081")
+	serviceCmd.PersistentFlags().StringVar(&publicAddr, "public-addr", defaultBookingServiceAddr, "Public listen address, e.g. :18081")
+	serviceCmd.PersistentFlags().StringVar(&publicAddr, "addr", defaultBookingServiceAddr, "Public listen address (legacy alias of --public-addr)")
+	serviceCmd.PersistentFlags().StringVar(&adminAddr, "admin-addr", defaultBookingServiceAdminAddr, "Admin listen address, e.g. 127.0.0.1:18082")
 	serviceCmd.PersistentFlags().StringVar(&runtimePath, "runtime", defaultBookingRuntimeStatePath(), "Path to booking runtime state JSON")
 	serviceCmd.PersistentFlags().StringVar(&draftsPath, "drafts", defaultBookingIntakeDraftsPath(), "Path to booking intake drafts JSON")
 	serviceCmd.PersistentFlags().StringVar(&securityKeysPath, "security-keys", "", "Path to unified security keys JSON")
