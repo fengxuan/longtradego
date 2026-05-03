@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +36,329 @@ func TestLoadBookingAPIKeys(t *testing.T) {
 	}
 	if _, err := loadBookingAPIKeys(emptyPath); err == nil {
 		t.Fatalf("expected empty booking api keys validation error")
+	}
+}
+
+func TestBookingPublicAuthSignedHeadersAndLegacyFallback(t *testing.T) {
+	now := time.Now().UTC()
+	thirdPartyID := "partner-a"
+	token := "booking-shared-token"
+	body := []byte(`{"user_id":"u-1","content":"hello"}`)
+	timestampText := strconv.FormatInt(now.Unix(), 10)
+	signature := computeWebhookSignature(thirdPartyID, timestampText, token, body)
+
+	controller := &bookingServiceController{
+		apiKeys: map[string]struct{}{
+			token: {},
+		},
+		tokenRecords: map[string]webhookTokenRecord{
+			thirdPartyID: {
+				ThirdPartyID: thirdPartyID,
+				Token:        token,
+				Scopes:       []string{securityScopeBooking},
+			},
+			"booking-blocked": {
+				ThirdPartyID: "booking-blocked",
+				Token:        "token-2",
+				Scopes:       []string{securityScopeWebhook},
+			},
+		},
+	}
+
+	signedReq := httptest.NewRequest(http.MethodPost, bookingPublicIntentParsePath, bytes.NewReader(body))
+	signedReq.Header.Set(webhookHeaderThirdPartyID, thirdPartyID)
+	signedReq.Header.Set(webhookHeaderTimestamp, timestampText)
+	signedReq.Header.Set(webhookHeaderSignature, signature)
+	if !controller.isAPIKeyAuthorized(signedReq) {
+		t.Fatalf("expected signed booking request authorized")
+	}
+	restoredBody, err := io.ReadAll(signedReq.Body)
+	if err != nil {
+		t.Fatalf("read restored body failed: %v", err)
+	}
+	if string(restoredBody) != string(body) {
+		t.Fatalf("expected request body restored after signature check, got %s", string(restoredBody))
+	}
+
+	legacyReq := httptest.NewRequest(http.MethodGet, bookingPublicCatalogPath, nil)
+	legacyReq.Header.Set(bookingHeaderAPIKey, token)
+	if !controller.isAPIKeyAuthorized(legacyReq) {
+		t.Fatalf("expected legacy X-Booking-API-Key authorized")
+	}
+
+	priorityReq := httptest.NewRequest(http.MethodPost, bookingPublicIntentParsePath, bytes.NewReader(body))
+	priorityReq.Header.Set(bookingHeaderAPIKey, token)
+	priorityReq.Header.Set(webhookHeaderThirdPartyID, thirdPartyID)
+	priorityReq.Header.Set(webhookHeaderTimestamp, timestampText)
+	priorityReq.Header.Set(webhookHeaderSignature, "bad-signature")
+	if controller.isAPIKeyAuthorized(priorityReq) {
+		t.Fatalf("expected signed header validation takes priority over legacy api key")
+	}
+
+	scopeReq := httptest.NewRequest(http.MethodPost, bookingPublicIntentParsePath, bytes.NewReader(body))
+	scopeReq.Header.Set(webhookHeaderThirdPartyID, "booking-blocked")
+	scopeReq.Header.Set(webhookHeaderTimestamp, timestampText)
+	scopeReq.Header.Set(webhookHeaderSignature, computeWebhookSignature("booking-blocked", timestampText, "token-2", body))
+	if controller.isAPIKeyAuthorized(scopeReq) {
+		t.Fatalf("expected webhook-only scope token rejected by booking endpoint")
+	}
+}
+
+func TestBookingPublicAuthFailureReasons(t *testing.T) {
+	now := time.Unix(1777797488, 0).UTC()
+	thirdPartyID := "partner-a"
+	token := "booking-shared-token"
+	blockedThirdPartyID := "partner-blocked"
+	blockedToken := "blocked-token"
+	body := []byte(`{"user_id":"u-1","content":"hello"}`)
+	timestampText := strconv.FormatInt(now.Add(-10*time.Minute).Unix(), 10)
+	signature := computeWebhookSignature(thirdPartyID, timestampText, token, body)
+	validTimestampText := strconv.FormatInt(now.Unix(), 10)
+	validSignature := computeWebhookSignature(thirdPartyID, validTimestampText, token, body)
+	blockedSignature := computeWebhookSignature(blockedThirdPartyID, validTimestampText, blockedToken, body)
+
+	controller := &bookingServiceController{
+		tokenRecords: map[string]webhookTokenRecord{
+			thirdPartyID: {
+				ThirdPartyID: thirdPartyID,
+				Token:        token,
+				Scopes:       []string{securityScopeBooking},
+			},
+			blockedThirdPartyID: {
+				ThirdPartyID: blockedThirdPartyID,
+				Token:        blockedToken,
+				Scopes:       []string{securityScopeWebhook},
+			},
+		},
+		nowFn: func() time.Time { return now },
+	}
+	mux := http.NewServeMux()
+	controller.registerHandlers(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	noKeyResp, err := http.Get(server.URL + bookingPublicCatalogPath)
+	if err != nil {
+		t.Fatalf("GET without key failed: %v", err)
+	}
+	noKeyBody := readAllAndClose(t, noKeyResp)
+	if noKeyResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized without key, got %d body=%s", noKeyResp.StatusCode, noKeyBody)
+	}
+	if !strings.Contains(noKeyBody, "missing X-Booking-API-Key") {
+		t.Fatalf("expected missing legacy key reason, got %s", noKeyBody)
+	}
+
+	signedParse := func(headers map[string]string) (int, string) {
+		t.Helper()
+		parseReq, _ := http.NewRequest(http.MethodPost, server.URL+bookingPublicIntentParsePath, bytes.NewReader(body))
+		parseReq.Header.Set("Content-Type", "application/json")
+		for key, value := range headers {
+			parseReq.Header.Set(key, value)
+		}
+		parseResp, err := http.DefaultClient.Do(parseReq)
+		if err != nil {
+			t.Fatalf("signed parse request failed: %v", err)
+		}
+		parseBody := readAllAndClose(t, parseResp)
+		return parseResp.StatusCode, parseBody
+	}
+
+	outOfWindowStatus, outOfWindowBody := signedParse(map[string]string{
+		webhookHeaderThirdPartyID: thirdPartyID,
+		webhookHeaderTimestamp:    timestampText,
+		webhookHeaderSignature:    signature,
+	})
+	if outOfWindowStatus != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized for out-of-window timestamp, got %d body=%s", outOfWindowStatus, outOfWindowBody)
+	}
+	if !strings.Contains(strings.ToLower(outOfWindowBody), "timestamp outside allowed window") {
+		t.Fatalf("expected timestamp reason, got %s", outOfWindowBody)
+	}
+
+	missingHeadersStatus, missingHeadersBody := signedParse(map[string]string{
+		webhookHeaderThirdPartyID: thirdPartyID,
+	})
+	if missingHeadersStatus != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized for missing signed headers, got %d body=%s", missingHeadersStatus, missingHeadersBody)
+	}
+	if !strings.Contains(strings.ToLower(missingHeadersBody), "missing required headers") {
+		t.Fatalf("expected missing headers reason, got %s", missingHeadersBody)
+	}
+
+	invalidTimestampStatus, invalidTimestampBody := signedParse(map[string]string{
+		webhookHeaderThirdPartyID: thirdPartyID,
+		webhookHeaderTimestamp:    "bad-ts",
+		webhookHeaderSignature:    validSignature,
+	})
+	if invalidTimestampStatus != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized for invalid timestamp, got %d body=%s", invalidTimestampStatus, invalidTimestampBody)
+	}
+	if !strings.Contains(strings.ToLower(invalidTimestampBody), "invalid timestamp") {
+		t.Fatalf("expected invalid timestamp reason, got %s", invalidTimestampBody)
+	}
+
+	tokenNotFoundStatus, tokenNotFoundBody := signedParse(map[string]string{
+		webhookHeaderThirdPartyID: "missing-partner",
+		webhookHeaderTimestamp:    validTimestampText,
+		webhookHeaderSignature:    computeWebhookSignature("missing-partner", validTimestampText, token, body),
+	})
+	if tokenNotFoundStatus != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized for missing token record, got %d body=%s", tokenNotFoundStatus, tokenNotFoundBody)
+	}
+	if !strings.Contains(strings.ToLower(tokenNotFoundBody), "token not found for third-party-id") {
+		t.Fatalf("expected token not found reason, got %s", tokenNotFoundBody)
+	}
+
+	scopeMismatchStatus, scopeMismatchBody := signedParse(map[string]string{
+		webhookHeaderThirdPartyID: blockedThirdPartyID,
+		webhookHeaderTimestamp:    validTimestampText,
+		webhookHeaderSignature:    blockedSignature,
+	})
+	if scopeMismatchStatus != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized for scope mismatch, got %d body=%s", scopeMismatchStatus, scopeMismatchBody)
+	}
+	if !strings.Contains(strings.ToLower(scopeMismatchBody), "token scope not allowed for booking") {
+		t.Fatalf("expected scope mismatch reason, got %s", scopeMismatchBody)
+	}
+
+	signatureFailureStatus, signatureFailureBody := signedParse(map[string]string{
+		webhookHeaderThirdPartyID: thirdPartyID,
+		webhookHeaderTimestamp:    validTimestampText,
+		webhookHeaderSignature:    "not-a-real-signature",
+	})
+	if signatureFailureStatus != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized for signature mismatch, got %d body=%s", signatureFailureStatus, signatureFailureBody)
+	}
+	if !strings.Contains(strings.ToLower(signatureFailureBody), "signature verification failed") {
+		t.Fatalf("expected signature mismatch reason, got %s", signatureFailureBody)
+	}
+}
+
+func TestBookingSignedAuthTokenHotReloadWithoutRestart(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "booking_runtime.json")
+	catalogPath := filepath.Join(dir, "booking_catalog.json")
+	reservationsPath := filepath.Join(dir, "booking_reservations.json")
+	draftsPath := filepath.Join(dir, "booking_intake_drafts.json")
+	securityKeysPath := filepath.Join(dir, "security_keys.json")
+	llmConfigPath := filepath.Join(dir, "booking_llm.json")
+	adminAuthPath := filepath.Join(dir, "admin_auth.json")
+
+	initialToken := "token-v1"
+	rotatedToken := "token-v2"
+	thirdPartyID := "partner-a"
+
+	if err := writeSecurityTokenRecords(securityKeysPath, map[string]webhookTokenRecord{
+		thirdPartyID: {
+			ThirdPartyID: thirdPartyID,
+			Token:        initialToken,
+			Scopes:       []string{securityScopeBooking},
+			CreatedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+			UpdatedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+		},
+	}); err != nil {
+		t.Fatalf("write initial security keys failed: %v", err)
+	}
+	if err := os.WriteFile(llmConfigPath, []byte(`{"api_key":"sk-test","base_url":"https://api.openai.com"}`), 0o644); err != nil {
+		t.Fatalf("write booking llm config failed: %v", err)
+	}
+	if err := os.WriteFile(adminAuthPath, []byte(`{"username":"admin","password":"secret"}`), 0o644); err != nil {
+		t.Fatalf("write admin auth failed: %v", err)
+	}
+
+	oldParser := bookingParseIntentWithLLM
+	bookingParseIntentWithLLM = func(ctx context.Context, req bookingIntentParseRequest, parseCtx bookingIntentParseContext) (bookingIntentParseExtracted, error) {
+		return bookingIntentParseExtracted{
+			ProductID:  "p-1",
+			PartySize:  2,
+			Personnel:  bookingReservationPersonnel{ContactName: "Alice", ContactPhone: "13800138000"},
+			Confidence: 0.88,
+		}, nil
+	}
+	defer func() {
+		bookingParseIntentWithLLM = oldParser
+	}()
+
+	handle, err := startBookingHTTPService(context.Background(), &bookingServiceServeConfig{
+		Addr:             "127.0.0.1:0",
+		RuntimePath:      runtimePath,
+		CatalogPath:      catalogPath,
+		ReservationsPath: reservationsPath,
+		DraftsPath:       draftsPath,
+		APIKeysPath:      securityKeysPath,
+		LLMConfigPath:    llmConfigPath,
+		AdminAuthPath:    adminAuthPath,
+		MaxPortFallback:  0,
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("startBookingHTTPService failed: %v", err)
+	}
+	defer func() {
+		_ = handle.Close()
+	}()
+
+	runtime, exists, err := readBookingRuntimeState(runtimePath)
+	if err != nil || !exists || runtime == nil {
+		t.Fatalf("read runtime failed: %v runtime=%+v", err, runtime)
+	}
+	baseURL := "http://" + runtime.Address
+
+	callSignedParseStatus := func(token string) (int, string) {
+		t.Helper()
+		body := `{"user_id":"u-1","channel":"chat","content":"hot reload test"}`
+		timestampText := strconv.FormatInt(time.Now().UTC().Unix(), 10)
+		signature := computeWebhookSignature(thirdPartyID, timestampText, token, []byte(body))
+		req, _ := http.NewRequest(http.MethodPost, baseURL+bookingPublicIntentParsePath, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(webhookHeaderThirdPartyID, thirdPartyID)
+		req.Header.Set(webhookHeaderTimestamp, timestampText)
+		req.Header.Set(webhookHeaderSignature, signature)
+		resp, reqErr := http.DefaultClient.Do(req)
+		if reqErr != nil {
+			t.Fatalf("signed parse request failed: %v", reqErr)
+		}
+		respBody := readAllAndClose(t, resp)
+		return resp.StatusCode, respBody
+	}
+
+	initialStatus, initialBody := callSignedParseStatus(initialToken)
+	if initialStatus != http.StatusOK {
+		t.Fatalf("expected initial token authorized, got %d body=%s", initialStatus, initialBody)
+	}
+
+	if err := writeSecurityTokenRecords(securityKeysPath, map[string]webhookTokenRecord{
+		thirdPartyID: {
+			ThirdPartyID: thirdPartyID,
+			Token:        rotatedToken,
+			Scopes:       []string{securityScopeBooking},
+			CreatedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+			UpdatedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+		},
+	}); err != nil {
+		t.Fatalf("write rotated security keys failed: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var lastStatus int
+	var lastBody string
+	for time.Now().Before(deadline) {
+		lastStatus, lastBody = callSignedParseStatus(rotatedToken)
+		if lastStatus == http.StatusOK {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	if lastStatus != http.StatusOK {
+		t.Fatalf("expected rotated token eventually authorized without restart, got %d body=%s", lastStatus, lastBody)
+	}
+
+	oldStatus, oldBody := callSignedParseStatus(initialToken)
+	if oldStatus != http.StatusUnauthorized {
+		t.Fatalf("expected old token rejected after rotation, got %d body=%s", oldStatus, oldBody)
+	}
+	if !strings.Contains(strings.ToLower(oldBody), "signature verification failed") {
+		t.Fatalf("expected signature failure for old token, got %s", oldBody)
 	}
 }
 
@@ -258,6 +584,9 @@ func TestBookingServiceStartStopWithFallback(t *testing.T) {
 	if result.Runtime.Address == baseAddr {
 		t.Fatalf("expected fallback address because base addr occupied, got %s", result.Runtime.Address)
 	}
+	if result.Runtime.OwnerSessionID != "" || result.Runtime.OwnerStartToken != "" || result.Runtime.OwnerDaemonPID != 0 || result.Runtime.OwnerClaimedAt != "" {
+		t.Fatalf("expected default background start without owner metadata, got %+v", result.Runtime)
+	}
 
 	status, runtime, err := bookingRuntimeStatus(runtimePath)
 	if err != nil {
@@ -273,6 +602,82 @@ func TestBookingServiceStartStopWithFallback(t *testing.T) {
 	}
 	if stopResult.Status != "stale_removed" {
 		t.Fatalf("expected stale_removed stop status, got %+v", stopResult)
+	}
+}
+
+func TestBookingServiceStartWithOwnerClaimWritesRuntimeOwner(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "booking_runtime.json")
+	logPath := filepath.Join(dir, "booking_service.log")
+	catalogPath := filepath.Join(dir, "booking_catalog.json")
+	reservationsPath := filepath.Join(dir, "booking_reservations.json")
+	draftsPath := filepath.Join(dir, "booking_intake_drafts.json")
+	apiKeysPath := filepath.Join(dir, "booking_api_keys.json")
+	adminAuthPath := filepath.Join(dir, "admin_auth.json")
+
+	if err := os.WriteFile(apiKeysPath, []byte(`{"keys":["test-key"]}`), 0o644); err != nil {
+		t.Fatalf("write booking api keys failed: %v", err)
+	}
+	if err := os.WriteFile(adminAuthPath, []byte(`{"username":"admin","password":"secret"}`), 0o644); err != nil {
+		t.Fatalf("write admin auth failed: %v", err)
+	}
+
+	oldSpawn := bookingSpawnBackgroundProcess
+	oldVerify := bookingVerifyBackgroundStart
+	defer func() {
+		bookingSpawnBackgroundProcess = oldSpawn
+		bookingVerifyBackgroundStart = oldVerify
+	}()
+	bookingSpawnBackgroundProcess = func(cfg *bookingServiceServeConfig, logPath string) (int, []string, error) {
+		return 54322, []string{"booking", "service", "serve", "--addr", cfg.Addr}, nil
+	}
+	bookingVerifyBackgroundStart = func(cfg *bookingServiceServeConfig, pid int, authCfg daemonAdminAuthConfig) error {
+		return nil
+	}
+
+	cfg := &bookingServiceServeConfig{
+		Addr:             "127.0.0.1:" + pickFreePort(t),
+		RuntimePath:      runtimePath,
+		CatalogPath:      catalogPath,
+		ReservationsPath: reservationsPath,
+		DraftsPath:       draftsPath,
+		APIKeysPath:      apiKeysPath,
+		AdminAuthPath:    adminAuthPath,
+		MaxPortFallback:  0,
+	}
+	claim := &bookingServiceStartOwnerClaim{
+		SessionID:  "daemon-session-booking",
+		DaemonPID:  13579,
+		ClaimedAt:  time.Now().Add(-2 * time.Second).UTC(),
+		StartToken: "booking-owner-token-x",
+	}
+
+	result, err := startBookingServiceInBackgroundWithOwner(runtimePath, logPath, cfg, claim)
+	if err != nil {
+		t.Fatalf("startBookingServiceInBackgroundWithOwner failed: %v", err)
+	}
+	if result.Status != "started" || result.Runtime == nil {
+		t.Fatalf("expected started runtime result, got %+v", result)
+	}
+	if result.Runtime.OwnerSessionID != claim.SessionID || result.Runtime.OwnerStartToken != claim.StartToken || result.Runtime.OwnerDaemonPID != claim.DaemonPID {
+		t.Fatalf("expected owner metadata in start result, got %+v", result.Runtime)
+	}
+	if strings.TrimSpace(result.Runtime.OwnerClaimedAt) == "" {
+		t.Fatalf("expected owner_claimed_at in start result, got %+v", result.Runtime)
+	}
+
+	runtime, exists, err := readBookingRuntimeState(runtimePath)
+	if err != nil {
+		t.Fatalf("readBookingRuntimeState failed: %v", err)
+	}
+	if !exists || runtime == nil {
+		t.Fatalf("expected booking runtime file after owner start")
+	}
+	if runtime.OwnerSessionID != claim.SessionID || runtime.OwnerStartToken != claim.StartToken || runtime.OwnerDaemonPID != claim.DaemonPID {
+		t.Fatalf("expected owner metadata persisted to runtime file, got %+v", runtime)
+	}
+	if strings.TrimSpace(runtime.OwnerClaimedAt) == "" {
+		t.Fatalf("expected persisted owner_claimed_at, got %+v", runtime)
 	}
 }
 
@@ -306,7 +711,7 @@ func TestBookingServiceStartFailsWhenAPIKeysConfigMissing(t *testing.T) {
 	if !strings.Contains(err.Error(), apiKeysPath) {
 		t.Fatalf("expected error includes missing api keys path %s, got %v", apiKeysPath, err)
 	}
-	if !strings.Contains(err.Error(), "copy conf-example/booking_api_keys.json") {
+	if !strings.Contains(err.Error(), "copy conf-example/security_keys.json") {
 		t.Fatalf("expected error includes copy hint, got %v", err)
 	}
 
@@ -512,6 +917,177 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 		t.Fatalf("expected booking admin action GET 405, got %d body=%s", adminActionResp.StatusCode, body)
 	}
 	_ = adminActionResp.Body.Close()
+}
+
+func TestStartBookingHTTPServiceAdminAuthSupportsPasswordHash(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "booking_runtime.json")
+	catalogPath := filepath.Join(dir, "booking_catalog.json")
+	reservationsPath := filepath.Join(dir, "booking_reservations.json")
+	draftsPath := filepath.Join(dir, "booking_intake_drafts.json")
+	apiKeysPath := filepath.Join(dir, "booking_api_keys.json")
+	llmConfigPath := filepath.Join(dir, "booking_llm.json")
+	adminAuthPath := filepath.Join(dir, "admin_auth.json")
+
+	if err := os.WriteFile(apiKeysPath, []byte(`{"keys":["booking-key"]}`), 0o644); err != nil {
+		t.Fatalf("write booking api keys failed: %v", err)
+	}
+	if err := os.WriteFile(llmConfigPath, []byte(`{"api_key":"sk-test","base_url":"https://api.openai.com"}`), 0o644); err != nil {
+		t.Fatalf("write booking llm config failed: %v", err)
+	}
+	hash, err := hashDaemonAdminPassword("hash-secret", 4)
+	if err != nil {
+		t.Fatalf("hashDaemonAdminPassword failed: %v", err)
+	}
+	if err := os.WriteFile(adminAuthPath, []byte(`{"username":"admin","password_hash":"`+hash+`"}`), 0o644); err != nil {
+		t.Fatalf("write admin auth hash failed: %v", err)
+	}
+
+	handle, err := startBookingHTTPService(context.Background(), &bookingServiceServeConfig{
+		Addr:             "127.0.0.1:0",
+		RuntimePath:      runtimePath,
+		CatalogPath:      catalogPath,
+		ReservationsPath: reservationsPath,
+		DraftsPath:       draftsPath,
+		APIKeysPath:      apiKeysPath,
+		LLMConfigPath:    llmConfigPath,
+		AdminAuthPath:    adminAuthPath,
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("startBookingHTTPService failed: %v", err)
+	}
+	defer func() {
+		_ = handle.Close()
+	}()
+
+	runtime, exists, err := readBookingRuntimeState(runtimePath)
+	if err != nil {
+		t.Fatalf("readBookingRuntimeState failed: %v", err)
+	}
+	if !exists || runtime == nil {
+		t.Fatalf("expected runtime after service start")
+	}
+	baseURL := "http://" + runtime.Address
+
+	okReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	okReq.SetBasicAuth("admin", "hash-secret")
+	okResp, err := http.DefaultClient.Do(okReq)
+	if err != nil {
+		t.Fatalf("GET booking admin status with hash auth failed: %v", err)
+	}
+	if okResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, okResp)
+		t.Fatalf("expected booking admin status 200 with hash auth, got %d body=%s", okResp.StatusCode, body)
+	}
+	_ = okResp.Body.Close()
+
+	badReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	badReq.SetBasicAuth("admin", "wrong-secret")
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatalf("GET booking admin status with wrong hash auth failed: %v", err)
+	}
+	if badResp.StatusCode != http.StatusUnauthorized {
+		body := readAllAndClose(t, badResp)
+		t.Fatalf("expected booking admin status 401 with wrong hash auth, got %d body=%s", badResp.StatusCode, body)
+	}
+	_ = badResp.Body.Close()
+}
+
+func TestStartBookingHTTPServiceReloadsAdminAuthConfigWithoutRestart(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "booking_runtime.json")
+	catalogPath := filepath.Join(dir, "booking_catalog.json")
+	reservationsPath := filepath.Join(dir, "booking_reservations.json")
+	draftsPath := filepath.Join(dir, "booking_intake_drafts.json")
+	apiKeysPath := filepath.Join(dir, "booking_api_keys.json")
+	adminAuthPath := filepath.Join(dir, "admin_auth.json")
+
+	if err := os.WriteFile(apiKeysPath, []byte(`{"keys":["booking-key"]}`), 0o644); err != nil {
+		t.Fatalf("write booking api keys failed: %v", err)
+	}
+	oldHash, err := hashDaemonAdminPassword("old-secret", 4)
+	if err != nil {
+		t.Fatalf("hashDaemonAdminPassword old failed: %v", err)
+	}
+	if err := writeDaemonAdminAuthConfig(adminAuthPath, daemonAdminAuthConfig{
+		Username:     "admin",
+		PasswordHash: oldHash,
+	}); err != nil {
+		t.Fatalf("write initial booking admin auth failed: %v", err)
+	}
+
+	handle, err := startBookingHTTPService(context.Background(), &bookingServiceServeConfig{
+		Addr:             "127.0.0.1:0",
+		RuntimePath:      runtimePath,
+		CatalogPath:      catalogPath,
+		ReservationsPath: reservationsPath,
+		DraftsPath:       draftsPath,
+		APIKeysPath:      apiKeysPath,
+		AdminAuthPath:    adminAuthPath,
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("startBookingHTTPService failed: %v", err)
+	}
+	defer func() {
+		_ = handle.Close()
+	}()
+
+	runtime, exists, err := readBookingRuntimeState(runtimePath)
+	if err != nil {
+		t.Fatalf("readBookingRuntimeState failed: %v", err)
+	}
+	if !exists || runtime == nil {
+		t.Fatalf("expected runtime after service start")
+	}
+	baseURL := "http://" + runtime.Address
+
+	oldReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	oldReq.SetBasicAuth("admin", "old-secret")
+	oldResp, err := http.DefaultClient.Do(oldReq)
+	if err != nil {
+		t.Fatalf("GET booking admin status with old password failed: %v", err)
+	}
+	if oldResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, oldResp)
+		t.Fatalf("expected old password 200 before reload, got %d body=%s", oldResp.StatusCode, body)
+	}
+	_ = oldResp.Body.Close()
+
+	newHash, err := hashDaemonAdminPassword("new-secret", 4)
+	if err != nil {
+		t.Fatalf("hashDaemonAdminPassword new failed: %v", err)
+	}
+	if err := writeDaemonAdminAuthConfig(adminAuthPath, daemonAdminAuthConfig{
+		Username:     "admin",
+		PasswordHash: newHash,
+	}); err != nil {
+		t.Fatalf("write updated booking admin auth failed: %v", err)
+	}
+
+	oldAfterReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	oldAfterReq.SetBasicAuth("admin", "old-secret")
+	oldAfterResp, err := http.DefaultClient.Do(oldAfterReq)
+	if err != nil {
+		t.Fatalf("GET booking admin status old password after reload failed: %v", err)
+	}
+	if oldAfterResp.StatusCode != http.StatusUnauthorized {
+		body := readAllAndClose(t, oldAfterResp)
+		t.Fatalf("expected old password 401 after reload, got %d body=%s", oldAfterResp.StatusCode, body)
+	}
+	_ = oldAfterResp.Body.Close()
+
+	newReq, _ := http.NewRequest(http.MethodGet, baseURL+bookingAdminStatusPath, nil)
+	newReq.SetBasicAuth("admin", "new-secret")
+	newResp, err := http.DefaultClient.Do(newReq)
+	if err != nil {
+		t.Fatalf("GET booking admin status with new password failed: %v", err)
+	}
+	if newResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, newResp)
+		t.Fatalf("expected new password 200 after reload, got %d body=%s", newResp.StatusCode, body)
+	}
+	_ = newResp.Body.Close()
 }
 
 func TestBookingIntentParseLLMUnavailable(t *testing.T) {

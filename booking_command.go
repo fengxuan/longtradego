@@ -59,15 +59,16 @@ func newBookingCommand(app *appContext) *cobra.Command {
 
 func newBookingServiceCommand(app *appContext, configFactory func() *bookingServiceServeConfig) *cobra.Command {
 	var (
-		addr            string
-		runtimePath     string
-		logPath         string
-		draftsPath      string
-		apiKeysPath     string
-		llmConfigPath   string
-		adminAuthPath   string
-		timeout         time.Duration
-		maxPortFallback int
+		addr              string
+		runtimePath       string
+		logPath           string
+		draftsPath        string
+		securityKeysPath  string
+		legacyAPIKeysPath string
+		llmConfigPath     string
+		adminAuthPath     string
+		timeout           time.Duration
+		maxPortFallback   int
 	)
 
 	serviceCmd := &cobra.Command{
@@ -80,17 +81,25 @@ func newBookingServiceCommand(app *appContext, configFactory func() *bookingServ
 		Short: "Start booking service in background",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg := configFactory()
+			resolvedSecurityPath, err := resolveSecurityKeysPath(securityKeysPath, legacyAPIKeysPath, "api-keys")
+			if err != nil {
+				return err
+			}
 			cfg.Addr = strings.TrimSpace(addr)
 			cfg.RuntimePath = strings.TrimSpace(runtimePath)
 			cfg.DraftsPath = strings.TrimSpace(draftsPath)
-			cfg.APIKeysPath = strings.TrimSpace(apiKeysPath)
+			cfg.APIKeysPath = resolvedSecurityPath
 			cfg.LLMConfigPath = strings.TrimSpace(llmConfigPath)
 			cfg.AdminAuthPath = strings.TrimSpace(adminAuthPath)
 			cfg.MaxPortFallback = maxPortFallback
 			if err := cfg.validate(); err != nil {
 				return err
 			}
-			result, err := startBookingServiceInBackground(cfg.RuntimePath, strings.TrimSpace(logPath), cfg)
+			var ownerClaim *bookingServiceStartOwnerClaim
+			if claim, ok := bookingServiceStartOwnerClaimFromContext(cmd.Context()); ok {
+				ownerClaim = &claim
+			}
+			result, err := startBookingServiceInBackgroundWithOwner(cfg.RuntimePath, strings.TrimSpace(logPath), cfg, ownerClaim)
 			if app != nil {
 				app.SetExecution("booking", []string{"service", "start"})
 				app.SetResult(bookingCommandResult{
@@ -179,10 +188,14 @@ func newBookingServiceCommand(app *appContext, configFactory func() *bookingServ
 				return fmt.Errorf("booking service serve is internal; use `booking service start`")
 			}
 			cfg := configFactory()
+			resolvedSecurityPath, err := resolveSecurityKeysPath(securityKeysPath, legacyAPIKeysPath, "api-keys")
+			if err != nil {
+				return err
+			}
 			cfg.Addr = strings.TrimSpace(addr)
 			cfg.RuntimePath = strings.TrimSpace(runtimePath)
 			cfg.DraftsPath = strings.TrimSpace(draftsPath)
-			cfg.APIKeysPath = strings.TrimSpace(apiKeysPath)
+			cfg.APIKeysPath = resolvedSecurityPath
 			cfg.LLMConfigPath = strings.TrimSpace(llmConfigPath)
 			cfg.AdminAuthPath = strings.TrimSpace(adminAuthPath)
 			cfg.MaxPortFallback = maxPortFallback
@@ -201,7 +214,8 @@ func newBookingServiceCommand(app *appContext, configFactory func() *bookingServ
 	serviceCmd.PersistentFlags().StringVar(&addr, "addr", defaultBookingServiceAddr, "Listen address, e.g. :18081")
 	serviceCmd.PersistentFlags().StringVar(&runtimePath, "runtime", defaultBookingRuntimeStatePath(), "Path to booking runtime state JSON")
 	serviceCmd.PersistentFlags().StringVar(&draftsPath, "drafts", defaultBookingIntakeDraftsPath(), "Path to booking intake drafts JSON")
-	serviceCmd.PersistentFlags().StringVar(&apiKeysPath, "api-keys", defaultBookingAPIKeysConfigPath(), "Path to booking API keys config JSON")
+	serviceCmd.PersistentFlags().StringVar(&securityKeysPath, "security-keys", "", "Path to unified security keys JSON")
+	serviceCmd.PersistentFlags().StringVar(&legacyAPIKeysPath, "api-keys", "", "Path to unified security keys JSON (legacy alias)")
 	serviceCmd.PersistentFlags().StringVar(&llmConfigPath, "llm-config", defaultBookingLLMConfigPath(), "Path to booking LLM config JSON")
 	serviceCmd.PersistentFlags().StringVar(&adminAuthPath, "admin-auth", defaultDaemonAdminAuthConfigPath(), "Path to admin basic auth config JSON")
 	serviceCmd.PersistentFlags().IntVar(&maxPortFallback, "max-port-fallback", defaultBookingServicePortFallback, "Fallback attempts when preferred port is occupied")

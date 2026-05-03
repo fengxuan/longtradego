@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
+	"crypto/hmac"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,10 +74,14 @@ type bookingServiceRuntimeState struct {
 }
 
 type bookingServiceRuntimeInfo struct {
-	PID       int    `json:"pid"`
-	Address   string `json:"address"`
-	StartedAt string `json:"started_at"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+	PID             int    `json:"pid"`
+	Address         string `json:"address"`
+	StartedAt       string `json:"started_at"`
+	UpdatedAt       string `json:"updated_at,omitempty"`
+	OwnerSessionID  string `json:"owner_session_id,omitempty"`
+	OwnerDaemonPID  int    `json:"owner_daemon_pid,omitempty"`
+	OwnerClaimedAt  string `json:"owner_claimed_at,omitempty"`
+	OwnerStartToken string `json:"owner_start_token,omitempty"`
 }
 
 type bookingServiceStartResult struct {
@@ -104,6 +108,15 @@ type bookingServiceStopResult struct {
 	PID     int    `json:"pid,omitempty"`
 	Message string `json:"message,omitempty"`
 }
+
+type bookingServiceStartOwnerClaim struct {
+	SessionID  string
+	DaemonPID  int
+	ClaimedAt  time.Time
+	StartToken string
+}
+
+type bookingServiceStartOwnerClaimContextKey struct{}
 
 type bookingAPIKeysConfig struct {
 	Keys    []string `json:"keys"`
@@ -132,19 +145,23 @@ type bookingServiceHandle struct {
 	server      *http.Server
 	listener    net.Listener
 	runtimePath string
+	tokenCache  *webhookTokenCache
 	out         io.Writer
 	stopOnce    sync.Once
 	errCh       chan error
 }
 
 type bookingServiceController struct {
-	service       *bookingService
-	apiKeys       map[string]struct{}
-	authConfig    daemonAdminAuthConfig
-	draftsPath    string
-	llmConfigPath string
-	nowFn         func() time.Time
-	parseWithLLM  bookingIntentParseFn
+	service        *bookingService
+	apiKeys        map[string]struct{}
+	tokenRecords   map[string]webhookTokenRecord
+	tokenCache     *webhookTokenCache
+	authConfig     daemonAdminAuthConfig
+	authConfigPath string
+	draftsPath     string
+	llmConfigPath  string
+	nowFn          func() time.Time
+	parseWithLLM   bookingIntentParseFn
 }
 
 type bookingIntentParseFn func(context.Context, bookingIntentParseRequest, bookingIntentParseContext) (bookingIntentParseExtracted, error)
@@ -155,6 +172,33 @@ var (
 	bookingStateDraftMu           sync.Mutex
 	bookingParseIntentWithLLM     bookingIntentParseFn = parseBookingIntentWithOpenAI
 )
+
+func withBookingServiceStartOwnerClaim(ctx context.Context, claim bookingServiceStartOwnerClaim) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, bookingServiceStartOwnerClaimContextKey{}, claim)
+}
+
+func bookingServiceStartOwnerClaimFromContext(ctx context.Context) (bookingServiceStartOwnerClaim, bool) {
+	if ctx == nil {
+		return bookingServiceStartOwnerClaim{}, false
+	}
+	value := ctx.Value(bookingServiceStartOwnerClaimContextKey{})
+	claim, ok := value.(bookingServiceStartOwnerClaim)
+	if !ok {
+		return bookingServiceStartOwnerClaim{}, false
+	}
+	claim.SessionID = strings.TrimSpace(claim.SessionID)
+	claim.StartToken = strings.TrimSpace(claim.StartToken)
+	if claim.SessionID == "" || claim.StartToken == "" {
+		return bookingServiceStartOwnerClaim{}, false
+	}
+	if claim.ClaimedAt.IsZero() {
+		claim.ClaimedAt = time.Now()
+	}
+	return claim, true
+}
 
 type bookingIntentParseRequest struct {
 	UserID  string `json:"user_id"`
@@ -230,7 +274,7 @@ func defaultBookingServiceLogPath() string {
 }
 
 func defaultBookingAPIKeysConfigPath() string {
-	return filepath.Join(daemonConfigDir, bookingAPIKeysConfigFile)
+	return defaultSecurityKeysPath()
 }
 
 func defaultBookingLLMConfigPath() string {
@@ -283,7 +327,7 @@ func (cfg *bookingServiceServeConfig) validate() error {
 		return fmt.Errorf("drafts is required")
 	}
 	if cfg.APIKeysPath == "" {
-		return fmt.Errorf("api-keys is required")
+		return fmt.Errorf("security-keys is required")
 	}
 	if cfg.LLMConfigPath == "" {
 		cfg.LLMConfigPath = defaultBookingLLMConfigPath()
@@ -298,45 +342,31 @@ func (cfg *bookingServiceServeConfig) validate() error {
 }
 
 func loadBookingAPIKeys(path string) ([]string, error) {
-	trimmedPath := strings.TrimSpace(path)
-	if trimmedPath == "" {
-		return nil, fmt.Errorf("booking api keys config path is empty")
-	}
-	raw, err := os.ReadFile(trimmedPath)
+	records, err := loadSecurityTokenRecords(path, false)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("booking api keys config %s not found; copy conf-example/booking_api_keys.json to %s and set at least one key", trimmedPath, trimmedPath)
-		}
 		return nil, err
 	}
-	if len(strings.TrimSpace(string(raw))) == 0 {
-		return nil, fmt.Errorf("booking api keys config %s is empty", trimmedPath)
-	}
-	var cfg bookingAPIKeysConfig
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("parse booking api keys config %s: %w", trimmedPath, err)
-	}
-	keys := make([]string, 0, len(cfg.Keys)+len(cfg.APIKeys))
-	keys = append(keys, cfg.Keys...)
-	keys = append(keys, cfg.APIKeys...)
-	seen := make(map[string]struct{}, len(keys))
-	clean := make([]string, 0, len(keys))
-	for _, item := range keys {
-		trimmed := strings.TrimSpace(item)
-		if trimmed == "" {
+	seen := make(map[string]struct{}, len(records))
+	keys := make([]string, 0, len(records))
+	for _, record := range records {
+		if !securityRecordHasScope(record, securityScopeBooking) {
 			continue
 		}
-		if _, exists := seen[trimmed]; exists {
+		token := strings.TrimSpace(record.Token)
+		if token == "" {
 			continue
 		}
-		seen[trimmed] = struct{}{}
-		clean = append(clean, trimmed)
+		if _, exists := seen[token]; exists {
+			continue
+		}
+		seen[token] = struct{}{}
+		keys = append(keys, token)
 	}
-	if len(clean) == 0 {
-		return nil, fmt.Errorf("booking api keys config %s has no valid keys", trimmedPath)
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("security keys config %s has no valid booking tokens", strings.TrimSpace(path))
 	}
-	sort.Strings(clean)
-	return clean, nil
+	sort.Strings(keys)
+	return keys, nil
 }
 
 func appendBookingServiceLogLine(logPath string, line string) {
@@ -489,10 +519,7 @@ func writeBookingRuntimeState(path string, runtime bookingServiceRuntimeInfo) er
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(trimmedPath), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(trimmedPath, append(encoded, '\n'), 0o644)
+	return writeFileAtomic(trimmedPath, append(encoded, '\n'), 0o644)
 }
 
 func removeBookingRuntimeState(path string) error {
@@ -581,6 +608,15 @@ func stopBookingService(runtimePath string, timeout time.Duration) (bookingServi
 }
 
 func startBookingServiceInBackground(runtimePath string, logPath string, cfg *bookingServiceServeConfig) (bookingServiceStartResult, error) {
+	return startBookingServiceInBackgroundWithOwner(runtimePath, logPath, cfg, nil)
+}
+
+func startBookingServiceInBackgroundWithOwner(
+	runtimePath string,
+	logPath string,
+	cfg *bookingServiceServeConfig,
+	ownerClaim *bookingServiceStartOwnerClaim,
+) (bookingServiceStartResult, error) {
 	runtimePath = strings.TrimSpace(runtimePath)
 	logPath = strings.TrimSpace(logPath)
 	if runtimePath == "" {
@@ -657,6 +693,20 @@ func startBookingServiceInBackground(runtimePath string, logPath string, cfg *bo
 			StartedAt: nowText,
 			UpdatedAt: nowText,
 		}
+		if ownerClaim != nil {
+			sessionID := strings.TrimSpace(ownerClaim.SessionID)
+			startToken := strings.TrimSpace(ownerClaim.StartToken)
+			if sessionID != "" && startToken != "" {
+				claimedAt := ownerClaim.ClaimedAt
+				if claimedAt.IsZero() {
+					claimedAt = time.Now()
+				}
+				runtimeInfo.OwnerSessionID = sessionID
+				runtimeInfo.OwnerDaemonPID = ownerClaim.DaemonPID
+				runtimeInfo.OwnerClaimedAt = claimedAt.Format(time.RFC3339Nano)
+				runtimeInfo.OwnerStartToken = startToken
+			}
+		}
 		if err := writeBookingRuntimeState(runtimePath, runtimeInfo); err != nil {
 			_ = killProcessByPID(pid)
 			appendBookingServiceStartFailureLog(logPath, err)
@@ -701,6 +751,11 @@ func ensureBookingAddrAvailable(addr string) error {
 }
 
 func verifyBookingBackgroundStart(cfg *bookingServiceServeConfig, pid int, authCfg daemonAdminAuthConfig) error {
+	apiKeys, err := loadBookingAPIKeys(cfg.APIKeysPath)
+	if err != nil {
+		return fmt.Errorf("load booking api keys for readiness check failed: %w", err)
+	}
+	normalizedAuth := normalizeDaemonAdminAuthConfig(authCfg)
 	deadline := time.Now().Add(defaultBookingServiceStartTimeout)
 	var lastErr error
 	for {
@@ -712,10 +767,20 @@ func verifyBookingBackgroundStart(cfg *bookingServiceServeConfig, pid int, authC
 			return fmt.Errorf("booking process exited before becoming ready")
 		}
 
-		if _, err := fetchBookingAdminStatus(cfg.Addr, authCfg, defaultWebhookManagementHTTPTimeout); err == nil {
-			return nil
-		} else {
-			lastErr = err
+		if normalizedAuth.Password != "" {
+			if _, err := fetchBookingAdminStatus(cfg.Addr, normalizedAuth, defaultWebhookManagementHTTPTimeout); err == nil {
+				return nil
+			} else {
+				lastErr = err
+			}
+		}
+
+		if len(apiKeys) > 0 {
+			if err := fetchBookingPublicCatalogStatus(cfg.Addr, apiKeys[0], defaultWebhookManagementHTTPTimeout); err == nil {
+				return nil
+			} else {
+				lastErr = err
+			}
 		}
 
 		if time.Now().After(deadline) {
@@ -724,9 +789,35 @@ func verifyBookingBackgroundStart(cfg *bookingServiceServeConfig, pid int, authC
 		time.Sleep(defaultBookingServiceStartPoll)
 	}
 	if lastErr != nil {
-		return fmt.Errorf("booking admin endpoint not ready: %w", lastErr)
+		return fmt.Errorf("booking service endpoint not ready: %w", lastErr)
 	}
-	return fmt.Errorf("booking admin endpoint not ready")
+	return fmt.Errorf("booking service endpoint not ready")
+}
+
+func fetchBookingPublicCatalogStatus(address string, apiKey string, timeout time.Duration) error {
+	url := buildWebhookManagementURL(address, bookingPublicCatalogPath)
+	if strings.TrimSpace(url) == "" {
+		return fmt.Errorf("booking address is empty")
+	}
+	clientTimeout := timeout
+	if clientTimeout <= 0 {
+		clientTimeout = 2 * time.Second
+	}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(bookingHeaderAPIKey, strings.TrimSpace(apiKey))
+	resp, err := (&http.Client{Timeout: clientTimeout}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("booking catalog status http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func fetchBookingAdminStatus(address string, authCfg daemonAdminAuthConfig, timeout time.Duration) (bookingAdminStatus, error) {
@@ -796,7 +887,7 @@ func buildBookingServiceServeArgs(cfg *bookingServiceServeConfig) []string {
 	args = append(args, "--catalog", cfg.CatalogPath)
 	args = append(args, "--reservations", cfg.ReservationsPath)
 	args = append(args, "--drafts", cfg.DraftsPath)
-	args = append(args, "--api-keys", cfg.APIKeysPath)
+	args = append(args, "--security-keys", cfg.APIKeysPath)
 	args = append(args, "--llm-config", cfg.LLMConfigPath)
 	args = append(args, "--admin-auth", cfg.AdminAuthPath)
 	return args
@@ -810,6 +901,21 @@ func startBookingHTTPService(ctx context.Context, cfg *bookingServiceServeConfig
 	if err != nil {
 		return nil, err
 	}
+	tokenRecords, err := loadSecurityTokenRecords(cfg.APIKeysPath, false)
+	if err != nil {
+		return nil, err
+	}
+	tokenCache, err := newWebhookTokenCache(cfg.APIKeysPath, defaultWebhookTokenRefreshInterval)
+	if err != nil {
+		return nil, err
+	}
+	tokenCache.Start()
+	tokenCacheStarted := true
+	defer func() {
+		if tokenCacheStarted {
+			tokenCache.Stop()
+		}
+	}()
 	authCfg, err := loadDaemonAdminAuthConfig(cfg.AdminAuthPath)
 	if err != nil {
 		return nil, err
@@ -829,13 +935,16 @@ func startBookingHTTPService(ctx context.Context, cfg *bookingServiceServeConfig
 	}
 
 	controller := &bookingServiceController{
-		service:       newBookingService(cfg.CatalogPath, cfg.ReservationsPath),
-		apiKeys:       bookingAPIKeySet(apiKeys),
-		authConfig:    authCfg,
-		draftsPath:    cfg.DraftsPath,
-		llmConfigPath: cfg.LLMConfigPath,
-		nowFn:         time.Now,
-		parseWithLLM:  bookingParseIntentWithLLM,
+		service:        newBookingService(cfg.CatalogPath, cfg.ReservationsPath),
+		apiKeys:        bookingAPIKeySet(apiKeys),
+		tokenRecords:   tokenRecords,
+		tokenCache:     tokenCache,
+		authConfig:     authCfg,
+		authConfigPath: strings.TrimSpace(cfg.AdminAuthPath),
+		draftsPath:     cfg.DraftsPath,
+		llmConfigPath:  cfg.LLMConfigPath,
+		nowFn:          time.Now,
+		parseWithLLM:   bookingParseIntentWithLLM,
 	}
 
 	mux := http.NewServeMux()
@@ -862,9 +971,11 @@ func startBookingHTTPService(ctx context.Context, cfg *bookingServiceServeConfig
 		server:      server,
 		listener:    listener,
 		runtimePath: cfg.RuntimePath,
+		tokenCache:  tokenCache,
 		out:         out,
 		errCh:       make(chan error, 1),
 	}
+	tokenCacheStarted = false
 	go func() {
 		err := server.Serve(listener)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -896,6 +1007,9 @@ func (s *bookingServiceHandle) Close() error {
 	}
 	var closeErr error
 	s.stopOnce.Do(func() {
+		if s.tokenCache != nil {
+			s.tokenCache.Stop()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if s.server != nil {
@@ -943,8 +1057,13 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 
 	requireAPIKey := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			if !c.isAPIKeyAuthorized(r) {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			authorized, reason := c.isPublicAuthorized(r)
+			if !authorized {
+				c.logPublicAuthFailure(r, reason)
+				if strings.TrimSpace(reason) == "" {
+					reason = "unauthorized"
+				}
+				http.Error(w, reason, http.StatusUnauthorized)
 				return
 			}
 			next(w, r)
@@ -1237,18 +1356,121 @@ func (c *bookingServiceController) registerHandlers(mux *http.ServeMux) {
 }
 
 func (c *bookingServiceController) isAPIKeyAuthorized(r *http.Request) bool {
+	authorized, _ := c.isPublicAuthorized(r)
+	return authorized
+}
+
+func (c *bookingServiceController) isPublicAuthorized(r *http.Request) (bool, string) {
 	if r == nil {
-		return false
+		return false, "invalid request"
 	}
-	if len(c.apiKeys) == 0 {
-		return false
+	thirdPartyID := normalizeThirdPartyID(r.Header.Get(webhookHeaderThirdPartyID))
+	timestampText := strings.TrimSpace(r.Header.Get(webhookHeaderTimestamp))
+	signatureText := strings.ToLower(strings.TrimSpace(r.Header.Get(webhookHeaderSignature)))
+	if thirdPartyID != "" || timestampText != "" || signatureText != "" {
+		return c.isBookingSignedAuthorized(r, thirdPartyID, timestampText, signatureText)
 	}
 	key := strings.TrimSpace(r.Header.Get(bookingHeaderAPIKey))
 	if key == "" {
-		return false
+		return false, "missing X-Booking-API-Key"
 	}
-	_, ok := c.apiKeys[key]
-	return ok
+	if c.tokenCache != nil {
+		if _, found, err := c.tokenCache.FindByToken(key, securityScopeBooking); err == nil && found {
+			return true, ""
+		} else if err != nil {
+			return false, fmt.Sprintf("token cache lookup failed: %v", err)
+		}
+	}
+	for _, record := range c.tokenRecords {
+		if strings.TrimSpace(record.Token) == key && securityRecordHasScope(record, securityScopeBooking) {
+			return true, ""
+		}
+	}
+	if len(c.apiKeys) > 0 {
+		if _, ok := c.apiKeys[key]; ok {
+			return true, ""
+		}
+	}
+	return false, "token not found for booking scope"
+}
+
+func (c *bookingServiceController) isBookingSignedAuthorized(
+	r *http.Request,
+	thirdPartyID string,
+	timestampText string,
+	signatureText string,
+) (bool, string) {
+	if r == nil {
+		return false, "invalid request"
+	}
+	if thirdPartyID == "" || timestampText == "" || signatureText == "" {
+		return false, "missing required headers"
+	}
+	timestamp, err := parseWebhookTimestamp(timestampText)
+	if err != nil {
+		return false, err.Error()
+	}
+	if !webhookTimestampWithinWindow(c.now(), timestamp, defaultWebhookTimestampSkew) {
+		return false, "timestamp outside allowed window"
+	}
+	record, found, err := c.findBookingTokenByThirdPartyID(thirdPartyID)
+	if err != nil {
+		return false, fmt.Sprintf("token lookup failed: %v", err)
+	}
+	if !found {
+		return false, "token not found for third-party-id"
+	}
+	if !securityRecordHasScope(record, securityScopeBooking) {
+		return false, "token scope not allowed for booking"
+	}
+	body, err := readWebhookBody(r.Body, defaultWebhookMaxBodyBytes)
+	if err != nil {
+		return false, err.Error()
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	expected := computeWebhookSignature(thirdPartyID, timestampText, record.Token, body)
+	if !hmac.Equal([]byte(signatureText), []byte(expected)) {
+		return false, "signature verification failed"
+	}
+	return true, ""
+}
+
+func (c *bookingServiceController) findBookingTokenByThirdPartyID(thirdPartyID string) (webhookTokenRecord, bool, error) {
+	normalizedID := normalizeThirdPartyID(thirdPartyID)
+	if normalizedID == "" {
+		return webhookTokenRecord{}, false, nil
+	}
+	if c.tokenCache != nil {
+		record, found, err := c.tokenCache.Find(normalizedID)
+		if err != nil {
+			return webhookTokenRecord{}, false, err
+		}
+		if found {
+			return record, true, nil
+		}
+	}
+	if len(c.tokenRecords) == 0 {
+		return webhookTokenRecord{}, false, nil
+	}
+	record, found := c.tokenRecords[normalizedID]
+	return record, found, nil
+}
+
+func (c *bookingServiceController) logPublicAuthFailure(r *http.Request, reason string) {
+	if strings.TrimSpace(reason) == "" {
+		reason = "unauthorized"
+	}
+	path := ""
+	method := ""
+	remote := ""
+	thirdPartyID := ""
+	if r != nil {
+		path = strings.TrimSpace(r.URL.Path)
+		method = strings.TrimSpace(r.Method)
+		remote = strings.TrimSpace(r.RemoteAddr)
+		thirdPartyID = normalizeThirdPartyID(r.Header.Get(webhookHeaderThirdPartyID))
+	}
+	log.Printf("booking public auth failed: method=%s path=%s remote=%s third_party_id=%s reason=%s", method, path, remote, thirdPartyID, reason)
 }
 
 func (c *bookingServiceController) isAdminAuthorized(r *http.Request) bool {
@@ -1259,8 +1481,15 @@ func (c *bookingServiceController) isAdminAuthorized(r *http.Request) bool {
 	if !ok {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(username), []byte(c.authConfig.Username)) == 1 &&
-		subtle.ConstantTimeCompare([]byte(password), []byte(c.authConfig.Password)) == 1
+	authCfg := c.authConfig
+	if strings.TrimSpace(c.authConfigPath) != "" {
+		reloadedCfg, err := loadDaemonAdminAuthConfig(c.authConfigPath)
+		if err != nil {
+			return false
+		}
+		authCfg = reloadedCfg
+	}
+	return daemonAdminCredentialsMatch(authCfg, username, password)
 }
 
 func writeBookingJSON(w http.ResponseWriter, status int, payload any) {

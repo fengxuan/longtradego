@@ -671,6 +671,41 @@ func (c *webhookTokenCache) Find(thirdPartyID string) (webhookTokenRecord, bool,
 	return record, true, nil
 }
 
+func (c *webhookTokenCache) Snapshot() map[string]webhookTokenRecord {
+	if c == nil {
+		return map[string]webhookTokenRecord{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	copyMap := make(map[string]webhookTokenRecord, len(c.records))
+	for key, record := range c.records {
+		copyMap[key] = record
+	}
+	return copyMap
+}
+
+func (c *webhookTokenCache) FindByToken(token string, requiredScope string) (webhookTokenRecord, bool, error) {
+	if c == nil {
+		return webhookTokenRecord{}, false, fmt.Errorf("token cache is not initialized")
+	}
+	trimmedToken := strings.TrimSpace(token)
+	if trimmedToken == "" {
+		return webhookTokenRecord{}, false, nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, record := range c.records {
+		if strings.TrimSpace(record.Token) != trimmedToken {
+			continue
+		}
+		if strings.TrimSpace(requiredScope) != "" && !securityRecordHasScope(record, requiredScope) {
+			continue
+		}
+		return record, true, nil
+	}
+	return webhookTokenRecord{}, false, nil
+}
+
 func (c *webhookTokenCache) Status() webhookTokenCacheStatus {
 	if c == nil {
 		return webhookTokenCacheStatus{}

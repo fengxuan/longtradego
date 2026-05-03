@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -147,5 +148,22 @@ func TestBookingCommandServiceStatus(t *testing.T) {
 	}
 	if result.ServiceState.Status != "stopped" || result.ServiceState.Running {
 		t.Fatalf("expected stopped booking service status, got %+v", result.ServiceState)
+	}
+}
+
+func TestBookingServiceStartRejectsConflictingSecurityFlags(t *testing.T) {
+	app := newAppContext()
+	cmd := newBookingCommand(app)
+	cmd.SetArgs([]string{
+		"service", "start",
+		"--security-keys", "/tmp/security-a.json",
+		"--api-keys", "/tmp/security-b.json",
+	})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("expected conflict error when --security-keys and --api-keys differ")
+	}
+	if !strings.Contains(err.Error(), "must point to the same path") {
+		t.Fatalf("expected conflict error message, got %v", err)
 	}
 }

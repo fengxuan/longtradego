@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "tokens": [
+    {
+      "third_party_id": "partner-a",
+      "token": "replace-with-strong-random-token",
+      "scopes": ["booking", "webhook"],
+      "created_at": "2026-05-03T00:00:00Z",
+      "updated_at": "2026-05-03T00:00:00Z"
+    }
+  ]
+}

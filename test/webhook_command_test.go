@@ -711,6 +711,105 @@ func TestWebhookTokenGenerateQueryResetLifecycle(t *testing.T) {
 	}
 }
 
+func TestWebhookTokenScopeGenerateAndReset(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "webhook_tokens.json")
+	now := time.Unix(1710000000, 0).UTC()
+
+	record, err := createWebhookTokenWithScopes(storePath, "partner-scope", []string{securityScopeWebhook}, now)
+	if err != nil {
+		t.Fatalf("createWebhookTokenWithScopes failed: %v", err)
+	}
+	if !securityRecordHasScope(record, securityScopeWebhook) || securityRecordHasScope(record, securityScopeBooking) {
+		t.Fatalf("expected webhook-only scope, got %+v", record.Scopes)
+	}
+
+	resetRecord, err := resetWebhookTokenWithScopes(storePath, "partner-scope", []string{securityScopeBooking}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("resetWebhookTokenWithScopes failed: %v", err)
+	}
+	if !securityRecordHasScope(resetRecord, securityScopeBooking) || securityRecordHasScope(resetRecord, securityScopeWebhook) {
+		t.Fatalf("expected booking-only scope after reset, got %+v", resetRecord.Scopes)
+	}
+}
+
+func TestWebhookTokenCommandRejectsConflictingSecurityFlags(t *testing.T) {
+	app := newAppContext()
+	cmd := newWebhookTokenCommand(app)
+	cmd.SetArgs([]string{
+		"query", "partner-a",
+		"--security-keys", "/tmp/security-a.json",
+		"--token-store", "/tmp/security-b.json",
+	})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("expected conflict error when --security-keys and --token-store differ")
+	}
+	if !strings.Contains(err.Error(), "must point to the same path") {
+		t.Fatalf("expected conflict error message, got %v", err)
+	}
+}
+
+func TestWebhookStartRejectsConflictingSecurityFlags(t *testing.T) {
+	app := newAppContext()
+	cmd := newWebhookStartCommand(app)
+	cmd.SetArgs([]string{
+		"--security-keys", "/tmp/security-a.json",
+		"--token-store", "/tmp/security-b.json",
+	})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("expected conflict error when --security-keys and --token-store differ")
+	}
+	if !strings.Contains(err.Error(), "must point to the same path") {
+		t.Fatalf("expected conflict error message, got %v", err)
+	}
+}
+
+func TestWebhookHandlerRejectsBookingOnlyScopeToken(t *testing.T) {
+	now := time.Unix(1710000000, 0).UTC()
+	tokenStore := filepath.Join(t.TempDir(), "webhook_tokens.json")
+	eventLog := filepath.Join(t.TempDir(), "webhook_events.json")
+
+	if err := writeWebhookTokenRecords(tokenStore, map[string]webhookTokenRecord{
+		"partner-a": {
+			ThirdPartyID: "partner-a",
+			Token:        "secret-token",
+			Scopes:       []string{securityScopeBooking},
+			CreatedAt:    now.Format(time.RFC3339Nano),
+			UpdatedAt:    now.Format(time.RFC3339Nano),
+		},
+	}); err != nil {
+		t.Fatalf("writeWebhookTokenRecords failed: %v", err)
+	}
+
+	body := []byte(`{"order_id":"o-1"}`)
+	signResult := buildWebhookSignResult("partner-a", "secret-token", "1710000000", body, "/webhook/events", "")
+	req := httptest.NewRequest(http.MethodPost, "/webhook/events", strings.NewReader(signResult.Body))
+	for key, value := range signResult.Headers {
+		req.Header.Set(key, value)
+	}
+	rr := httptest.NewRecorder()
+
+	handler := newWebhookEventHandler(webhookServeOptions{
+		TokenStorePath: tokenStore,
+		EventLogPath:   eventLog,
+		TimestampSkew:  5 * time.Minute,
+		MaxBodyBytes:   1024 * 1024,
+		Now: func() time.Time {
+			return now
+		},
+	})
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	event := decodeWebhookResponse(t, rr.Body.Bytes())
+	if !strings.Contains(strings.ToLower(event.Meta.Error), "scope") {
+		t.Fatalf("expected scope error message, got %q", event.Meta.Error)
+	}
+}
+
 func TestWebhookHandlerRejectsGETMethod(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/webhook/events", nil)
 	rr := httptest.NewRecorder()

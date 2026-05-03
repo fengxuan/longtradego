@@ -33,6 +33,21 @@ func TestLoadDaemonAdminAuthConfig(t *testing.T) {
 	if cfg.Username != "admin" || cfg.Password != "secret" {
 		t.Fatalf("unexpected auth config loaded: %+v", cfg)
 	}
+	hash, err := hashDaemonAdminPassword("secret-hash", 4)
+	if err != nil {
+		t.Fatalf("hashDaemonAdminPassword failed: %v", err)
+	}
+	hashPath := filepath.Join(dir, "password_hash.json")
+	if err := os.WriteFile(hashPath, []byte(`{"username":"admin","password_hash":"`+hash+`"}`), 0o644); err != nil {
+		t.Fatalf("write hash auth config failed: %v", err)
+	}
+	hashCfg, err := loadDaemonAdminAuthConfig(hashPath)
+	if err != nil {
+		t.Fatalf("loadDaemonAdminAuthConfig hash failed: %v", err)
+	}
+	if hashCfg.Username != "admin" || strings.TrimSpace(hashCfg.PasswordHash) == "" {
+		t.Fatalf("unexpected hash auth config loaded: %+v", hashCfg)
+	}
 
 	if _, err := loadDaemonAdminAuthConfig(filepath.Join(dir, "missing.json")); err == nil {
 		t.Fatalf("expected missing auth config error")
@@ -60,6 +75,63 @@ func TestLoadDaemonAdminAuthConfig(t *testing.T) {
 	}
 	if _, err := loadDaemonAdminAuthConfig(emptyPasswordPath); err == nil {
 		t.Fatalf("expected empty password auth config error")
+	}
+
+	invalidHashPath := filepath.Join(dir, "invalid_hash.json")
+	if err := os.WriteFile(invalidHashPath, []byte(`{"username":"admin","password_hash":"invalid"}`), 0o644); err != nil {
+		t.Fatalf("write invalid hash config failed: %v", err)
+	}
+	if _, err := loadDaemonAdminAuthConfig(invalidHashPath); err == nil {
+		t.Fatalf("expected invalid password_hash auth config error")
+	}
+}
+
+func TestDaemonAdminCredentialsMatchUsesHashPriority(t *testing.T) {
+	hash, err := hashDaemonAdminPassword("right-password", 4)
+	if err != nil {
+		t.Fatalf("hashDaemonAdminPassword failed: %v", err)
+	}
+	cfg := daemonAdminAuthConfig{
+		Username:     "admin",
+		Password:     "legacy-password",
+		PasswordHash: hash,
+	}
+	if !daemonAdminCredentialsMatch(cfg, "admin", "right-password") {
+		t.Fatalf("expected hash credential verification success")
+	}
+	if daemonAdminCredentialsMatch(cfg, "admin", "legacy-password") {
+		t.Fatalf("expected hash priority rejects legacy plaintext password when mismatch")
+	}
+}
+
+func TestWriteDaemonAdminAuthConfigHashClearsLegacyPassword(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admin_auth.json")
+	hash, err := hashDaemonAdminPassword("secret", 4)
+	if err != nil {
+		t.Fatalf("hashDaemonAdminPassword failed: %v", err)
+	}
+	if err := writeDaemonAdminAuthConfig(path, daemonAdminAuthConfig{
+		Username:     "admin",
+		Password:     "legacy-plain",
+		PasswordHash: hash,
+	}); err != nil {
+		t.Fatalf("writeDaemonAdminAuthConfig failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read written auth config failed: %v", err)
+	}
+	if strings.Contains(string(raw), `"password":`) {
+		t.Fatalf("expected hash writeback to clear legacy password field, got %s", string(raw))
+	}
+
+	cfg, err := loadDaemonAdminAuthConfig(path)
+	if err != nil {
+		t.Fatalf("loadDaemonAdminAuthConfig after write failed: %v", err)
+	}
+	if cfg.Username != "admin" || strings.TrimSpace(cfg.PasswordHash) == "" {
+		t.Fatalf("unexpected config after write: %+v", cfg)
 	}
 }
 
@@ -220,6 +292,9 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 	stubBookingStartCalls := 0
 	stubBookingStopCalls := 0
 	stubBookingStatusCalls := 0
+	daemonSessionID := "daemon-test-session"
+	bookingOwnedMu := &sync.Mutex{}
+	bookingOwnedPIDs := map[int]daemonOwnedBookingRuntime{}
 	authConfig := daemonAdminAuthConfig{
 		Username: testDaemonAdminUsername,
 		Password: testDaemonAdminPassword,
@@ -231,7 +306,7 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 		MaxPortFallback: 2,
 		RuntimePath:     runtimePath,
 		DaemonPID:       os.Getpid(),
-		DaemonSessionID: "daemon-test-session",
+		DaemonSessionID: daemonSessionID,
 		DaemonStartedAt: time.Now(),
 		TaskManager:     taskManager,
 		MonitorMu:       &monitorMu,
@@ -251,6 +326,8 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 		},
 		WebhookOwnedMu:   &sync.Mutex{},
 		WebhookOwnedPIDs: map[int]daemonOwnedWebhookRuntime{},
+		BookingOwnedMu:   bookingOwnedMu,
+		BookingOwnedPIDs: bookingOwnedPIDs,
 		WebhookRuntime:   filepath.Join(t.TempDir(), "webhook_runtime.json"),
 		WebhookLogPath:   filepath.Join(t.TempDir(), "webhook_server.log"),
 		WebhookStartFn: func() (webhookStartResult, error) {
@@ -271,9 +348,13 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 				Mode:   "service_start",
 				Status: "started",
 				Runtime: &bookingServiceRuntimeInfo{
-					PID:       12001,
-					Address:   "127.0.0.1:18081",
-					StartedAt: time.Now().Format(time.RFC3339Nano),
+					PID:             12001,
+					Address:         "127.0.0.1:18081",
+					StartedAt:       time.Now().Format(time.RFC3339Nano),
+					OwnerSessionID:  daemonSessionID,
+					OwnerDaemonPID:  os.Getpid(),
+					OwnerClaimedAt:  time.Now().Format(time.RFC3339Nano),
+					OwnerStartToken: "admin-booking-owner-token",
 				},
 			}, nil
 		},
@@ -586,7 +667,19 @@ func TestStartDaemonAdminServiceFallbackAndEndpoints(t *testing.T) {
 		t.Fatalf("expected webhook action stubs called once, got start=%d stop=%d kill=%d", stubWebhookStartCalls, stubWebhookStopCalls, stubWebhookKillCalls)
 	}
 	mustPOSTFormWithBasicAuth(t, baseURL+daemonAdminBookingServiceStartPath, url.Values{}, authConfig.Username, authConfig.Password, http.StatusOK)
+	bookingOwnedMu.Lock()
+	if _, tracked := bookingOwnedPIDs[12001]; !tracked {
+		bookingOwnedMu.Unlock()
+		t.Fatalf("expected booking pid tracked after admin booking start, got %v", bookingOwnedPIDs)
+	}
+	bookingOwnedMu.Unlock()
 	mustPOSTFormWithBasicAuth(t, baseURL+daemonAdminBookingServiceStopPath, url.Values{}, authConfig.Username, authConfig.Password, http.StatusOK)
+	bookingOwnedMu.Lock()
+	if _, tracked := bookingOwnedPIDs[12001]; tracked {
+		bookingOwnedMu.Unlock()
+		t.Fatalf("expected booking pid untracked after admin booking stop, got %v", bookingOwnedPIDs)
+	}
+	bookingOwnedMu.Unlock()
 	if stubBookingStartCalls != 1 || stubBookingStopCalls != 1 {
 		t.Fatalf("expected booking service start/stop callbacks once, got start=%d stop=%d", stubBookingStartCalls, stubBookingStopCalls)
 	}
@@ -639,6 +732,141 @@ func TestStartDaemonAdminServiceAllPortsBusy(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected daemon admin start failure when all ports busy")
 	}
+}
+
+func TestStartDaemonAdminServiceSupportsPasswordHashAuth(t *testing.T) {
+	hash, err := hashDaemonAdminPassword("hash-secret", 4)
+	if err != nil {
+		t.Fatalf("hashDaemonAdminPassword failed: %v", err)
+	}
+	taskManager := newDaemonTaskManagerWithPaths(func(ctx context.Context, commands [][]string) error { return nil }, filepath.Join(t.TempDir(), "daemon_tasks.json"), filepath.Join(t.TempDir(), "daemon_tasks_history.json"))
+	defer taskManager.Close()
+
+	svc, err := startDaemonAdminService(daemonAdminServiceOptions{
+		PreferredAddr:   "127.0.0.1:" + pickFreePort(t),
+		MaxPortFallback: 0,
+		RuntimePath:     filepath.Join(t.TempDir(), "admin_runtime.json"),
+		DaemonPID:       os.Getpid(),
+		DaemonSessionID: "daemon-hash-auth",
+		DaemonStartedAt: time.Now(),
+		TaskManager:     taskManager,
+		MonitorMu:       &sync.Mutex{},
+		Monitors:        map[int]*daemonMonitorRuntime{},
+		MonitorRecords:  map[string]daemonMonitorRecord{},
+		AuthConfig: daemonAdminAuthConfig{
+			Username:     testDaemonAdminUsername,
+			PasswordHash: hash,
+		},
+	})
+	if err != nil {
+		t.Fatalf("startDaemonAdminService hash auth failed: %v", err)
+	}
+	defer func() {
+		_ = svc.Close()
+	}()
+
+	okResp, err := httpGetWithBasicAuth(svc.URL(), testDaemonAdminUsername, "hash-secret")
+	if err != nil {
+		t.Fatalf("GET admin home with hash auth failed: %v", err)
+	}
+	if okResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, okResp)
+		t.Fatalf("expected /admin 200 with hash auth, got %d body=%s", okResp.StatusCode, body)
+	}
+	_ = okResp.Body.Close()
+
+	badResp, err := httpGetWithBasicAuth(svc.URL(), testDaemonAdminUsername, "wrong-secret")
+	if err != nil {
+		t.Fatalf("GET admin home with wrong hash auth failed: %v", err)
+	}
+	if badResp.StatusCode != http.StatusUnauthorized {
+		body := readAllAndClose(t, badResp)
+		t.Fatalf("expected /admin 401 with wrong hash auth, got %d body=%s", badResp.StatusCode, body)
+	}
+	_ = badResp.Body.Close()
+}
+
+func TestStartDaemonAdminServiceReloadsAuthConfigWithoutRestart(t *testing.T) {
+	authPath := filepath.Join(t.TempDir(), "admin_auth.json")
+	initialHash, err := hashDaemonAdminPassword("old-secret", 4)
+	if err != nil {
+		t.Fatalf("hashDaemonAdminPassword old failed: %v", err)
+	}
+	if err := writeDaemonAdminAuthConfig(authPath, daemonAdminAuthConfig{
+		Username:     testDaemonAdminUsername,
+		PasswordHash: initialHash,
+	}); err != nil {
+		t.Fatalf("write initial admin auth failed: %v", err)
+	}
+	loadedAuth, err := loadDaemonAdminAuthConfig(authPath)
+	if err != nil {
+		t.Fatalf("load initial admin auth failed: %v", err)
+	}
+
+	taskManager := newDaemonTaskManagerWithPaths(func(ctx context.Context, commands [][]string) error { return nil }, filepath.Join(t.TempDir(), "daemon_tasks.json"), filepath.Join(t.TempDir(), "daemon_tasks_history.json"))
+	defer taskManager.Close()
+
+	svc, err := startDaemonAdminService(daemonAdminServiceOptions{
+		PreferredAddr:   "127.0.0.1:" + pickFreePort(t),
+		MaxPortFallback: 0,
+		RuntimePath:     filepath.Join(t.TempDir(), "admin_runtime.json"),
+		AuthConfigPath:  authPath,
+		DaemonPID:       os.Getpid(),
+		DaemonSessionID: "daemon-auth-reload",
+		DaemonStartedAt: time.Now(),
+		TaskManager:     taskManager,
+		MonitorMu:       &sync.Mutex{},
+		Monitors:        map[int]*daemonMonitorRuntime{},
+		MonitorRecords:  map[string]daemonMonitorRecord{},
+		AuthConfig:      loadedAuth,
+	})
+	if err != nil {
+		t.Fatalf("startDaemonAdminService failed: %v", err)
+	}
+	defer func() {
+		_ = svc.Close()
+	}()
+
+	oldResp, err := httpGetWithBasicAuth(svc.URL(), testDaemonAdminUsername, "old-secret")
+	if err != nil {
+		t.Fatalf("GET admin home with old password failed: %v", err)
+	}
+	if oldResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, oldResp)
+		t.Fatalf("expected old password 200 before reload, got %d body=%s", oldResp.StatusCode, body)
+	}
+	_ = oldResp.Body.Close()
+
+	nextHash, err := hashDaemonAdminPassword("new-secret", 4)
+	if err != nil {
+		t.Fatalf("hashDaemonAdminPassword new failed: %v", err)
+	}
+	if err := writeDaemonAdminAuthConfig(authPath, daemonAdminAuthConfig{
+		Username:     testDaemonAdminUsername,
+		PasswordHash: nextHash,
+	}); err != nil {
+		t.Fatalf("write updated admin auth failed: %v", err)
+	}
+
+	oldAfterResp, err := httpGetWithBasicAuth(svc.URL(), testDaemonAdminUsername, "old-secret")
+	if err != nil {
+		t.Fatalf("GET admin home old password after reload failed: %v", err)
+	}
+	if oldAfterResp.StatusCode != http.StatusUnauthorized {
+		body := readAllAndClose(t, oldAfterResp)
+		t.Fatalf("expected old password 401 after reload, got %d body=%s", oldAfterResp.StatusCode, body)
+	}
+	_ = oldAfterResp.Body.Close()
+
+	newResp, err := httpGetWithBasicAuth(svc.URL(), testDaemonAdminUsername, "new-secret")
+	if err != nil {
+		t.Fatalf("GET admin home with new password failed: %v", err)
+	}
+	if newResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, newResp)
+		t.Fatalf("expected new password 200 after reload, got %d body=%s", newResp.StatusCode, body)
+	}
+	_ = newResp.Body.Close()
 }
 
 func TestBuildDaemonAdminTaskViewState(t *testing.T) {

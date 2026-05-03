@@ -18,7 +18,7 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 - Automatic update reminder cache (`data/update_state.json`, max once per 24h check)
 - `webhook` command for signature generation, test sending, managed lifecycle (`start/status/stop/kill-port`), and management endpoints (`/admin`, `/healthz`, `/readyz`, `/admin/webhook/status`, `/metrics`, `/admin/webhook/stop`)
 - `booking` command for product/slot/reservation/query management and independent service lifecycle (`booking service start/status/stop`)
-- Booking public API key config (`conf/booking_api_keys.json`)
+- Unified external security key config (`conf/security_keys.json`, scopes: `booking` / `webhook`)
 - `admin` command for daemon-admin runtime inspection (`admin status`)
 - Daemon scheduled task management (`task add/list/pause/resume/global-pause/global-resume/remove`)
 - Daemon task persistence across restarts (`conf/daemon_tasks.json`)
@@ -356,6 +356,8 @@ go run . webhook sign \
   --data '{"hello":"world"}'
 ```
 
+For cross-language client integration (JS/Python helper functions, signing rules, and troubleshooting), see [Public API Signing Guide](#public-api-signing-guide).
+
 Quickly send a signed webhook test request:
 
 ```bash
@@ -384,13 +386,184 @@ curl -X POST http://127.0.0.1:8080/webhook/events \
   -d '{"hello":"world"}'
 ```
 
+### Public API Signing Guide
+
+This guide applies to all public signed endpoints, including:
+
+- Webhook public routes (for example `/webhook/events`, `/webhook/<route-path>`)
+- Booking public routes (for example `/booking/catalog`, `/booking/reservations`, `/booking/intents/parse`, `/booking/intents/confirm`)
+
+Required headers:
+
+- `X-Third-Party-ID`
+- `X-Webhook-Timestamp` (Unix seconds, UTC)
+- `X-Webhook-Token`
+
+Timestamp validation:
+
+- Server checks timestamp within `+-5 minutes` of server time.
+- The request should be sent immediately after signature generation.
+
+Signature algorithm (same as `webhook` API):
+
+- `sha256(third_party_id + "\n" + timestamp + "\n" + token + "\n" + raw_body_bytes)`
+- Output format: lowercase hex string
+
+Raw body rule:
+
+- Sign the exact bytes you send on the wire.
+- Do not sign one JSON string and send another re-serialized JSON body.
+
+Booking compatibility rule:
+
+- If any unified signed headers are present, booking validates unified signature first.
+- Legacy fallback still exists only when signed headers are absent: `X-Booking-API-Key: <token>`.
+
+JavaScript helper (Node.js 18+):
+
+```javascript
+const crypto = require("node:crypto");
+
+function buildSignedHeaders({ thirdPartyId, token, bodyJsonString, timestamp }) {
+  const ts = String(timestamp ?? Math.floor(Date.now() / 1000));
+  const payload = `${thirdPartyId}\n${ts}\n${token}\n${bodyJsonString}`;
+  const signature = crypto.createHash("sha256").update(payload, "utf8").digest("hex");
+  return {
+    "X-Third-Party-ID": thirdPartyId,
+    "X-Webhook-Timestamp": ts,
+    "X-Webhook-Token": signature,
+  };
+}
+
+async function sendSignedRequest({ url, thirdPartyId, token, data, timestamp }) {
+  const bodyJsonString = JSON.stringify(data);
+  const signedHeaders = buildSignedHeaders({
+    thirdPartyId,
+    token,
+    bodyJsonString,
+    timestamp,
+  });
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...signedHeaders,
+      "Content-Type": "application/json",
+    },
+    body: bodyJsonString,
+  });
+  return {
+    status: response.status,
+    text: await response.text(),
+  };
+}
+
+// webhook example
+await sendSignedRequest({
+  url: "http://127.0.0.1:8080/webhook/events",
+  thirdPartyId: "partner-a",
+  token: "your_raw_token",
+  data: { hello: "world" },
+});
+
+// booking example
+await sendSignedRequest({
+  url: "http://127.0.0.1:18081/booking/intents/parse",
+  thirdPartyId: "partner-a",
+  token: "your_raw_token",
+  data: { user_id: "u-1", channel: "chat", content: "我想明天上午两个人预约产品 p-1" },
+});
+```
+
+Python helper:
+
+```python
+import hashlib
+import json
+import time
+import requests
+
+def build_signed_headers(third_party_id, token, body_json_string, timestamp=None):
+    ts = str(int(timestamp if timestamp is not None else time.time()))
+    payload = f"{third_party_id}\n{ts}\n{token}\n".encode("utf-8") + body_json_string.encode("utf-8")
+    signature = hashlib.sha256(payload).hexdigest()
+    return {
+        "X-Third-Party-ID": third_party_id,
+        "X-Webhook-Timestamp": ts,
+        "X-Webhook-Token": signature,
+    }
+
+def send_signed_request(url, third_party_id, token, data, timestamp=None, timeout=10):
+    body_json_string = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    headers = build_signed_headers(third_party_id, token, body_json_string, timestamp)
+    headers["Content-Type"] = "application/json"
+    response = requests.post(url, headers=headers, data=body_json_string.encode("utf-8"), timeout=timeout)
+    return response.status_code, response.text
+
+# webhook example
+status, text = send_signed_request(
+    "http://127.0.0.1:8080/webhook/events",
+    "partner-a",
+    "your_raw_token",
+    {"hello": "world"},
+)
+print(status, text)
+
+# booking example
+status, text = send_signed_request(
+    "http://127.0.0.1:18081/booking/intents/parse",
+    "partner-a",
+    "your_raw_token",
+    {"user_id": "u-1", "channel": "chat", "content": "我想明天上午两个人预约产品 p-1"},
+)
+print(status, text)
+```
+
+CLI parity check with `webhook sign`:
+
+```bash
+# 1) keep exactly the same body bytes your app will send
+cat > /tmp/payload.json <<'EOF'
+{"hello":"world"}
+EOF
+
+# 2) fix timestamp once and use it in both CLI and your app helper
+TS=$(date +%s)
+
+# 3) generate signature from CLI (ground truth)
+go run . webhook sign \
+  --third-party-id partner-a \
+  --token your_raw_token \
+  --timestamp "$TS" \
+  --data-file /tmp/payload.json
+```
+
+Compare your app-computed signature with CLI JSON output field `signature`. They must be identical.
+
+Common mismatch causes:
+
+- Timestamp expired (outside +-5 minutes)
+- Signed body bytes are not exactly the sent body bytes
+- Wrong token for `third_party_id`
+- `third_party_id` has unexpected whitespace or mismatch
+
+401 quick troubleshooting:
+
+| Error text | Immediate checks | Typical fix |
+| --- | --- | --- |
+| `missing required headers` | Are all three signed headers present? | Always send all required headers together. |
+| `invalid timestamp header "..."` | Is timestamp Unix seconds string? | Send integer seconds, not milliseconds or RFC3339 text. |
+| `timestamp outside allowed window` / `timestamp is outside allowed window` | Is client clock skewed or request delayed? | Sync clock (NTP), regenerate timestamp and resend immediately. |
+| `token not found for third-party-id` | Does `third_party_id` exist in `conf/security_keys.json`? | Create/reset token for that `third_party_id`, then retry. |
+| `token scope not allowed for booking` / `token is not allowed for webhook scope` | Does token include endpoint scope? | Update token scopes (`booking`, `webhook`, or both). |
+| `signature verification failed` | Are `third_party_id/timestamp/token/body` exactly the same at sign and send time? | Re-sign with exact body bytes and correct token. |
+
 Webhook downstream processing model:
 
 - Route mode `sync`: execute configured downstream pipeline in request path and return `200` on success.
 - Route mode `async`: enqueue and return `202` immediately; background worker retries with backoff, then dead-letters on max attempts.
 - Downstream allowlist is enabled by default; `sys/shell` requires explicit `--allow-sys-downstream`.
 - Webhook endpoints only accept `POST`; non-POST requests return `405`.
-- Token verification uses in-memory cache with periodic refresh from token store file.
+- Token verification uses in-memory cache with periodic refresh from `conf/security_keys.json`.
 
 Webhook logs and audit:
 
@@ -427,10 +600,12 @@ jq -r 'select(.result.stdout_json_valid==true) | [.timestamp,.result.command_lin
 Webhook token management:
 
 ```bash
-go run . webhook token generate partner-a
+go run . webhook token generate partner-a --scope both
 go run . webhook token query partner-a
-go run . webhook token reset partner-a
+go run . webhook token reset partner-a --scope webhook
 ```
+
+Flag compatibility: prefer `--security-keys`; legacy `--token-store` is still accepted.
 
 Backward compatible symbol-first mode:
 
@@ -522,9 +697,11 @@ go run . booking service stop
 go run . booking service start --llm-config conf/booking_llm.json
 ```
 
+Flag compatibility: prefer `--security-keys`; legacy `--api-keys` is still accepted.
+
 Booking service security config (fail-closed on missing/invalid config):
 
-- `conf/booking_api_keys.json` (public API key allow-list)
+- `conf/security_keys.json` (unified external tokens, scopes: `booking` / `webhook`)
 - `conf/booking_llm.json` (OpenAI-compatible parse config: `api_key`, `base_url`, optional `model`)
 - `conf/admin_auth.json` (booking admin basic auth, shared with daemon admin)
 
@@ -554,7 +731,11 @@ go run . booking query --product-id p-1 --from 2026-05-03T00:00:00+08:00 --to 20
 
 Booking service APIs (default URL `http://127.0.0.1:18081`, actual port may fallback):
 
-- Public endpoints require header `X-Booking-API-Key: <key>`:
+- Public endpoints accept unified signed headers (see [Public API Signing Guide](#public-api-signing-guide)):
+  - `X-Third-Party-ID`
+  - `X-Webhook-Timestamp`
+  - `X-Webhook-Token` (same signature algorithm as webhook API)
+- Legacy header is still compatible long-term: `X-Booking-API-Key: <token>`
 - `GET /booking/catalog?product_id=<id>&from=<RFC3339>&to=<RFC3339>&include_full=<bool>`
 - `POST /booking/reservations` (JSON body)
 - `GET /booking/reservations?user_id=<id>&status=<pending|confirmed|rejected|cancelled>`
@@ -594,12 +775,16 @@ Intent parse/confirm example:
 
 ```bash
 curl -X POST http://127.0.0.1:18081/booking/intents/parse \
-  -H "X-Booking-API-Key: booking-key-1" \
+  -H "X-Third-Party-ID: partner-a" \
+  -H "X-Webhook-Timestamp: 1710000000" \
+  -H "X-Webhook-Token: <signature>" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"u-1","channel":"chat","content":"我想明天上午两个人预约产品 p-1"}'
 
 curl -X POST http://127.0.0.1:18081/booking/intents/confirm \
-  -H "X-Booking-API-Key: booking-key-1" \
+  -H "X-Third-Party-ID: partner-a" \
+  -H "X-Webhook-Timestamp: 1710000000" \
+  -H "X-Webhook-Token: <signature>" \
   -H "Content-Type: application/json" \
   -d '{"draft_id":"d-1","slot_id":"slot-1"}'
 ```
@@ -617,27 +802,43 @@ Admin booking APIs (Basic Auth required, hosted by booking service):
 
 HTTP semantics:
 
-- `/booking/*` requires `X-Booking-API-Key`.
+- `/booking/*` validates unified signed headers; if signed headers are absent, it falls back to `X-Booking-API-Key`.
 - `/admin/booking/*` requires Basic Auth (`conf/admin_auth.json`).
 - Action endpoints are POST-only (`405` on wrong method).
 - Validation errors return `400`; capacity conflicts return `409`.
 
-Daemon admin auth config (`conf/admin_auth.json`, plaintext v1):
+Daemon admin auth config (`conf/admin_auth.json`, hash-first):
 
 ```json
 {
   "username": "admin",
-  "password": "your-password"
+  "password_hash": "$2a$12$jkV7cbbJU1CDJw.GWy2rYOCbjfActfvTzgTnfnjS3Zg1p5UylgkLK"
 }
 ```
 
-Booking API keys config (`conf/booking_api_keys.json`):
+Legacy compatibility: `password` (plaintext) is still readable for migration, but `password_hash` takes priority when both fields exist.
+
+Admin password operations:
+
+- `admin auth set-password --config conf/admin_auth.json --username admin --password 'new-password'`
+- `admin auth migrate --config conf/admin_auth.json` (migrate legacy plaintext to hash-only)
+- `admin auth reset-password --generate --config conf/admin_auth.json --username admin`
+- `admin auth verify --config conf/admin_auth.json --username admin --password 'candidate-password'`
+- Raw/original password is not recoverable from `password_hash`; only verify/reset/generate are supported.
+
+Unified security key config (`conf/security_keys.json`):
 
 ```json
 {
-  "keys": [
-    "booking-key-1",
-    "booking-key-2"
+  "version": 1,
+  "tokens": [
+    {
+      "third_party_id": "partner-a",
+      "token": "replace-with-strong-random-token",
+      "scopes": ["booking", "webhook"],
+      "created_at": "2026-05-03T00:00:00Z",
+      "updated_at": "2026-05-03T00:00:00Z"
+    }
   ]
 }
 ```
@@ -656,8 +857,6 @@ Booking LLM config (`conf/booking_llm.json`, OpenAI-compatible):
 
 If `conf/admin_auth.json` is missing or invalid, daemon keeps running but skips daemon admin service startup.
 
-Security note: daemon admin now requires HTTP Basic Auth, but it is still recommended to expose it only in trusted environments. Webhook built-in `/admin` remains unchanged.
-
 When daemon exits (`exit` / EOF), it closes runtime contexts/connections and only cleans webhook process if ownership matches current daemon session (`owner_session_id` + `owner_start_token` double check). This avoids stopping webhook instances started by other daemon sessions or external terminals.
 
 Daemon interactive shortcuts:
@@ -665,7 +864,7 @@ Daemon interactive shortcuts:
 - `↑` / `↓`: history navigation (last executed commands)
 - `←` / `→`: move cursor within current input line for editing
 - `TAB`: command/flag auto completion (supports pipeline stages after `|`, e.g. `quote AAPL.US | em` + TAB -> `email`; `task pause ` + TAB -> task IDs; `task ` + TAB -> all task subcommands including `global-pause`, `global-resume`, `remove`)
-- `TAB`: admin command completion is supported (`admin status`, `admin --runtime`)
+- `TAB`: admin command completion is supported (`admin status`, `admin auth set-password|migrate|reset-password|verify`, `admin --runtime`)
 - `TAB`: webhook command completion is supported (`webhook start|stop|kill-port|status|route|token|sign|send` and common flags, including route flags)
 - `TAB`: booking command completion is supported (`booking product|slot|reservation|query|service` and common flags)
 - `Ctrl+C`: clears current input; first time shows hint to use `exit` to stop daemon

@@ -63,6 +63,10 @@ type daemonOwnedWebhookRuntime struct {
 	StartToken string
 }
 
+type daemonOwnedBookingRuntime struct {
+	StartToken string
+}
+
 func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.Command {
 	return &cobra.Command{
 		Use:     "daemon",
@@ -88,12 +92,14 @@ func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.
 				executeMu         sync.Mutex
 				monitorMu         sync.Mutex
 				daemonWebhookMu   sync.Mutex
+				daemonBookingMu   sync.Mutex
 				daemonStartedAt   = time.Now()
 				daemonSessionID   = newDaemonWebhookOwnerSessionID()
 				monitorSeq        int
 				monitorNextID     int64 = 1
 				monitorStatePath        = defaultDaemonMonitorStatePath()
 				daemonWebhookPIDs       = make(map[int]daemonOwnedWebhookRuntime)
+				daemonBookingPIDs       = make(map[int]daemonOwnedBookingRuntime)
 				monitors                = make(map[int]*daemonMonitorRuntime)
 				monitorRecords          = make(map[string]daemonMonitorRecord)
 			)
@@ -104,6 +110,9 @@ func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.
 				effectiveCtx := runCtx
 				if claim, ok := buildDaemonWebhookStartOwnerClaim(parsedArgs, daemonSessionID); ok {
 					effectiveCtx = withWebhookStartOwnerClaim(runCtx, claim)
+				}
+				if claim, ok := buildDaemonBookingStartOwnerClaim(parsedArgs, daemonSessionID); ok {
+					effectiveCtx = withBookingServiceStartOwnerClaim(effectiveCtx, claim)
 				}
 
 				runErr := executeCLICommand(effectiveCtx, app, commandLogger, parsedArgs)
@@ -273,6 +282,15 @@ func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.
 				stopDaemonOwnedWebhookOnDaemonExit(cloned, daemonSessionID, daemonOut)
 			}()
 			defer func() {
+				daemonBookingMu.Lock()
+				cloned := make(map[int]daemonOwnedBookingRuntime, len(daemonBookingPIDs))
+				for pid, state := range daemonBookingPIDs {
+					cloned[pid] = state
+				}
+				daemonBookingMu.Unlock()
+				stopDaemonOwnedBookingOnDaemonExit(cloned, daemonSessionID, daemonOut)
+			}()
+			defer func() {
 				monitorMu.Lock()
 				defer monitorMu.Unlock()
 				for id, monitor := range monitors {
@@ -391,6 +409,7 @@ func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.
 					PreferredAddr:       defaultDaemonAdminAddr,
 					MaxPortFallback:     defaultDaemonAdminPortFallback,
 					RuntimePath:         defaultDaemonAdminRuntimePath(),
+					AuthConfigPath:      adminAuthPath,
 					DaemonPID:           os.Getpid(),
 					DaemonSessionID:     daemonSessionID,
 					DaemonStartedAt:     daemonStartedAt,
@@ -404,6 +423,8 @@ func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.
 					StartAllMonitors:    startAllPausedMonitorConfigs,
 					WebhookOwnedMu:      &daemonWebhookMu,
 					WebhookOwnedPIDs:    daemonWebhookPIDs,
+					BookingOwnedMu:      &daemonBookingMu,
+					BookingOwnedPIDs:    daemonBookingPIDs,
 					WebhookRuntime:      defaultWebhookRuntimeStatePath(),
 					WebhookLogPath:      defaultWebhookServerLogPath(),
 					BookingRuntime:      defaultBookingRuntimeStatePath(),
@@ -542,6 +563,9 @@ func newDaemonCommand(app *appContext, commandLogger *commandFileLogger) *cobra.
 				daemonWebhookMu.Lock()
 				trackDaemonOwnedWebhookLifecycle(parsedArgs, commandResult, daemonWebhookPIDs, daemonSessionID)
 				daemonWebhookMu.Unlock()
+				daemonBookingMu.Lock()
+				trackDaemonOwnedBookingLifecycle(parsedArgs, commandResult, daemonBookingPIDs, daemonSessionID)
+				daemonBookingMu.Unlock()
 				if commandErr != nil {
 					fmt.Printf("command failed: %v\n", commandErr)
 				}
@@ -1797,6 +1821,7 @@ var (
 		"--addr",
 		"--path",
 		"--routes-file",
+		"--security-keys",
 		"--token-store",
 		"--event-log",
 		"--audit-log",
@@ -1816,6 +1841,7 @@ var (
 		"--addr",
 		"--path",
 		"--routes-file",
+		"--security-keys",
 		"--token-store",
 		"--event-log",
 		"--audit-log",
@@ -1891,7 +1917,9 @@ var (
 		"--timeout",
 	}
 	daemonWebhookTokenFlagCandidates = []string{
+		"--security-keys",
 		"--token-store",
+		"--scope",
 	}
 	daemonUpgradeFlagCandidates = []string{
 		"--version",
@@ -1988,6 +2016,7 @@ var (
 		"--runtime",
 		"--log-file",
 		"--drafts",
+		"--security-keys",
 		"--api-keys",
 		"--llm-config",
 		"--admin-auth",
@@ -2399,13 +2428,44 @@ func systemCompletionCandidates(parts []string) [][]rune {
 
 func adminCompletionCandidates(parts []string) [][]rune {
 	if len(parts) <= 2 {
-		return stringCandidatesToRunes([]string{"status", "--runtime", "help"})
+		return stringCandidatesToRunes([]string{"status", "auth", "--runtime", "help"})
 	}
 	current := strings.TrimSpace(parts[len(parts)-1])
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	switch sub {
+	case "status":
+		if current == "" || strings.HasPrefix(current, "--") {
+			return stringCandidatesToRunes([]string{"--runtime"})
+		}
+		return nil
+	case "auth":
+		if len(parts) <= 3 {
+			return stringCandidatesToRunes([]string{"set-password", "migrate", "reset-password", "verify", "--config", "help"})
+		}
+		authSub := strings.ToLower(strings.TrimSpace(parts[2]))
+		if authSub == "" || strings.HasPrefix(authSub, "--") {
+			return stringCandidatesToRunes([]string{"set-password", "migrate", "reset-password", "verify", "--config"})
+		}
+		if current != "" && !strings.HasPrefix(current, "--") {
+			return nil
+		}
+		switch authSub {
+		case "set-password":
+			return stringCandidatesToRunes([]string{"--config", "--username", "--password", "--cost"})
+		case "migrate":
+			return stringCandidatesToRunes([]string{"--config", "--cost"})
+		case "reset-password":
+			return stringCandidatesToRunes([]string{"--generate", "--config", "--username", "--length", "--cost"})
+		case "verify":
+			return stringCandidatesToRunes([]string{"--config", "--username", "--password"})
+		default:
+			return nil
+		}
+	}
 	if current == "" || strings.HasPrefix(current, "--") {
 		return stringCandidatesToRunes([]string{"--runtime"})
 	}
-	return stringCandidatesToRunes([]string{"status", "help"})
+	return stringCandidatesToRunes([]string{"status", "auth", "help"})
 }
 
 func bookingCompletionCandidates(parts []string) [][]rune {
@@ -2615,6 +2675,10 @@ func newDaemonWebhookOwnerStartToken() string {
 	return newDaemonOpaqueToken("owner")
 }
 
+func newDaemonBookingOwnerStartToken() string {
+	return newDaemonOpaqueToken("booking-owner")
+}
+
 func newDaemonOpaqueToken(prefix string) string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
@@ -2630,6 +2694,15 @@ func isDaemonWebhookStartArgs(args []string) bool {
 	return strings.EqualFold(strings.TrimSpace(args[0]), "webhook") && strings.EqualFold(strings.TrimSpace(args[1]), "start")
 }
 
+func isDaemonBookingStartArgs(args []string) bool {
+	if len(args) < 3 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(args[0]), "booking") &&
+		strings.EqualFold(strings.TrimSpace(args[1]), "service") &&
+		strings.EqualFold(strings.TrimSpace(args[2]), "start")
+}
+
 func buildDaemonWebhookStartOwnerClaim(args []string, daemonSessionID string) (webhookStartOwnerClaim, bool) {
 	if !isDaemonWebhookStartArgs(args) {
 		return webhookStartOwnerClaim{}, false
@@ -2643,6 +2716,22 @@ func buildDaemonWebhookStartOwnerClaim(args []string, daemonSessionID string) (w
 		DaemonPID:  os.Getpid(),
 		ClaimedAt:  time.Now(),
 		StartToken: newDaemonWebhookOwnerStartToken(),
+	}, true
+}
+
+func buildDaemonBookingStartOwnerClaim(args []string, daemonSessionID string) (bookingServiceStartOwnerClaim, bool) {
+	if !isDaemonBookingStartArgs(args) {
+		return bookingServiceStartOwnerClaim{}, false
+	}
+	sessionID := strings.TrimSpace(daemonSessionID)
+	if sessionID == "" {
+		return bookingServiceStartOwnerClaim{}, false
+	}
+	return bookingServiceStartOwnerClaim{
+		SessionID:  sessionID,
+		DaemonPID:  os.Getpid(),
+		ClaimedAt:  time.Now(),
+		StartToken: newDaemonBookingOwnerStartToken(),
 	}, true
 }
 
@@ -2799,6 +2888,155 @@ func stopDaemonOwnedWebhookOnDaemonExitWithPath(ownedPIDs map[int]daemonOwnedWeb
 		return
 	}
 	_, _ = fmt.Fprintf(out, "daemon exit webhook cleanup status=%s\n", stopResult.Status)
+}
+
+func bookingStartResultFromAny(result any) (bookingServiceStartResult, bool) {
+	switch typed := result.(type) {
+	case bookingServiceStartResult:
+		return typed, true
+	case *bookingServiceStartResult:
+		if typed == nil {
+			return bookingServiceStartResult{}, false
+		}
+		return *typed, true
+	case bookingCommandResult:
+		if typed.ServiceStart == nil {
+			return bookingServiceStartResult{}, false
+		}
+		return *typed.ServiceStart, true
+	case *bookingCommandResult:
+		if typed == nil || typed.ServiceStart == nil {
+			return bookingServiceStartResult{}, false
+		}
+		return *typed.ServiceStart, true
+	default:
+		return bookingServiceStartResult{}, false
+	}
+}
+
+func bookingStopResultFromAny(result any) (bookingServiceStopResult, bool) {
+	switch typed := result.(type) {
+	case bookingServiceStopResult:
+		return typed, true
+	case *bookingServiceStopResult:
+		if typed == nil {
+			return bookingServiceStopResult{}, false
+		}
+		return *typed, true
+	case bookingCommandResult:
+		if typed.ServiceStop == nil {
+			return bookingServiceStopResult{}, false
+		}
+		return *typed.ServiceStop, true
+	case *bookingCommandResult:
+		if typed == nil || typed.ServiceStop == nil {
+			return bookingServiceStopResult{}, false
+		}
+		return *typed.ServiceStop, true
+	default:
+		return bookingServiceStopResult{}, false
+	}
+}
+
+func trackDaemonOwnedBookingLifecycle(args []string, result any, ownedPIDs map[int]daemonOwnedBookingRuntime, daemonSessionID string) {
+	if len(args) < 3 {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(args[0]), "booking") || !strings.EqualFold(strings.TrimSpace(args[1]), "service") {
+		return
+	}
+
+	sub := strings.ToLower(strings.TrimSpace(args[2]))
+	switch sub {
+	case "start":
+		startResult, ok := bookingStartResultFromAny(result)
+		if !ok {
+			return
+		}
+		if strings.ToLower(strings.TrimSpace(startResult.Status)) != "started" {
+			return
+		}
+		if startResult.Runtime == nil || startResult.Runtime.PID <= 0 {
+			return
+		}
+		if strings.TrimSpace(startResult.Runtime.OwnerSessionID) != strings.TrimSpace(daemonSessionID) {
+			return
+		}
+		startToken := strings.TrimSpace(startResult.Runtime.OwnerStartToken)
+		if startToken == "" {
+			return
+		}
+		ownedPIDs[startResult.Runtime.PID] = daemonOwnedBookingRuntime{StartToken: startToken}
+	case "stop":
+		stopResult, ok := bookingStopResultFromAny(result)
+		if !ok {
+			return
+		}
+		if stopResult.PID > 0 {
+			delete(ownedPIDs, stopResult.PID)
+		}
+		switch strings.ToLower(strings.TrimSpace(stopResult.Status)) {
+		case "stopped", "stale_removed", "not_running":
+			for pid := range ownedPIDs {
+				delete(ownedPIDs, pid)
+			}
+		}
+	}
+}
+
+func stopDaemonOwnedBookingOnDaemonExit(ownedPIDs map[int]daemonOwnedBookingRuntime, daemonSessionID string, out io.Writer) {
+	stopDaemonOwnedBookingOnDaemonExitWithPath(ownedPIDs, defaultBookingRuntimeStatePath(), daemonSessionID, out)
+}
+
+func stopDaemonOwnedBookingOnDaemonExitWithPath(ownedPIDs map[int]daemonOwnedBookingRuntime, runtimePath string, daemonSessionID string, out io.Writer) {
+	if len(ownedPIDs) == 0 {
+		return
+	}
+	runtime, exists, err := readBookingRuntimeState(runtimePath)
+	if err != nil {
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "daemon booking cleanup skipped: %v\n", err)
+		}
+		return
+	}
+	if !exists || runtime == nil || runtime.PID <= 0 {
+		return
+	}
+	owned, ok := ownedPIDs[runtime.PID]
+	if !ok {
+		return
+	}
+
+	sessionID := strings.TrimSpace(runtime.OwnerSessionID)
+	startToken := strings.TrimSpace(runtime.OwnerStartToken)
+	if sessionID == "" && startToken == "" && runtime.OwnerDaemonPID == 0 && strings.TrimSpace(runtime.OwnerClaimedAt) == "" {
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "daemon exit booking cleanup skip: runtime has no owner metadata (pid=%d)\n", runtime.PID)
+		}
+		return
+	}
+	if sessionID != strings.TrimSpace(daemonSessionID) || startToken != strings.TrimSpace(owned.StartToken) {
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "daemon exit booking cleanup skip: not owned by current daemon (pid=%d)\n", runtime.PID)
+		}
+		return
+	}
+
+	stopResult, stopErr := stopBookingService(runtimePath, defaultBookingServiceStopTimeout)
+	if stopErr != nil {
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "daemon booking cleanup failed: %v\n", stopErr)
+		}
+		return
+	}
+	if out == nil {
+		return
+	}
+	if stopResult.PID > 0 {
+		_, _ = fmt.Fprintf(out, "daemon exit stopped booking pid=%d\n", stopResult.PID)
+		return
+	}
+	_, _ = fmt.Fprintf(out, "daemon exit booking cleanup status=%s\n", stopResult.Status)
 }
 
 func parseEmailCompletionState(args []string) (map[string]struct{}, string) {

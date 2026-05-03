@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -60,14 +62,16 @@ type daemonAdminRuntimeInfo struct {
 }
 
 type daemonAdminAuthConfig struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username     string `json:"username"`
+	Password     string `json:"password,omitempty"`
+	PasswordHash string `json:"password_hash,omitempty"`
 }
 
 type daemonAdminServiceOptions struct {
 	PreferredAddr       string
 	MaxPortFallback     int
 	RuntimePath         string
+	AuthConfigPath      string
 	DaemonPID           int
 	DaemonSessionID     string
 	DaemonStartedAt     time.Time
@@ -81,6 +85,8 @@ type daemonAdminServiceOptions struct {
 	StartAllMonitors    func() (int, error)
 	WebhookOwnedMu      *sync.Mutex
 	WebhookOwnedPIDs    map[int]daemonOwnedWebhookRuntime
+	BookingOwnedMu      *sync.Mutex
+	BookingOwnedPIDs    map[int]daemonOwnedBookingRuntime
 	WebhookRuntime      string
 	WebhookLogPath      string
 	WebhookStartFn      func() (webhookStartResult, error)
@@ -202,6 +208,8 @@ type daemonAdminController struct {
 	startAllMonitors    func() (int, error)
 	webhookOwnedMu      *sync.Mutex
 	webhookOwnedPIDs    map[int]daemonOwnedWebhookRuntime
+	bookingOwnedMu      *sync.Mutex
+	bookingOwnedPIDs    map[int]daemonOwnedBookingRuntime
 	webhookRuntime      string
 	webhookLogPath      string
 	webhookStartFn      func() (webhookStartResult, error)
@@ -219,6 +227,7 @@ type daemonAdminController struct {
 	bookingAPIKeys      string
 	bookingLLMConfig    string
 	bookingAdminAuth    string
+	authConfigPath      string
 	authConfig          daemonAdminAuthConfig
 }
 
@@ -563,22 +572,54 @@ func loadDaemonAdminAuthConfig(path string) (daemonAdminAuthConfig, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return daemonAdminAuthConfig{}, fmt.Errorf("parse admin auth config %s: %w", trimmedPath, err)
 	}
-	cfg.Username = strings.TrimSpace(cfg.Username)
-	cfg.Password = strings.TrimSpace(cfg.Password)
+	cfg = normalizeDaemonAdminAuthConfig(cfg)
 	if err := validateDaemonAdminAuthConfig(cfg); err != nil {
 		return daemonAdminAuthConfig{}, fmt.Errorf("invalid admin auth config %s: %w", trimmedPath, err)
 	}
 	return cfg, nil
 }
 
+func normalizeDaemonAdminAuthConfig(cfg daemonAdminAuthConfig) daemonAdminAuthConfig {
+	cfg.Username = strings.TrimSpace(cfg.Username)
+	cfg.Password = strings.TrimSpace(cfg.Password)
+	cfg.PasswordHash = strings.TrimSpace(cfg.PasswordHash)
+	return cfg
+}
+
 func validateDaemonAdminAuthConfig(cfg daemonAdminAuthConfig) error {
-	if strings.TrimSpace(cfg.Username) == "" {
+	normalized := normalizeDaemonAdminAuthConfig(cfg)
+	if normalized.Username == "" {
 		return fmt.Errorf("username is required")
 	}
-	if strings.TrimSpace(cfg.Password) == "" {
-		return fmt.Errorf("password is required")
+	if normalized.PasswordHash != "" {
+		if _, err := bcrypt.Cost([]byte(normalized.PasswordHash)); err != nil {
+			return fmt.Errorf("password_hash is invalid: %w", err)
+		}
+		return nil
+	}
+	if normalized.Password == "" {
+		return fmt.Errorf("password or password_hash is required")
 	}
 	return nil
+}
+
+func writeDaemonAdminAuthConfig(path string, cfg daemonAdminAuthConfig) error {
+	trimmedPath := strings.TrimSpace(path)
+	if trimmedPath == "" {
+		return fmt.Errorf("admin auth config path is empty")
+	}
+	normalized := normalizeDaemonAdminAuthConfig(cfg)
+	if err := validateDaemonAdminAuthConfig(normalized); err != nil {
+		return err
+	}
+	if normalized.PasswordHash != "" {
+		normalized.Password = ""
+	}
+	encoded, err := json.MarshalIndent(normalized, "", defaultWebhookResponseIndent)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(trimmedPath, append(encoded, '\n'), 0o644)
 }
 
 func daemonAdminRuntimeStatus(runtimePath string) (string, *daemonAdminRuntimeInfo, error) {
@@ -643,10 +684,7 @@ func writeDaemonAdminRuntimeState(path string, runtime daemonAdminRuntimeInfo) e
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(trimmedPath), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(trimmedPath, append(data, '\n'), 0o644)
+	return writeFileAtomic(trimmedPath, append(data, '\n'), 0o644)
 }
 
 func removeDaemonAdminRuntimeState(path string) error {
@@ -709,6 +747,8 @@ func startDaemonAdminService(options daemonAdminServiceOptions) (*daemonAdminSer
 		startAllMonitors:    options.StartAllMonitors,
 		webhookOwnedMu:      options.WebhookOwnedMu,
 		webhookOwnedPIDs:    options.WebhookOwnedPIDs,
+		bookingOwnedMu:      options.BookingOwnedMu,
+		bookingOwnedPIDs:    options.BookingOwnedPIDs,
 		webhookRuntime:      strings.TrimSpace(options.WebhookRuntime),
 		webhookLogPath:      strings.TrimSpace(options.WebhookLogPath),
 		webhookStartFn:      options.WebhookStartFn,
@@ -726,10 +766,8 @@ func startDaemonAdminService(options daemonAdminServiceOptions) (*daemonAdminSer
 		bookingAPIKeys:      strings.TrimSpace(options.BookingAPIKeys),
 		bookingLLMConfig:    strings.TrimSpace(options.BookingLLMConfig),
 		bookingAdminAuth:    strings.TrimSpace(options.BookingAdminAuth),
-		authConfig: daemonAdminAuthConfig{
-			Username: strings.TrimSpace(options.AuthConfig.Username),
-			Password: strings.TrimSpace(options.AuthConfig.Password),
-		},
+		authConfigPath:      strings.TrimSpace(options.AuthConfigPath),
+		authConfig:          normalizeDaemonAdminAuthConfig(options.AuthConfig),
 	}
 	if controller.daemonPID <= 0 {
 		controller.daemonPID = os.Getpid()
@@ -1068,12 +1106,30 @@ func (c *daemonAdminController) isAuthorized(r *http.Request) bool {
 	if !ok {
 		return false
 	}
-	return daemonAdminConstantTimeEqual(username, c.authConfig.Username) &&
-		daemonAdminConstantTimeEqual(password, c.authConfig.Password)
+	authCfg := c.authConfig
+	if strings.TrimSpace(c.authConfigPath) != "" {
+		reloadedCfg, err := loadDaemonAdminAuthConfig(c.authConfigPath)
+		if err != nil {
+			return false
+		}
+		authCfg = reloadedCfg
+	}
+	return daemonAdminCredentialsMatch(authCfg, username, password)
 }
 
 func daemonAdminConstantTimeEqual(left string, right string) bool {
 	return subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
+}
+
+func daemonAdminCredentialsMatch(cfg daemonAdminAuthConfig, username string, password string) bool {
+	normalized := normalizeDaemonAdminAuthConfig(cfg)
+	if !daemonAdminConstantTimeEqual(strings.TrimSpace(username), normalized.Username) {
+		return false
+	}
+	if normalized.PasswordHash != "" {
+		return bcrypt.CompareHashAndPassword([]byte(normalized.PasswordHash), []byte(password)) == nil
+	}
+	return daemonAdminConstantTimeEqual(password, normalized.Password)
 }
 
 func daemonAdminRequestID(r *http.Request) string {
@@ -1496,7 +1552,11 @@ func (c *daemonAdminController) bookingServiceStatus() (bookingServiceStatusResu
 
 func (c *daemonAdminController) bookingServiceStart() (bookingServiceStartResult, error) {
 	if c.bookingStartFn != nil {
-		return c.bookingStartFn()
+		result, err := c.bookingStartFn()
+		if err == nil {
+			c.trackBookingLifecycle([]string{"booking", "service", "start"}, result)
+		}
+		return result, err
 	}
 	cfg := &bookingServiceServeConfig{
 		Addr:             c.bookingAddr,
@@ -1509,14 +1569,35 @@ func (c *daemonAdminController) bookingServiceStart() (bookingServiceStartResult
 		AdminAuthPath:    c.bookingAdminAuth,
 		MaxPortFallback:  defaultBookingServicePortFallback,
 	}
-	return startBookingServiceInBackground(c.bookingRuntime, c.bookingLogPath, cfg)
+	var ownerClaim *bookingServiceStartOwnerClaim
+	if strings.TrimSpace(c.daemonSessionID) != "" {
+		ownerClaim = &bookingServiceStartOwnerClaim{
+			SessionID:  strings.TrimSpace(c.daemonSessionID),
+			DaemonPID:  c.daemonPID,
+			ClaimedAt:  time.Now(),
+			StartToken: newDaemonBookingOwnerStartToken(),
+		}
+	}
+	result, err := startBookingServiceInBackgroundWithOwner(c.bookingRuntime, c.bookingLogPath, cfg, ownerClaim)
+	if err == nil {
+		c.trackBookingLifecycle([]string{"booking", "service", "start"}, result)
+	}
+	return result, err
 }
 
 func (c *daemonAdminController) bookingServiceStop() (bookingServiceStopResult, error) {
 	if c.bookingStopFn != nil {
-		return c.bookingStopFn()
+		result, err := c.bookingStopFn()
+		if err == nil {
+			c.trackBookingLifecycle([]string{"booking", "service", "stop"}, result)
+		}
+		return result, err
 	}
-	return stopBookingService(c.bookingRuntime, defaultBookingServiceStopTimeout)
+	result, err := stopBookingService(c.bookingRuntime, defaultBookingServiceStopTimeout)
+	if err == nil {
+		c.trackBookingLifecycle([]string{"booking", "service", "stop"}, result)
+	}
+	return result, err
 }
 
 func (c *daemonAdminController) trackWebhookLifecycle(args []string, result any) {
@@ -1537,6 +1618,15 @@ func (c *daemonAdminController) untrackWebhookPIDs(stoppedPIDs []int) {
 	for _, pid := range stoppedPIDs {
 		delete(c.webhookOwnedPIDs, pid)
 	}
+}
+
+func (c *daemonAdminController) trackBookingLifecycle(args []string, result any) {
+	if c.bookingOwnedMu == nil || c.bookingOwnedPIDs == nil {
+		return
+	}
+	c.bookingOwnedMu.Lock()
+	defer c.bookingOwnedMu.Unlock()
+	trackDaemonOwnedBookingLifecycle(args, result, c.bookingOwnedPIDs, c.daemonSessionID)
 }
 
 func renderDaemonAdminHome(w http.ResponseWriter, view daemonAdminHomeView) {

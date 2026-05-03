@@ -171,8 +171,27 @@ func TestDaemonCompletionSystemCommandFlags(t *testing.T) {
 
 func TestDaemonCompletionAdminFlagsAndSubcommands(t *testing.T) {
 	candidates := completionCandidatesFromLine("admin ")
-	if !slices.Contains(candidates, "status") || !slices.Contains(candidates, "--runtime") {
+	if !slices.Contains(candidates, "status") || !slices.Contains(candidates, "auth") || !slices.Contains(candidates, "--runtime") {
 		t.Fatalf("expected admin completion includes status/runtime, got: %v", candidates)
+	}
+
+	authSub := completionCandidatesFromLine("admin auth ")
+	if !slices.Contains(authSub, "set-password") ||
+		!slices.Contains(authSub, "migrate") ||
+		!slices.Contains(authSub, "reset-password") ||
+		!slices.Contains(authSub, "verify") ||
+		!slices.Contains(authSub, "--config") {
+		t.Fatalf("expected admin auth completion includes subcommands/flags, got: %v", authSub)
+	}
+
+	setFlags := completionCandidatesFromLine("admin auth set-password --")
+	if !slices.Contains(setFlags, "--username") || !slices.Contains(setFlags, "--password") || !slices.Contains(setFlags, "--cost") {
+		t.Fatalf("expected admin auth set-password flags, got: %v", setFlags)
+	}
+
+	resetFlags := completionCandidatesFromLine("admin auth reset-password --")
+	if !slices.Contains(resetFlags, "--generate") || !slices.Contains(resetFlags, "--length") {
+		t.Fatalf("expected admin auth reset-password flags, got: %v", resetFlags)
 	}
 }
 
@@ -195,7 +214,7 @@ func TestDaemonCompletionWebhookSubcommands(t *testing.T) {
 
 func TestDaemonCompletionWebhookFlags(t *testing.T) {
 	startCandidates := completionCandidatesFromLine("webhook start --")
-	if !slices.Contains(startCandidates, "--runtime") || !slices.Contains(startCandidates, "--log-file") || !slices.Contains(startCandidates, "--token-store") {
+	if !slices.Contains(startCandidates, "--runtime") || !slices.Contains(startCandidates, "--log-file") || !slices.Contains(startCandidates, "--token-store") || !slices.Contains(startCandidates, "--security-keys") {
 		t.Fatalf("expected webhook start completion flags, got: %v", startCandidates)
 	}
 
@@ -222,6 +241,10 @@ func TestDaemonCompletionWebhookFlags(t *testing.T) {
 	tokenCandidates := completionCandidatesFromLine("webhook token ")
 	if !slices.Contains(tokenCandidates, "generate") || !slices.Contains(tokenCandidates, "query") || !slices.Contains(tokenCandidates, "reset") {
 		t.Fatalf("expected webhook token completion subcommands, got: %v", tokenCandidates)
+	}
+	tokenFlagCandidates := completionCandidatesFromLine("webhook token generate --")
+	if !slices.Contains(tokenFlagCandidates, "--security-keys") || !slices.Contains(tokenFlagCandidates, "--scope") {
+		t.Fatalf("expected webhook token generate completion flags, got: %v", tokenFlagCandidates)
 	}
 
 	routeCandidates := completionCandidatesFromLine("webhook route ")
@@ -283,6 +306,7 @@ func TestDaemonCompletionBookingSubcommandsAndFlags(t *testing.T) {
 	serviceCandidates := completionCandidatesFromLine("booking service start --")
 	if !slices.Contains(serviceCandidates, "--addr") ||
 		!slices.Contains(serviceCandidates, "--runtime") ||
+		!slices.Contains(serviceCandidates, "--security-keys") ||
 		!slices.Contains(serviceCandidates, "--api-keys") ||
 		!slices.Contains(serviceCandidates, "--llm-config") {
 		t.Fatalf("expected booking service start flags, got: %v", serviceCandidates)
@@ -464,6 +488,175 @@ func TestStopDaemonOwnedWebhookOnDaemonExitSkipsWhenOwnerMismatch(t *testing.T) 
 	}
 	if !strings.Contains(output.String(), "skip: not owned by current daemon") {
 		t.Fatalf("expected skip message for owner mismatch, got: %s", output.String())
+	}
+}
+
+func TestTrackDaemonOwnedBookingLifecycle(t *testing.T) {
+	owned := map[int]daemonOwnedBookingRuntime{}
+	sessionID := "daemon-session-booking-1"
+
+	trackDaemonOwnedBookingLifecycle(
+		[]string{"booking", "service", "start"},
+		bookingCommandResult{
+			ServiceStart: &bookingServiceStartResult{
+				Status: "started",
+				Runtime: &bookingServiceRuntimeInfo{
+					PID:             431,
+					OwnerSessionID:  sessionID,
+					OwnerStartToken: "booking-owner-token-1",
+				},
+			},
+		},
+		owned,
+		sessionID,
+	)
+	if _, ok := owned[431]; !ok {
+		t.Fatalf("expected booking pid tracked after start, got: %v", owned)
+	}
+
+	trackDaemonOwnedBookingLifecycle(
+		[]string{"booking", "service", "start"},
+		bookingCommandResult{
+			ServiceStart: &bookingServiceStartResult{
+				Status: "already_running",
+				Runtime: &bookingServiceRuntimeInfo{
+					PID:             999,
+					OwnerSessionID:  sessionID,
+					OwnerStartToken: "booking-owner-token-2",
+				},
+			},
+		},
+		owned,
+		sessionID,
+	)
+	if len(owned) != 1 {
+		t.Fatalf("expected already_running booking pid not tracked, got: %v", owned)
+	}
+
+	trackDaemonOwnedBookingLifecycle(
+		[]string{"booking", "service", "stop"},
+		bookingCommandResult{
+			ServiceStop: &bookingServiceStopResult{
+				Status: "stopped",
+				PID:    431,
+			},
+		},
+		owned,
+		sessionID,
+	)
+	if len(owned) != 0 {
+		t.Fatalf("expected tracked booking pids cleared after stop, got: %v", owned)
+	}
+}
+
+func TestStopDaemonOwnedBookingOnDaemonExitWithPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	runtimePath := filepath.Join(tmpDir, "booking_runtime.json")
+	nowText := time.Now().Format(time.RFC3339Nano)
+	sessionID := "daemon-booking-session-1"
+	startToken := "booking-owner-token-1"
+
+	if err := writeBookingRuntimeState(runtimePath, bookingServiceRuntimeInfo{
+		PID:             999995,
+		Address:         "127.0.0.1:18081",
+		StartedAt:       nowText,
+		UpdatedAt:       nowText,
+		OwnerSessionID:  sessionID,
+		OwnerStartToken: startToken,
+	}); err != nil {
+		t.Fatalf("write booking runtime failed: %v", err)
+	}
+
+	var output bytes.Buffer
+	stopDaemonOwnedBookingOnDaemonExitWithPath(
+		map[int]daemonOwnedBookingRuntime{999995: {StartToken: startToken}},
+		runtimePath,
+		sessionID,
+		&output,
+	)
+
+	if _, exists, err := readBookingRuntimeState(runtimePath); err != nil {
+		t.Fatalf("read booking runtime failed: %v", err)
+	} else if exists {
+		t.Fatalf("expected booking runtime removed when pid is owned")
+	}
+
+	if err := writeBookingRuntimeState(runtimePath, bookingServiceRuntimeInfo{
+		PID:             999994,
+		Address:         "127.0.0.1:18081",
+		StartedAt:       nowText,
+		UpdatedAt:       nowText,
+		OwnerSessionID:  sessionID,
+		OwnerStartToken: startToken,
+	}); err != nil {
+		t.Fatalf("write booking runtime failed: %v", err)
+	}
+	stopDaemonOwnedBookingOnDaemonExitWithPath(
+		map[int]daemonOwnedBookingRuntime{1: {StartToken: startToken}},
+		runtimePath,
+		sessionID,
+		nil,
+	)
+	if _, exists, err := readBookingRuntimeState(runtimePath); err != nil {
+		t.Fatalf("read booking runtime failed: %v", err)
+	} else if !exists {
+		t.Fatalf("expected booking runtime kept when pid is not owned")
+	}
+}
+
+func TestStopDaemonOwnedBookingOnDaemonExitSkipsOwnerMismatchAndOwnerless(t *testing.T) {
+	tmpDir := t.TempDir()
+	runtimePath := filepath.Join(tmpDir, "booking_runtime.json")
+	nowText := time.Now().Format(time.RFC3339Nano)
+
+	if err := writeBookingRuntimeState(runtimePath, bookingServiceRuntimeInfo{
+		PID:             999993,
+		Address:         "127.0.0.1:18081",
+		StartedAt:       nowText,
+		UpdatedAt:       nowText,
+		OwnerSessionID:  "daemon-a",
+		OwnerStartToken: "token-a",
+	}); err != nil {
+		t.Fatalf("write booking runtime failed: %v", err)
+	}
+	var mismatchOut bytes.Buffer
+	stopDaemonOwnedBookingOnDaemonExitWithPath(
+		map[int]daemonOwnedBookingRuntime{999993: {StartToken: "token-b"}},
+		runtimePath,
+		"daemon-b",
+		&mismatchOut,
+	)
+	if _, exists, err := readBookingRuntimeState(runtimePath); err != nil {
+		t.Fatalf("read booking runtime failed: %v", err)
+	} else if !exists {
+		t.Fatalf("expected booking runtime kept when owner mismatch")
+	}
+	if !strings.Contains(mismatchOut.String(), "skip: not owned by current daemon") {
+		t.Fatalf("expected owner mismatch skip message, got: %s", mismatchOut.String())
+	}
+
+	if err := writeBookingRuntimeState(runtimePath, bookingServiceRuntimeInfo{
+		PID:       999992,
+		Address:   "127.0.0.1:18081",
+		StartedAt: nowText,
+		UpdatedAt: nowText,
+	}); err != nil {
+		t.Fatalf("write ownerless booking runtime failed: %v", err)
+	}
+	var ownerlessOut bytes.Buffer
+	stopDaemonOwnedBookingOnDaemonExitWithPath(
+		map[int]daemonOwnedBookingRuntime{999992: {StartToken: "ignored"}},
+		runtimePath,
+		"daemon-session",
+		&ownerlessOut,
+	)
+	if _, exists, err := readBookingRuntimeState(runtimePath); err != nil {
+		t.Fatalf("read booking runtime failed: %v", err)
+	} else if !exists {
+		t.Fatalf("expected ownerless booking runtime kept")
+	}
+	if !strings.Contains(ownerlessOut.String(), "runtime has no owner metadata") {
+		t.Fatalf("expected ownerless skip message, got: %s", ownerlessOut.String())
 	}
 }
 

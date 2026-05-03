@@ -28,7 +28,6 @@ import (
 )
 
 const (
-	webhookTokenStateVersion   = 1
 	webhookRuntimeStateVersion = 1
 	webhookTokenStateFile      = "webhook_tokens.json"
 	webhookRuntimeStateFile    = "webhook_runtime.json"
@@ -52,21 +51,17 @@ const (
 	defaultWebhookResponseIndent = "  "
 )
 
-type webhookTokenState struct {
-	Version int                  `json:"version"`
-	Tokens  []webhookTokenRecord `json:"tokens"`
-}
-
 type webhookRuntimeState struct {
 	Version int                `json:"version"`
 	Runtime webhookRuntimeInfo `json:"runtime"`
 }
 
 type webhookTokenRecord struct {
-	ThirdPartyID string `json:"third_party_id"`
-	Token        string `json:"token"`
-	CreatedAt    string `json:"created_at,omitempty"`
-	UpdatedAt    string `json:"updated_at,omitempty"`
+	ThirdPartyID string   `json:"third_party_id"`
+	Token        string   `json:"token"`
+	Scopes       []string `json:"scopes,omitempty"`
+	CreatedAt    string   `json:"created_at,omitempty"`
+	UpdatedAt    string   `json:"updated_at,omitempty"`
 }
 
 type webhookRuntimeInfo struct {
@@ -93,18 +88,20 @@ type webhookRuntimeInfo struct {
 }
 
 type webhookTokenMutationResult struct {
-	Action       string `json:"action"`
-	ThirdPartyID string `json:"third_party_id"`
-	Token        string `json:"token"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	Action       string   `json:"action"`
+	ThirdPartyID string   `json:"third_party_id"`
+	Token        string   `json:"token"`
+	Scopes       []string `json:"scopes,omitempty"`
+	CreatedAt    string   `json:"created_at"`
+	UpdatedAt    string   `json:"updated_at"`
 }
 
 type webhookTokenQueryResult struct {
-	ThirdPartyID string `json:"third_party_id"`
-	TokenMasked  string `json:"token_masked"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	ThirdPartyID string   `json:"third_party_id"`
+	TokenMasked  string   `json:"token_masked"`
+	Scopes       []string `json:"scopes,omitempty"`
+	CreatedAt    string   `json:"created_at"`
+	UpdatedAt    string   `json:"updated_at"`
 }
 
 type webhookSignResult struct {
@@ -249,6 +246,7 @@ type webhookServeConfig struct {
 	RuntimePath              string
 	RoutesPath               string
 	TokenStore               string
+	LegacyTokenStore         string
 	EventLogPath             string
 	AuditLogPath             string
 	DispatchQueuePath        string
@@ -665,24 +663,37 @@ func newWebhookKillPortCommand(app *appContext) *cobra.Command {
 }
 
 func newWebhookTokenCommand(app *appContext) *cobra.Command {
-	var tokenStore string
+	var (
+		securityKeysPath  string
+		legacyTokenStore  string
+		generateScopeText string
+		resetScopeText    string
+	)
 
 	tokenCmd := &cobra.Command{
 		Use:   "token",
-		Short: "Manage webhook raw tokens by third-party ID",
+		Short: "Manage external API tokens by third-party ID",
 	}
 
 	generateCmd := &cobra.Command{
 		Use:   "generate <third-party-id>",
-		Short: "Generate a new raw token for third-party ID",
+		Short: "Generate a new token for third-party ID",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			thirdPartyID := normalizeThirdPartyID(args[0])
 			if thirdPartyID == "" {
 				return fmt.Errorf("third-party-id is required")
 			}
+			securityPath, err := resolveSecurityKeysPath(securityKeysPath, legacyTokenStore, "token-store")
+			if err != nil {
+				return err
+			}
+			scopes, err := parseTokenScopeArgument(generateScopeText)
+			if err != nil {
+				return err
+			}
 
-			record, err := createWebhookToken(tokenStore, thirdPartyID, time.Now())
+			record, err := createWebhookTokenWithScopes(securityPath, thirdPartyID, scopes, time.Now())
 			if err != nil {
 				return err
 			}
@@ -691,6 +702,7 @@ func newWebhookTokenCommand(app *appContext) *cobra.Command {
 				Action:       "generate",
 				ThirdPartyID: record.ThirdPartyID,
 				Token:        record.Token,
+				Scopes:       append([]string(nil), record.Scopes...),
 				CreatedAt:    record.CreatedAt,
 				UpdatedAt:    record.UpdatedAt,
 			}
@@ -710,8 +722,12 @@ func newWebhookTokenCommand(app *appContext) *cobra.Command {
 			if thirdPartyID == "" {
 				return fmt.Errorf("third-party-id is required")
 			}
+			securityPath, err := resolveSecurityKeysPath(securityKeysPath, legacyTokenStore, "token-store")
+			if err != nil {
+				return err
+			}
 
-			record, ok, err := findWebhookToken(tokenStore, thirdPartyID)
+			record, ok, err := findWebhookToken(securityPath, thirdPartyID)
 			if err != nil {
 				return err
 			}
@@ -722,6 +738,7 @@ func newWebhookTokenCommand(app *appContext) *cobra.Command {
 			result := webhookTokenQueryResult{
 				ThirdPartyID: record.ThirdPartyID,
 				TokenMasked:  maskWebhookToken(record.Token),
+				Scopes:       append([]string(nil), record.Scopes...),
 				CreatedAt:    record.CreatedAt,
 				UpdatedAt:    record.UpdatedAt,
 			}
@@ -741,8 +758,16 @@ func newWebhookTokenCommand(app *appContext) *cobra.Command {
 			if thirdPartyID == "" {
 				return fmt.Errorf("third-party-id is required")
 			}
+			securityPath, err := resolveSecurityKeysPath(securityKeysPath, legacyTokenStore, "token-store")
+			if err != nil {
+				return err
+			}
+			scopes, err := parseTokenScopeArgument(resetScopeText)
+			if err != nil {
+				return err
+			}
 
-			record, err := resetWebhookToken(tokenStore, thirdPartyID, time.Now())
+			record, err := resetWebhookTokenWithScopes(securityPath, thirdPartyID, scopes, time.Now())
 			if err != nil {
 				return err
 			}
@@ -751,6 +776,7 @@ func newWebhookTokenCommand(app *appContext) *cobra.Command {
 				Action:       "reset",
 				ThirdPartyID: record.ThirdPartyID,
 				Token:        record.Token,
+				Scopes:       append([]string(nil), record.Scopes...),
 				CreatedAt:    record.CreatedAt,
 				UpdatedAt:    record.UpdatedAt,
 			}
@@ -761,7 +787,10 @@ func newWebhookTokenCommand(app *appContext) *cobra.Command {
 		},
 	}
 
-	tokenCmd.PersistentFlags().StringVar(&tokenStore, "token-store", defaultWebhookTokenStatePath(), "Path to webhook token store JSON")
+	tokenCmd.PersistentFlags().StringVar(&securityKeysPath, "security-keys", "", "Path to unified security keys JSON")
+	tokenCmd.PersistentFlags().StringVar(&legacyTokenStore, "token-store", "", "Path to unified security keys JSON (legacy alias)")
+	generateCmd.Flags().StringVar(&generateScopeText, "scope", securityScopeBoth, "Token scope: both, booking, webhook")
+	resetCmd.Flags().StringVar(&resetScopeText, "scope", securityScopeBoth, "Token scope: both, booking, webhook")
 	tokenCmd.AddCommand(generateCmd, queryCmd, resetCmd)
 	return tokenCmd
 }
@@ -940,7 +969,8 @@ func bindWebhookServeFlags(cmd *cobra.Command, cfg *webhookServeConfig) {
 	cmd.Flags().StringVar(&cfg.Addr, "addr", defaultWebhookServeAddr, "Listen address, e.g. :8080")
 	cmd.Flags().StringVar(&cfg.Path, "path", defaultWebhookServePath, "Webhook endpoint path")
 	cmd.Flags().StringVar(&cfg.RoutesPath, "routes-file", defaultWebhookRouteStatePath(), "Path to webhook route definitions JSON")
-	cmd.Flags().StringVar(&cfg.TokenStore, "token-store", defaultWebhookTokenStatePath(), "Path to webhook token store JSON")
+	cmd.Flags().StringVar(&cfg.TokenStore, "security-keys", "", "Path to unified security keys JSON")
+	cmd.Flags().StringVar(&cfg.LegacyTokenStore, "token-store", "", "Path to unified security keys JSON (legacy alias)")
 	cmd.Flags().StringVar(&cfg.EventLogPath, "event-log", defaultWebhookEventLogPath(), "Path to webhook event log JSON")
 	cmd.Flags().StringVar(&cfg.AuditLogPath, "audit-log", defaultWebhookAuditLogPath(), "Path to webhook audit JSONL log")
 	cmd.Flags().StringVar(&cfg.DispatchQueuePath, "dispatch-queue", defaultWebhookDispatchQueuePath(), "Path to webhook dispatch queue JSON")
@@ -961,7 +991,8 @@ func newWebhookServeConfig() *webhookServeConfig {
 		Addr:                     defaultWebhookServeAddr,
 		Path:                     defaultWebhookServePath,
 		RoutesPath:               defaultWebhookRouteStatePath(),
-		TokenStore:               defaultWebhookTokenStatePath(),
+		TokenStore:               "",
+		LegacyTokenStore:         "",
 		EventLogPath:             defaultWebhookEventLogPath(),
 		AuditLogPath:             defaultWebhookAuditLogPath(),
 		DispatchQueuePath:        defaultWebhookDispatchQueuePath(),
@@ -984,11 +1015,18 @@ func (c *webhookServeConfig) validate() error {
 	c.RuntimePath = strings.TrimSpace(c.RuntimePath)
 	c.RoutesPath = strings.TrimSpace(c.RoutesPath)
 	c.TokenStore = strings.TrimSpace(c.TokenStore)
+	c.LegacyTokenStore = strings.TrimSpace(c.LegacyTokenStore)
 	c.EventLogPath = strings.TrimSpace(c.EventLogPath)
 	c.AuditLogPath = strings.TrimSpace(c.AuditLogPath)
 	c.DispatchQueuePath = strings.TrimSpace(c.DispatchQueuePath)
 	c.DispatchHistoryPath = strings.TrimSpace(c.DispatchHistoryPath)
 	c.DeadLetterPath = strings.TrimSpace(c.DeadLetterPath)
+	resolvedSecurityPath, err := resolveSecurityKeysPath(c.TokenStore, c.LegacyTokenStore, "token-store")
+	if err != nil {
+		return err
+	}
+	c.TokenStore = resolvedSecurityPath
+	c.LegacyTokenStore = resolvedSecurityPath
 	if c.Addr == "" {
 		return fmt.Errorf("addr is required")
 	}
@@ -999,7 +1037,7 @@ func (c *webhookServeConfig) validate() error {
 		return fmt.Errorf("max-body-bytes must be > 0")
 	}
 	if c.TokenStore == "" {
-		return fmt.Errorf("token-store is required")
+		return fmt.Errorf("security-keys is required")
 	}
 	if c.RoutesPath == "" {
 		return fmt.Errorf("routes-file is required")
@@ -1237,7 +1275,7 @@ func buildWebhookServeArgs(cfg *webhookServeConfig) []string {
 	args = append(args, "--addr", cfg.Addr)
 	args = append(args, "--path", cfg.Path)
 	args = append(args, "--routes-file", cfg.RoutesPath)
-	args = append(args, "--token-store", cfg.TokenStore)
+	args = append(args, "--security-keys", cfg.TokenStore)
 	args = append(args, "--event-log", cfg.EventLogPath)
 	args = append(args, "--audit-log", cfg.AuditLogPath)
 	args = append(args, "--dispatch-queue", cfg.DispatchQueuePath)
@@ -1625,7 +1663,7 @@ func isPermissionError(err error) bool {
 }
 
 func defaultWebhookTokenStatePath() string {
-	return filepath.Join(daemonConfigDir, webhookTokenStateFile)
+	return defaultSecurityKeysPath()
 }
 
 func defaultWebhookRuntimeStatePath() string {
@@ -2138,6 +2176,13 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			writeWebhookResponse(writer, http.StatusUnauthorized, event)
 			return
 		}
+		if !securityRecordHasScope(record, securityScopeWebhook) {
+			event.Meta.Error = "token is not allowed for webhook scope"
+			dispatch.Status = "token_scope_not_allowed"
+			audit.Dispatch = dispatch
+			writeWebhookResponse(writer, http.StatusUnauthorized, event)
+			return
+		}
 
 		expectedSignature := computeWebhookSignature(thirdPartyID, timestampText, record.Token, body)
 		event.Meta.Validation.TokenValid = hmac.Equal([]byte(signatureText), []byte(expectedSignature))
@@ -2445,6 +2490,10 @@ func newWebhookEventID(now time.Time) string {
 }
 
 func createWebhookToken(path string, thirdPartyID string, now time.Time) (webhookTokenRecord, error) {
+	return createWebhookTokenWithScopes(path, thirdPartyID, []string{securityScopeBooking, securityScopeWebhook}, now)
+}
+
+func createWebhookTokenWithScopes(path string, thirdPartyID string, scopes []string, now time.Time) (webhookTokenRecord, error) {
 	thirdPartyID = normalizeThirdPartyID(thirdPartyID)
 	if thirdPartyID == "" {
 		return webhookTokenRecord{}, fmt.Errorf("third-party-id is required")
@@ -2466,6 +2515,7 @@ func createWebhookToken(path string, thirdPartyID string, now time.Time) (webhoo
 	record := webhookTokenRecord{
 		ThirdPartyID: thirdPartyID,
 		Token:        token,
+		Scopes:       normalizeSecurityScopes(scopes, []string{securityScopeBooking, securityScopeWebhook}),
 		CreatedAt:    nowText,
 		UpdatedAt:    nowText,
 	}
@@ -2491,10 +2541,15 @@ func findWebhookToken(path string, thirdPartyID string) (webhookTokenRecord, boo
 	if !exists {
 		return webhookTokenRecord{}, false, nil
 	}
+	record.Scopes = normalizeSecurityScopes(record.Scopes, []string{securityScopeWebhook})
 	return record, true, nil
 }
 
 func resetWebhookToken(path string, thirdPartyID string, now time.Time) (webhookTokenRecord, error) {
+	return resetWebhookTokenWithScopes(path, thirdPartyID, []string{securityScopeBooking, securityScopeWebhook}, now)
+}
+
+func resetWebhookTokenWithScopes(path string, thirdPartyID string, scopes []string, now time.Time) (webhookTokenRecord, error) {
 	thirdPartyID = normalizeThirdPartyID(thirdPartyID)
 	if thirdPartyID == "" {
 		return webhookTokenRecord{}, fmt.Errorf("third-party-id is required")
@@ -2517,6 +2572,7 @@ func resetWebhookToken(path string, thirdPartyID string, now time.Time) (webhook
 	if strings.TrimSpace(record.CreatedAt) == "" {
 		record.CreatedAt = now.Format(time.RFC3339Nano)
 	}
+	record.Scopes = normalizeSecurityScopes(scopes, []string{securityScopeBooking, securityScopeWebhook})
 	record.UpdatedAt = now.Format(time.RFC3339Nano)
 	records[thirdPartyID] = record
 
@@ -2527,74 +2583,21 @@ func resetWebhookToken(path string, thirdPartyID string, now time.Time) (webhook
 }
 
 func loadWebhookTokenRecords(path string) (map[string]webhookTokenRecord, error) {
-	trimmedPath := strings.TrimSpace(path)
-	if trimmedPath == "" {
-		return nil, fmt.Errorf("token store path is empty")
-	}
-
-	raw, err := os.ReadFile(trimmedPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return map[string]webhookTokenRecord{}, nil
-		}
-		return nil, err
-	}
-	if len(strings.TrimSpace(string(raw))) == 0 {
-		return map[string]webhookTokenRecord{}, nil
-	}
-
-	var state webhookTokenState
-	if err := json.Unmarshal(raw, &state); err != nil {
-		return nil, err
-	}
-
-	records := make(map[string]webhookTokenRecord, len(state.Tokens))
-	for _, record := range state.Tokens {
-		thirdPartyID := normalizeThirdPartyID(record.ThirdPartyID)
-		token := strings.TrimSpace(record.Token)
-		if thirdPartyID == "" || token == "" {
-			continue
-		}
-		record.ThirdPartyID = thirdPartyID
-		record.Token = token
-		records[thirdPartyID] = record
-	}
-	return records, nil
+	return loadSecurityTokenRecords(path, true)
 }
 
 func writeWebhookTokenRecords(path string, records map[string]webhookTokenRecord) error {
-	trimmedPath := strings.TrimSpace(path)
-	if trimmedPath == "" {
-		return fmt.Errorf("token store path is empty")
-	}
-	keys := make([]string, 0, len(records))
-	for key := range records {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	state := webhookTokenState{
-		Version: webhookTokenStateVersion,
-		Tokens:  make([]webhookTokenRecord, 0, len(keys)),
-	}
-	for _, key := range keys {
-		record := records[key]
+	normalized := make(map[string]webhookTokenRecord, len(records))
+	for key, record := range records {
 		record.ThirdPartyID = normalizeThirdPartyID(key)
 		record.Token = strings.TrimSpace(record.Token)
+		record.Scopes = normalizeSecurityScopes(record.Scopes, []string{securityScopeWebhook})
 		if record.ThirdPartyID == "" || record.Token == "" {
 			continue
 		}
-		state.Tokens = append(state.Tokens, record)
+		normalized[record.ThirdPartyID] = record
 	}
-
-	data, err := json.MarshalIndent(state, "", defaultWebhookResponseIndent)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(trimmedPath), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(trimmedPath, append(data, '\n'), 0o644)
+	return writeSecurityTokenRecords(path, normalized)
 }
 
 func readWebhookRuntimeState(path string) (*webhookRuntimeInfo, bool, error) {
@@ -2643,10 +2646,7 @@ func writeWebhookRuntimeState(path string, runtime webhookRuntimeInfo) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(trimmedPath), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(trimmedPath, append(data, '\n'), 0o644)
+	return writeFileAtomic(trimmedPath, append(data, '\n'), 0o644)
 }
 
 func migrateWebhookRuntimeStateIfNeeded(path string) error {
@@ -2685,7 +2685,7 @@ func migrateWebhookRuntimeStateIfNeeded(path string) error {
 	if readErr != nil {
 		return readErr
 	}
-	if writeErr := os.WriteFile(trimmedPath, raw, 0o644); writeErr != nil {
+	if writeErr := writeFileAtomic(trimmedPath, raw, 0o644); writeErr != nil {
 		return writeErr
 	}
 	if removeErr := os.Remove(legacyPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
