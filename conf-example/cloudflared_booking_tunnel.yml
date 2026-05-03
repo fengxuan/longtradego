@@ -1,0 +1,28 @@
+# Cloudflare Tunnel example for exposing only booking public APIs.
+#
+# This file is a template for locally-managed tunnels, and can also be used as
+# an ingress reference for remotely-managed tunnel configuration in dashboard/API.
+#
+# Replace:
+# - <TUNNEL_UUID>
+# - booking-api.example.com
+tunnel: <TUNNEL_UUID>
+credentials-file: /etc/cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  # Block booking admin APIs from public access.
+  - hostname: booking-api.example.com
+    path: ^/admin(/.*)?$
+    service: http_status:403
+
+  # Allow only booking public APIs.
+  - hostname: booking-api.example.com
+    path: ^/booking(/.*)?$
+    service: http://127.0.0.1:18081
+
+  # All other paths on this host are denied.
+  - hostname: booking-api.example.com
+    service: http_status:404
+
+  # Required final catch-all rule.
+  - service: http_status:404
