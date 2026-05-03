@@ -225,4 +225,3 @@ func TestBookingServiceQueryDefaultsToEnabledAndAvailable(t *testing.T) {
 		t.Fatalf("unexpected query entries: products=%+v slots=%+v", query.Products, query.Slots)
 	}
 }
-
