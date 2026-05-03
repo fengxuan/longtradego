@@ -35,25 +35,11 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 
 ## Project Layout
 
-- `main.go`: app entrypoint, command execution lifecycle, unified logging
-- `root_command.go`: root CLI command registration
-- `execute_command.go`: shared execution lifecycle (normal + daemon)
-- `daemon_command.go`: interactive daemon mode (`daemon` / `d`)
-- `admin_command.go`: daemon-admin runtime status command (`admin status`)
-- `quote_command.go`: quote command implementation
-- `email_command.go`: email command implementation
-- `system_command.go`: system command execution (`sys` / `shell`)
-- `version_command.go`: build metadata output command
-- `upgrade_command.go`: release check/install and update reminder cache
-- `webhook_command.go`: webhook service/signature/token/runtime implementation
-- `booking_command.go`: booking CLI command tree
-- `booking_service.go`: booking domain rules and JSON persistence
-- `booking_service_runtime.go`: independent booking HTTP service lifecycle/auth/intake parsing
-- `daemon_task.go`: daemon scheduled task manager
-- `daemon_admin_service.go`: daemon-owned independent admin HTTP service
-- `args.go`: argument normalization and symbol parsing
-- `app_context.go`: shared app state and Longbridge config bootstrap
-- `command_log.go`: JSON lines command logs and file rotation
+- `cmd/longtradego/main.go`: primary CLI entrypoint (`go run ./cmd/longtradego`)
+- `main.go`: thin compatibility entrypoint (`go run .`)
+- `internal/cli`: root command assembly and execution lifecycle
+- `internal/core`: shared app context, args normalization, logging, atomic IO
+- `internal/service`: booking/webhook/daemon/admin/email/system/version/upgrade/task implementations
 - `scripts/booking_public_start.sh`: start booking service for stable public tunnel origin (`127.0.0.1:18081`, no port fallback)
 
 ## Requirements
@@ -105,26 +91,26 @@ go mod tidy
 Run quote command:
 
 ```bash
-go run . quote AAPL.US TSLA.US 700.HK
+go run ./cmd/longtradego quote AAPL.US TSLA.US 700.HK
 ```
 
 Alias:
 
 ```bash
-go run . q AAPL.US TSLA.US
+go run ./cmd/longtradego q AAPL.US TSLA.US
 ```
 
 Version and upgrade:
 
 ```bash
 # Build metadata
-go run . version
+go run ./cmd/longtradego version
 
 # Check latest release
-go run . upgrade check
+go run ./cmd/longtradego upgrade check
 
 # Dry-run planned upgrade (no binary replacement)
-go run . upgrade --dry-run --yes
+go run ./cmd/longtradego upgrade --dry-run --yes
 
 # Install latest release (binary mode)
 longtradego upgrade
@@ -426,8 +412,7 @@ Raw body rule:
 
 Booking compatibility rule:
 
-- If any unified signed headers are present, booking validates unified signature first.
-- Legacy fallback still exists only when signed headers are absent: `X-Booking-API-Key: <token>`.
+- Booking public APIs only accept unified signed headers.
 
 JavaScript helper (Node.js 18+):
 
@@ -615,7 +600,7 @@ go run . webhook token query partner-a
 go run . webhook token reset partner-a --scope webhook
 ```
 
-Flag compatibility: prefer `--security-keys`; legacy `--token-store` is still accepted.
+Use `--security-keys` as the only token file flag.
 
 Backward compatible symbol-first mode:
 
@@ -707,7 +692,7 @@ go run . booking service stop
 go run . booking service start --llm-config conf/booking_llm.json
 ```
 
-Flag compatibility: prefer `--security-keys`; legacy `--api-keys` is still accepted.
+Use `--security-keys` as the only booking key flag.
 
 For public exposure via Cloudflare Tunnel, use fixed origin address and disable port fallback:
 
@@ -759,7 +744,6 @@ Booking service APIs:
   - `X-Third-Party-ID`
   - `X-Webhook-Timestamp`
   - `X-Webhook-Token` (same signature algorithm as webhook API)
-- Legacy header is still compatible long-term: `X-Booking-API-Key: <token>`
 - `GET /booking/catalog?product_id=<id>&from=<RFC3339>&to=<RFC3339>&include_full=<bool>`
 - `POST /booking/reservations` (JSON body)
 - `GET /booking/reservations?user_id=<id>&status=<pending|confirmed|rejected|cancelled>`
@@ -829,7 +813,7 @@ Admin booking APIs (Basic Auth required, hosted by booking service):
 
 HTTP semantics:
 
-- `/booking/*` validates unified signed headers; if signed headers are absent, it falls back to `X-Booking-API-Key`.
+- `/booking/*` requires unified signed headers.
 - `/admin/*` requires Basic Auth (`conf/admin_auth.json`).
 - Booking public listener does not expose admin routes (`/admin/*` returns `404` on public address).
 - Action endpoints are POST-only (`405` on wrong method).
@@ -881,7 +865,7 @@ sudo systemctl status cloudflared
 
 - Public base URL: `https://booking-api.<your-domain>`
 - Keep using the same signed headers and algorithm from [Public API Signing Guide](#public-api-signing-guide).
-- Legacy `X-Booking-API-Key` remains compatible, but new integrations should use unified signed headers.
+- Public integrations must use unified signed headers.
 
 6. Verification checklist:
 

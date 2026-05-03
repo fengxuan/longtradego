@@ -1,1 +1,0 @@
-test/daemon_command_test.go
