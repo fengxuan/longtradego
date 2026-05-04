@@ -1935,6 +1935,7 @@ var (
 		"slot",
 		"reservation",
 		"query",
+		"agent",
 		"service",
 		"help",
 	}
@@ -2028,6 +2029,29 @@ var (
 	}
 	daemonBookingServiceStatusFlagCandidates = []string{
 		"--runtime",
+	}
+	daemonBookingAgentSubcommandCandidates = []string{
+		"reserve",
+		"help",
+	}
+	daemonBookingAgentReserveFlagCandidates = []string{
+		"--user-id",
+		"--content",
+		"--third-party-id",
+		"--token",
+		"--security-keys",
+		"--channel",
+		"--url",
+		"--runtime",
+		"--timeout",
+		"--idempotency-key",
+		"--product-id",
+		"--slot-id",
+		"--party-size",
+		"--contact-name",
+		"--contact-phone",
+		"--member",
+		"--special-requirements",
 	}
 )
 
@@ -2599,6 +2623,25 @@ func bookingCompletionCandidates(parts []string) [][]rune {
 		case "status":
 			if current == "" || strings.HasPrefix(current, "--") {
 				return candidateWithGlobals(daemonBookingServiceStatusFlagCandidates)
+			}
+		}
+		return nil
+	case "agent":
+		if len(parts) <= 3 {
+			candidates := append([]string{}, daemonBookingAgentSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingAgentReserveFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		agentSub := strings.ToLower(strings.TrimSpace(parts[2]))
+		if agentSub == "" || strings.HasPrefix(agentSub, "--") {
+			candidates := append([]string{}, daemonBookingAgentSubcommandCandidates...)
+			candidates = append(candidates, daemonBookingAgentReserveFlagCandidates...)
+			return candidateWithGlobals(candidates)
+		}
+		switch agentSub {
+		case "reserve":
+			if current == "" || strings.HasPrefix(current, "--") {
+				return candidateWithGlobals(daemonBookingAgentReserveFlagCandidates)
 			}
 		}
 		return nil

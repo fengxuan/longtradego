@@ -116,6 +116,7 @@ type webhookDispatchAuditInfo struct {
 
 type webhookAuditLogEntry struct {
 	Timestamp              string                    `json:"timestamp"`
+	RequestID              string                    `json:"request_id,omitempty"`
 	EventID                string                    `json:"event_id,omitempty"`
 	RouteID                string                    `json:"route_id,omitempty"`
 	Method                 string                    `json:"method"`

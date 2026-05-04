@@ -1,14 +1,28 @@
 package service
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 )
+
+var bookingAgentHTTPClientFactory = func(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return &http.Client{Timeout: timeout}
+}
 
 type bookingCommandResult struct {
 	Mode         string                      `json:"mode"`
@@ -24,6 +38,48 @@ type bookingCommandResult struct {
 	ServiceStart *bookingServiceStartResult  `json:"service_start,omitempty"`
 	ServiceStop  *bookingServiceStopResult   `json:"service_stop,omitempty"`
 	ServiceState *bookingServiceStatusResult `json:"service_status,omitempty"`
+	AgentReserve *bookingAgentReserveResult  `json:"agent_reserve,omitempty"`
+}
+
+type bookingAgentReserveResult struct {
+	PublicBaseURL      string                         `json:"public_base_url,omitempty"`
+	ThirdPartyID       string                         `json:"third_party_id,omitempty"`
+	Parse              bookingAgentReserveStepResult  `json:"parse"`
+	Confirm            *bookingAgentReserveStepResult `json:"confirm,omitempty"`
+	DraftID            string                         `json:"draft_id,omitempty"`
+	ReservationID      string                         `json:"reservation_id,omitempty"`
+	FinalStatus        string                         `json:"final_status,omitempty"`
+	MissingFields      []string                       `json:"missing_fields,omitempty"`
+	ParseExtracted     *bookingIntentParseExtracted   `json:"parse_extracted,omitempty"`
+	ConfirmPayload     map[string]any                 `json:"confirm_payload,omitempty"`
+	IdempotencyParse   string                         `json:"idempotency_key_parse,omitempty"`
+	IdempotencyConfirm string                         `json:"idempotency_key_confirm,omitempty"`
+}
+
+type bookingAgentReserveStepResult struct {
+	TargetURL      string `json:"target_url"`
+	HTTPStatus     int    `json:"http_status,omitempty"`
+	Code           string `json:"code,omitempty"`
+	Message        string `json:"message,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+}
+
+type bookingAgentReserveParseEnvelopeData struct {
+	DraftID string `json:"draft_id"`
+	Draft   struct {
+		ID            string                      `json:"id"`
+		Extracted     bookingIntentParseExtracted `json:"extracted"`
+		MissingFields []string                    `json:"missing_fields"`
+	} `json:"draft"`
+}
+
+type bookingAgentReserveConfirmEnvelopeData struct {
+	DraftID       string `json:"draft_id"`
+	ReservationID string `json:"reservation_id"`
+	Reservation   struct {
+		Status string `json:"status"`
+	} `json:"reservation"`
 }
 
 func newBookingCommand(app *AppContext) *cobra.Command {
@@ -48,6 +104,7 @@ func newBookingCommand(app *AppContext) *cobra.Command {
 	bookingCmd.AddCommand(newBookingSlotCommand(app, newService))
 	bookingCmd.AddCommand(newBookingReservationCommand(app, newService))
 	bookingCmd.AddCommand(newBookingQueryCommand(app, newService))
+	bookingCmd.AddCommand(newBookingAgentCommand(app))
 	bookingCmd.AddCommand(newBookingServiceCommand(app, func() *bookingServiceServeConfig {
 		cfg := newBookingServiceServeConfig()
 		cfg.CatalogPath = strings.TrimSpace(catalogPath)
@@ -668,6 +725,491 @@ func newBookingQueryCommand(app *AppContext, newService func() *bookingService) 
 	queryCmd.Flags().StringVar(&to, "to", "", "Filter to start time (RFC3339)")
 	queryCmd.Flags().BoolVar(&includeFull, "include-full", false, "Include full slots with no available capacity")
 	return queryCmd
+}
+
+func newBookingAgentCommand(app *AppContext) *cobra.Command {
+	var (
+		userID                      string
+		content                     string
+		channel                     string
+		thirdPartyID                string
+		rawToken                    string
+		securityKeysPath            string
+		publicURL                   string
+		runtimePath                 string
+		timeout                     time.Duration
+		idempotencyKey              string
+		overrideProductID           string
+		overrideSlotID              string
+		overridePartySize           int
+		overrideContactName         string
+		overrideContactPhone        string
+		overrideMembers             []string
+		overrideSpecialRequirements string
+	)
+
+	agentCmd := &cobra.Command{
+		Use:   "agent",
+		Short: "Simulate AI-driven booking flows via public APIs",
+	}
+
+	reserveCmd := &cobra.Command{
+		Use:   "reserve",
+		Short: "Run parse + confirm flow against booking public API",
+		RunE: func(cmd *cobra.Command, _ []string) (runErr error) {
+			result := bookingAgentReserveResult{}
+			if app != nil {
+				app.SetExecution("booking", []string{"agent", "reserve"})
+				defer func() {
+					status := "ok"
+					message := ""
+					if runErr != nil {
+						status = "error"
+						message = strings.TrimSpace(runErr.Error())
+					}
+					app.SetResult(bookingCommandResult{
+						Mode:         "booking_agent_reserve",
+						Status:       status,
+						Message:      message,
+						AgentReserve: &result,
+					})
+				}()
+			}
+
+			trimmedThirdPartyID := normalizeThirdPartyID(thirdPartyID)
+			if trimmedThirdPartyID == "" {
+				return fmt.Errorf("third-party-id is required")
+			}
+			trimmedUserID := strings.TrimSpace(userID)
+			trimmedContent := strings.TrimSpace(content)
+			trimmedChannel := strings.TrimSpace(channel)
+			if trimmedUserID == "" {
+				return fmt.Errorf("user-id is required")
+			}
+			if trimmedContent == "" {
+				return fmt.Errorf("content is required")
+			}
+			if trimmedChannel == "" {
+				trimmedChannel = "chat"
+			}
+			if timeout <= 0 {
+				return fmt.Errorf("timeout must be > 0")
+			}
+			if cmd.Flags().Changed("party-size") && overridePartySize <= 0 {
+				return fmt.Errorf("party-size must be > 0 when provided")
+			}
+
+			token, err := resolveBookingAgentToken(rawToken, securityKeysPath, trimmedThirdPartyID)
+			if err != nil {
+				return err
+			}
+			baseURL, err := resolveBookingAgentPublicBaseURL(publicURL, runtimePath)
+			if err != nil {
+				return err
+			}
+			parseURL, err := buildBookingAgentEndpointURL(baseURL, bookingPublicIntentParsePath)
+			if err != nil {
+				return err
+			}
+			confirmURL, err := buildBookingAgentEndpointURL(baseURL, bookingPublicIntentConfirmPath)
+			if err != nil {
+				return err
+			}
+			parseIdempotencyKey, confirmIdempotencyKey := bookingAgentIdempotencyPair(idempotencyKey)
+
+			result.PublicBaseURL = baseURL
+			result.ThirdPartyID = trimmedThirdPartyID
+			result.IdempotencyParse = parseIdempotencyKey
+			result.IdempotencyConfirm = confirmIdempotencyKey
+			result.Parse = bookingAgentReserveStepResult{
+				TargetURL:      parseURL,
+				IdempotencyKey: parseIdempotencyKey,
+			}
+
+			parsePayload := bookingIntentParseRequest{
+				UserID:  trimmedUserID,
+				Content: trimmedContent,
+				Channel: trimmedChannel,
+			}
+			parseRaw, err := json.Marshal(parsePayload)
+			if err != nil {
+				return err
+			}
+			client := bookingAgentHTTPClientFactory(timeout)
+			parseEnvelope, parseHTTPStatus, err := bookingAgentSignedPOST(client, parseURL, trimmedThirdPartyID, token, parseRaw, parseIdempotencyKey, time.Now())
+			if err != nil {
+				return fmt.Errorf("booking parse request failed: %w", err)
+			}
+			result.Parse.HTTPStatus = parseHTTPStatus
+			result.Parse.Code = strings.TrimSpace(parseEnvelope.Code)
+			result.Parse.Message = strings.TrimSpace(parseEnvelope.Message)
+			result.Parse.RequestID = strings.TrimSpace(parseEnvelope.RequestID)
+
+			if strings.TrimSpace(parseEnvelope.Status) != publicAPIStatusOK {
+				return bookingAgentPublicError("booking parse", parseHTTPStatus, parseEnvelope)
+			}
+			parseData, err := decodeBookingAgentParseEnvelopeData(parseEnvelope.Data)
+			if err != nil {
+				return fmt.Errorf("decode parse response failed: %w", err)
+			}
+			draftID := strings.TrimSpace(parseData.DraftID)
+			if draftID == "" {
+				draftID = strings.TrimSpace(parseData.Draft.ID)
+			}
+			if draftID == "" {
+				return fmt.Errorf("parse response missing draft_id")
+			}
+			result.DraftID = draftID
+			if len(parseData.Draft.MissingFields) > 0 {
+				result.MissingFields = append([]string(nil), parseData.Draft.MissingFields...)
+			}
+			extracted := parseData.Draft.Extracted
+			result.ParseExtracted = &extracted
+
+			confirmPayload := bookingIntentConfirmRequest{
+				DraftID: draftID,
+			}
+			if value := strings.TrimSpace(overrideProductID); value != "" {
+				confirmPayload.ProductID = value
+			}
+			if value := strings.TrimSpace(overrideSlotID); value != "" {
+				confirmPayload.SlotID = value
+			}
+			if cmd.Flags().Changed("party-size") {
+				confirmPayload.PartySize = overridePartySize
+			}
+			trimmedContactName := strings.TrimSpace(overrideContactName)
+			trimmedContactPhone := strings.TrimSpace(overrideContactPhone)
+			trimmedMembers := make([]string, 0, len(overrideMembers))
+			for _, member := range overrideMembers {
+				member = strings.TrimSpace(member)
+				if member == "" {
+					continue
+				}
+				trimmedMembers = append(trimmedMembers, member)
+			}
+			if trimmedContactName != "" || trimmedContactPhone != "" || len(trimmedMembers) > 0 {
+				confirmPayload.Personnel = &bookingReservationPersonnel{
+					ContactName:  trimmedContactName,
+					ContactPhone: trimmedContactPhone,
+					Members:      trimmedMembers,
+				}
+			}
+			if value := strings.TrimSpace(overrideSpecialRequirements); value != "" {
+				confirmPayload.SpecialRequirements = value
+			}
+			merged := mergeBookingDraftForConfirm(extracted, confirmPayload)
+			missingFields := bookingIntentMissingFields(merged)
+			result.MissingFields = append([]string(nil), missingFields...)
+			if len(missingFields) > 0 {
+				result.ConfirmPayload = bookingAgentConfirmPayloadPreview(confirmPayload)
+				return fmt.Errorf(
+					"missing_fields: %s; provide overrides via %s",
+					strings.Join(missingFields, ", "),
+					strings.Join(bookingAgentSuggestedFlags(missingFields), ", "),
+				)
+			}
+
+			result.Confirm = &bookingAgentReserveStepResult{
+				TargetURL:      confirmURL,
+				IdempotencyKey: confirmIdempotencyKey,
+			}
+			confirmRaw, err := json.Marshal(confirmPayload)
+			if err != nil {
+				return err
+			}
+			confirmEnvelope, confirmHTTPStatus, err := bookingAgentSignedPOST(client, confirmURL, trimmedThirdPartyID, token, confirmRaw, confirmIdempotencyKey, time.Now())
+			if err != nil {
+				return fmt.Errorf("booking confirm request failed: %w", err)
+			}
+			result.Confirm.HTTPStatus = confirmHTTPStatus
+			result.Confirm.Code = strings.TrimSpace(confirmEnvelope.Code)
+			result.Confirm.Message = strings.TrimSpace(confirmEnvelope.Message)
+			result.Confirm.RequestID = strings.TrimSpace(confirmEnvelope.RequestID)
+
+			if strings.TrimSpace(confirmEnvelope.Status) != publicAPIStatusOK {
+				return bookingAgentPublicError("booking confirm", confirmHTTPStatus, confirmEnvelope)
+			}
+			confirmData, err := decodeBookingAgentConfirmEnvelopeData(confirmEnvelope.Data)
+			if err != nil {
+				return fmt.Errorf("decode confirm response failed: %w", err)
+			}
+			result.ReservationID = strings.TrimSpace(confirmData.ReservationID)
+			result.FinalStatus = strings.TrimSpace(confirmData.Reservation.Status)
+			if result.FinalStatus == "" {
+				result.FinalStatus = "pending"
+			}
+			if len(result.MissingFields) == 0 {
+				result.MissingFields = nil
+			}
+
+			fmt.Printf(
+				"booking agent reserve parse_code=%s draft_id=%s confirm_code=%s reservation_id=%s status=%s\n",
+				result.Parse.Code,
+				result.DraftID,
+				result.Confirm.Code,
+				result.ReservationID,
+				result.FinalStatus,
+			)
+			return nil
+		},
+	}
+
+	reserveCmd.Flags().StringVar(&userID, "user-id", "", "Booking user ID")
+	reserveCmd.Flags().StringVar(&content, "content", "", "Booking intent content text")
+	reserveCmd.Flags().StringVar(&thirdPartyID, "third-party-id", "", "Third-party ID used for signed headers")
+	reserveCmd.Flags().StringVar(&rawToken, "token", "", "Raw token used for request signing (overrides --security-keys)")
+	reserveCmd.Flags().StringVar(&securityKeysPath, "security-keys", defaultSecurityKeysPath(), "Path to unified security keys JSON")
+	reserveCmd.Flags().StringVar(&channel, "channel", "chat", "Request channel value for parse API")
+	reserveCmd.Flags().StringVar(&publicURL, "url", "", "Booking public base URL, e.g. http://127.0.0.1:18081")
+	reserveCmd.Flags().StringVar(&runtimePath, "runtime", defaultBookingRuntimeStatePath(), "Path to booking runtime state JSON")
+	reserveCmd.Flags().DurationVar(&timeout, "timeout", 10*time.Second, "HTTP timeout for parse/confirm requests")
+	reserveCmd.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Idempotency key prefix (command appends -parse/-confirm)")
+	reserveCmd.Flags().StringVar(&overrideProductID, "product-id", "", "Override product_id before confirm")
+	reserveCmd.Flags().StringVar(&overrideSlotID, "slot-id", "", "Override slot_id before confirm")
+	reserveCmd.Flags().IntVar(&overridePartySize, "party-size", 0, "Override party_size before confirm")
+	reserveCmd.Flags().StringVar(&overrideContactName, "contact-name", "", "Override personnel.contact_name before confirm")
+	reserveCmd.Flags().StringVar(&overrideContactPhone, "contact-phone", "", "Override personnel.contact_phone before confirm")
+	reserveCmd.Flags().StringSliceVar(&overrideMembers, "member", nil, "Override personnel.members before confirm (repeatable)")
+	reserveCmd.Flags().StringVar(&overrideSpecialRequirements, "special-requirements", "", "Override special_requirements before confirm")
+
+	agentCmd.AddCommand(reserveCmd)
+	return agentCmd
+}
+
+func resolveBookingAgentToken(rawToken string, securityKeysPath string, thirdPartyID string) (string, error) {
+	if token := strings.TrimSpace(rawToken); token != "" {
+		return token, nil
+	}
+	records, err := loadSecurityTokenRecords(strings.TrimSpace(securityKeysPath), false)
+	if err != nil {
+		return "", err
+	}
+	record, exists := records[normalizeThirdPartyID(thirdPartyID)]
+	if !exists {
+		return "", fmt.Errorf("token not found for third-party-id %q in %s", thirdPartyID, strings.TrimSpace(securityKeysPath))
+	}
+	if !securityRecordHasScope(record, securityScopeBooking) {
+		return "", fmt.Errorf("token scope not allowed for booking: third-party-id %q", thirdPartyID)
+	}
+	if strings.TrimSpace(record.Token) == "" {
+		return "", fmt.Errorf("token is empty for third-party-id %q", thirdPartyID)
+	}
+	return record.Token, nil
+}
+
+func resolveBookingAgentPublicBaseURL(rawURL string, runtimePath string) (string, error) {
+	trimmedURL := strings.TrimSpace(rawURL)
+	if trimmedURL != "" {
+		return normalizeBookingAgentBaseURL(trimmedURL)
+	}
+	status, err := bookingServiceStatus(strings.TrimSpace(runtimePath))
+	if err != nil {
+		return "", err
+	}
+	if !status.Running || status.Runtime == nil {
+		return "", fmt.Errorf("booking service is not running; start it first with `go run . booking service start`")
+	}
+	publicAddress := bookingRuntimePublicAddress(status.Runtime)
+	if strings.TrimSpace(publicAddress) == "" {
+		return "", fmt.Errorf("booking runtime is missing public address; restart service with `go run . booking service start`")
+	}
+	return normalizeBookingAgentBaseURL(buildWebhookManagementURL(publicAddress, "/"))
+}
+
+func normalizeBookingAgentBaseURL(rawURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", fmt.Errorf("invalid url %q: %w", rawURL, err)
+	}
+	if strings.TrimSpace(parsed.Scheme) == "" || strings.TrimSpace(parsed.Host) == "" {
+		return "", fmt.Errorf("url must include scheme and host")
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func buildBookingAgentEndpointURL(baseURL string, endpointPath string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return "", err
+	}
+	prefix := strings.TrimRight(parsed.Path, "/")
+	parsed.Path = prefix + ensureWebhookPath(endpointPath)
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func bookingAgentIdempotencyPair(raw string) (string, string) {
+	prefix := strings.TrimSpace(raw)
+	if prefix == "" {
+		prefix = fmt.Sprintf("booking-agent-reserve-%d", time.Now().UnixNano())
+	}
+	return prefix + "-parse", prefix + "-confirm"
+}
+
+func bookingAgentSignedPOST(
+	client *http.Client,
+	targetURL string,
+	thirdPartyID string,
+	token string,
+	body []byte,
+	idempotencyKey string,
+	now time.Time,
+) (publicAPIEnvelope, int, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	timestamp := strconv.FormatInt(now.Unix(), 10)
+	signature := computeWebhookSignature(thirdPartyID, timestamp, token, body)
+	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return publicAPIEnvelope{}, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(webhookHeaderThirdPartyID, thirdPartyID)
+	req.Header.Set(webhookHeaderTimestamp, timestamp)
+	req.Header.Set(webhookHeaderSignature, signature)
+	req.Header.Set(publicAPIHeaderIdempotencyKey, strings.TrimSpace(idempotencyKey))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return publicAPIEnvelope{}, 0, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return publicAPIEnvelope{}, resp.StatusCode, err
+	}
+	envelope, err := readPublicAPIEnvelope(raw)
+	if err != nil {
+		trimmed := strings.TrimSpace(string(raw))
+		if len(trimmed) > 512 {
+			trimmed = trimmed[:512]
+		}
+		return publicAPIEnvelope{}, resp.StatusCode, fmt.Errorf("response is not valid public envelope: http=%d body=%s", resp.StatusCode, trimmed)
+	}
+	return envelope, resp.StatusCode, nil
+}
+
+func bookingAgentPublicError(stage string, httpStatus int, envelope publicAPIEnvelope) error {
+	code := strings.TrimSpace(envelope.Code)
+	if code == "" {
+		code = publicAPIErrorCodeInternalError
+	}
+	message := strings.TrimSpace(envelope.Message)
+	if message == "" {
+		message = "request failed"
+	}
+	requestID := strings.TrimSpace(envelope.RequestID)
+	return fmt.Errorf("%s failed: code=%s message=%s request_id=%s http_status=%d", stage, code, message, requestID, httpStatus)
+}
+
+func decodeBookingAgentParseEnvelopeData(data any) (bookingAgentReserveParseEnvelopeData, error) {
+	var payload bookingAgentReserveParseEnvelopeData
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return payload, err
+	}
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		return payload, err
+	}
+	payload.DraftID = strings.TrimSpace(payload.DraftID)
+	payload.Draft.ID = strings.TrimSpace(payload.Draft.ID)
+	payload.Draft.MissingFields = bookingAgentNormalizeFields(payload.Draft.MissingFields)
+	return payload, nil
+}
+
+func decodeBookingAgentConfirmEnvelopeData(data any) (bookingAgentReserveConfirmEnvelopeData, error) {
+	var payload bookingAgentReserveConfirmEnvelopeData
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return payload, err
+	}
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		return payload, err
+	}
+	payload.DraftID = strings.TrimSpace(payload.DraftID)
+	payload.ReservationID = strings.TrimSpace(payload.ReservationID)
+	payload.Reservation.Status = strings.TrimSpace(payload.Reservation.Status)
+	return payload, nil
+}
+
+func bookingAgentNormalizeFields(fields []string) []string {
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(fields))
+	seen := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if _, exists := seen[field]; exists {
+			continue
+		}
+		seen[field] = struct{}{}
+		out = append(out, field)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func bookingAgentSuggestedFlags(missingFields []string) []string {
+	if len(missingFields) == 0 {
+		return nil
+	}
+	fieldToFlag := map[string]string{
+		"product_id":              "--product-id",
+		"slot_id":                 "--slot-id",
+		"party_size":              "--party-size",
+		"personnel.contact_name":  "--contact-name",
+		"personnel.contact_phone": "--contact-phone",
+	}
+	flags := make([]string, 0, len(missingFields))
+	seen := make(map[string]struct{}, len(missingFields))
+	for _, field := range missingFields {
+		flag, exists := fieldToFlag[strings.TrimSpace(field)]
+		if !exists {
+			continue
+		}
+		if _, ok := seen[flag]; ok {
+			continue
+		}
+		seen[flag] = struct{}{}
+		flags = append(flags, flag)
+	}
+	if len(flags) == 0 {
+		return []string{"--product-id", "--slot-id", "--party-size", "--contact-name", "--contact-phone"}
+	}
+	sort.Strings(flags)
+	return flags
+}
+
+func bookingAgentConfirmPayloadPreview(payload bookingIntentConfirmRequest) map[string]any {
+	preview := map[string]any{
+		"draft_id": strings.TrimSpace(payload.DraftID),
+	}
+	if value := strings.TrimSpace(payload.ProductID); value != "" {
+		preview["product_id"] = value
+	}
+	if value := strings.TrimSpace(payload.SlotID); value != "" {
+		preview["slot_id"] = value
+	}
+	if payload.PartySize > 0 {
+		preview["party_size"] = payload.PartySize
+	}
+	if payload.Personnel != nil {
+		preview["personnel"] = payload.Personnel
+	}
+	if value := strings.TrimSpace(payload.SpecialRequirements); value != "" {
+		preview["special_requirements"] = value
+	}
+	return preview
 }
 
 func parseOptionalBookingTimeFlag(raw string, field string) (*time.Time, error) {

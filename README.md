@@ -353,6 +353,7 @@ go run . webhook sign \
 ```
 
 For cross-language client integration (JS/Python helper functions, signing rules, and troubleshooting), see [Public API Signing Guide](#public-api-signing-guide).
+For third-party JavaScript backend integrators, use the dedicated guide: [Public API JS Integration Guide](docs/public_api_js_integration.md).
 
 Quickly send a signed webhook test request:
 
@@ -384,42 +385,77 @@ curl -X POST http://127.0.0.1:8080/webhook/events \
 
 ### Public API Signing Guide
 
-This guide applies to all public signed endpoints, including:
+This guide applies to all public signed endpoints:
 
 - Webhook public routes (for example `/webhook/events`, `/webhook/<route-path>`)
 - Booking public routes (for example `/booking/catalog`, `/booking/reservations`, `/booking/intents/parse`, `/booking/intents/confirm`)
 
-Required headers:
+Authoritative spec:
+
+- OpenAPI: [`docs/openapi/public_api.yaml`](docs/openapi/public_api.yaml)
+- Runtime portal: `http://<public-host>/openapi/v1`
+- Runtime YAML: `http://<public-host>/openapi/v1/spec.yaml`
+- Runtime JSON: `http://<public-host>/openapi/v1/spec.json`
+- Runtime API reference UI: `http://<public-host>/openapi/v1/reference`
+- Runtime JS guide (HTML): `http://<public-host>/openapi/v1/guide/js`
+- Runtime JS guide (Markdown): `http://<public-host>/openapi/v1/guide/js.md`
+- JS integration guide: [`docs/public_api_js_integration.md`](docs/public_api_js_integration.md)
+
+Required signing headers:
 
 - `X-Third-Party-ID`
 - `X-Webhook-Timestamp` (Unix seconds, UTC)
 - `X-Webhook-Token`
 
-Timestamp validation:
+Required idempotency header on **public POST**:
 
-- Server checks timestamp within `+-5 minutes` of server time.
-- The request should be sent immediately after signature generation.
+- `Idempotency-Key`
 
-Signature algorithm (same as `webhook` API):
+Signature algorithm (same as `webhook sign` CLI):
 
 - `sha256(third_party_id + "\n" + timestamp + "\n" + token + "\n" + raw_body_bytes)`
-- Output format: lowercase hex string
+- Output: lowercase hex string
+
+Timestamp rule:
+
+- Server validates `+-5 minutes` around server time.
+- Generate and send immediately.
 
 Raw body rule:
 
-- Sign the exact bytes you send on the wire.
-- Do not sign one JSON string and send another re-serialized JSON body.
+- Sign exact outgoing bytes.
+- Do not sign one JSON string and send another re-serialized payload.
 
-Booking compatibility rule:
+Unified public response envelope:
 
-- Booking public APIs only accept unified signed headers.
+- Success:
+  - `{"status":"ok","code":"ok","message":"","data":...,"request_id":"...","ts":"RFC3339Nano"}`
+- Error:
+  - `{"status":"error","code":"<machine_code>","message":"<human_message>","details":...,"request_id":"...","ts":"RFC3339Nano"}`
+
+Core machine codes:
+
+- `missing_required_headers`
+- `invalid_timestamp_header`
+- `timestamp_outside_allowed_window`
+- `token_not_found`
+- `token_scope_not_allowed`
+- `signature_verification_failed`
+- `invalid_json_body`
+- `method_not_allowed`
+- `validation_error`
+- `conflict`
+- `internal_error`
+- `idempotency_key_required`
+- `idempotency_key_conflict`
+- `idempotency_store_error`
 
 JavaScript helper (Node.js 18+):
 
 ```javascript
 const crypto = require("node:crypto");
 
-function buildSignedHeaders({ thirdPartyId, token, bodyJsonString, timestamp }) {
+function buildSignedHeaders({ thirdPartyId, token, bodyJsonString, timestamp, idempotencyKey }) {
   const ts = String(timestamp ?? Math.floor(Date.now() / 1000));
   const payload = `${thirdPartyId}\n${ts}\n${token}\n${bodyJsonString}`;
   const signature = crypto.createHash("sha256").update(payload, "utf8").digest("hex");
@@ -427,16 +463,18 @@ function buildSignedHeaders({ thirdPartyId, token, bodyJsonString, timestamp }) 
     "X-Third-Party-ID": thirdPartyId,
     "X-Webhook-Timestamp": ts,
     "X-Webhook-Token": signature,
+    "Idempotency-Key": idempotencyKey,
   };
 }
 
-async function sendSignedRequest({ url, thirdPartyId, token, data, timestamp }) {
+async function sendSignedRequest({ url, thirdPartyId, token, data, timestamp, idempotencyKey }) {
   const bodyJsonString = JSON.stringify(data);
   const signedHeaders = buildSignedHeaders({
     thirdPartyId,
     token,
     bodyJsonString,
     timestamp,
+    idempotencyKey,
   });
   const response = await fetch(url, {
     method: "POST",
@@ -446,27 +484,14 @@ async function sendSignedRequest({ url, thirdPartyId, token, data, timestamp }) 
     },
     body: bodyJsonString,
   });
+  const envelope = await response.json().catch(() => ({}));
   return {
     status: response.status,
-    text: await response.text(),
+    code: envelope.code || "",
+    requestId: envelope.request_id || "",
+    envelope,
   };
 }
-
-// webhook example
-await sendSignedRequest({
-  url: "http://127.0.0.1:8080/webhook/events",
-  thirdPartyId: "partner-a",
-  token: "your_raw_token",
-  data: { hello: "world" },
-});
-
-// booking example
-await sendSignedRequest({
-  url: "http://127.0.0.1:18081/booking/intents/parse",
-  thirdPartyId: "partner-a",
-  token: "your_raw_token",
-  data: { user_id: "u-1", channel: "chat", content: "我想明天上午两个人预约产品 p-1" },
-});
 ```
 
 Python helper:
@@ -477,7 +502,7 @@ import json
 import time
 import requests
 
-def build_signed_headers(third_party_id, token, body_json_string, timestamp=None):
+def build_signed_headers(third_party_id, token, body_json_string, idempotency_key, timestamp=None):
     ts = str(int(timestamp if timestamp is not None else time.time()))
     payload = f"{third_party_id}\n{ts}\n{token}\n".encode("utf-8") + body_json_string.encode("utf-8")
     signature = hashlib.sha256(payload).hexdigest()
@@ -485,46 +510,30 @@ def build_signed_headers(third_party_id, token, body_json_string, timestamp=None
         "X-Third-Party-ID": third_party_id,
         "X-Webhook-Timestamp": ts,
         "X-Webhook-Token": signature,
+        "Idempotency-Key": idempotency_key,
     }
 
-def send_signed_request(url, third_party_id, token, data, timestamp=None, timeout=10):
+def send_signed_request(url, third_party_id, token, data, idempotency_key, timestamp=None, timeout=10):
     body_json_string = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    headers = build_signed_headers(third_party_id, token, body_json_string, timestamp)
+    headers = build_signed_headers(third_party_id, token, body_json_string, idempotency_key, timestamp)
     headers["Content-Type"] = "application/json"
     response = requests.post(url, headers=headers, data=body_json_string.encode("utf-8"), timeout=timeout)
-    return response.status_code, response.text
-
-# webhook example
-status, text = send_signed_request(
-    "http://127.0.0.1:8080/webhook/events",
-    "partner-a",
-    "your_raw_token",
-    {"hello": "world"},
-)
-print(status, text)
-
-# booking example
-status, text = send_signed_request(
-    "http://127.0.0.1:18081/booking/intents/parse",
-    "partner-a",
-    "your_raw_token",
-    {"user_id": "u-1", "channel": "chat", "content": "我想明天上午两个人预约产品 p-1"},
-)
-print(status, text)
+    try:
+        envelope = response.json()
+    except ValueError:
+        envelope = {}
+    return response.status_code, envelope
 ```
 
 CLI parity check with `webhook sign`:
 
 ```bash
-# 1) keep exactly the same body bytes your app will send
 cat > /tmp/payload.json <<'EOF'
 {"hello":"world"}
 EOF
 
-# 2) fix timestamp once and use it in both CLI and your app helper
 TS=$(date +%s)
 
-# 3) generate signature from CLI (ground truth)
 go run . webhook sign \
   --third-party-id partner-a \
   --token your_raw_token \
@@ -532,25 +541,33 @@ go run . webhook sign \
   --data-file /tmp/payload.json
 ```
 
-Compare your app-computed signature with CLI JSON output field `signature`. They must be identical.
+Compare your app signature with CLI output `signature`. They must match.
 
 Common mismatch causes:
 
-- Timestamp expired (outside +-5 minutes)
-- Signed body bytes are not exactly the sent body bytes
+- Expired timestamp (outside +-5 minutes)
+- Signed bytes differ from sent bytes
 - Wrong token for `third_party_id`
-- `third_party_id` has unexpected whitespace or mismatch
+- `third_party_id` whitespace/case mismatch
 
-401 quick troubleshooting:
+401/4xx quick troubleshooting:
 
-| Error text | Immediate checks | Typical fix |
+| Code | Immediate checks | Typical fix |
 | --- | --- | --- |
-| `missing required headers` | Are all three signed headers present? | Always send all required headers together. |
-| `invalid timestamp header "..."` | Is timestamp Unix seconds string? | Send integer seconds, not milliseconds or RFC3339 text. |
-| `timestamp outside allowed window` / `timestamp is outside allowed window` | Is client clock skewed or request delayed? | Sync clock (NTP), regenerate timestamp and resend immediately. |
-| `token not found for third-party-id` | Does `third_party_id` exist in `conf/security_keys.json`? | Create/reset token for that `third_party_id`, then retry. |
-| `token scope not allowed for booking` / `token is not allowed for webhook scope` | Does token include endpoint scope? | Update token scopes (`booking`, `webhook`, or both). |
-| `signature verification failed` | Are `third_party_id/timestamp/token/body` exactly the same at sign and send time? | Re-sign with exact body bytes and correct token. |
+| `missing_required_headers` | Are all signing headers present? | Always send all three signing headers. |
+| `invalid_timestamp_header` | Unix seconds string format? | Send integer seconds, not ms/RFC3339. |
+| `timestamp_outside_allowed_window` | Clock skew / send delay? | Sync time, regenerate timestamp, resend. |
+| `token_not_found` | Does `third_party_id` exist in `conf/security_keys.json`? | Create/reset token for that ID. |
+| `token_scope_not_allowed` | Does token scope include target API? | Add scope `booking`, `webhook`, or both. |
+| `signature_verification_failed` | Sign inputs exactly matched? | Re-sign exact payload with correct token. |
+| `idempotency_key_required` | Is `Idempotency-Key` set on POST? | Always send unique key for each logical write operation. |
+| `idempotency_key_conflict` | Same key reused for different body? | Use a new key when payload changes. |
+
+Agent retry strategy:
+
+- Safe auto-retry: `GET` + `POST` requests with stable `Idempotency-Key`.
+- Do not retry with a changed payload under the same idempotency key.
+- Use `request_id` + `code` in logs for fast provider-side support.
 
 Webhook downstream processing model:
 
@@ -734,7 +751,32 @@ go run . booking reservation cancel r-3 --note "user canceled"
 
 # user-view query
 go run . booking query --product-id p-1 --from 2026-05-03T00:00:00+08:00 --to 2026-05-03T23:59:59+08:00
+
+# booking agent (simulate external AI flow: parse -> confirm)
+go run . booking agent reserve \
+  --user-id u-1 \
+  --content "我想明天上午两个人预约产品 p-1" \
+  --third-party-id partner-a \
+  --security-keys conf/security_keys.json \
+  --url http://127.0.0.1:18081
+
+# if parse still has missing fields, provide overrides
+go run . booking agent reserve \
+  --user-id u-1 \
+  --content "我想明天上午两个人预约" \
+  --third-party-id partner-a \
+  --security-keys conf/security_keys.json \
+  --slot-id slot-1 \
+  --contact-phone 13800138000
 ```
+
+`booking agent reserve` behavior:
+
+- Calls `/booking/intents/parse` then `/booking/intents/confirm` using unified signed headers.
+- Uses `--token` first; if empty, reads token from `--security-keys` by `third_party_id` and requires `booking` scope.
+- Uses runtime public address when `--url` is empty; if service is not running, command fails and asks to run `booking service start`.
+- Always sends `Idempotency-Key` to both POSTs (`<prefix>-parse` / `<prefix>-confirm`).
+- If required fields are still missing after overrides, command stops before confirm and prints `missing_fields` with recommended flags.
 
 Booking service APIs:
 
@@ -822,7 +864,7 @@ HTTP semantics:
 
 ### Expose Booking Public APIs via Cloudflare Named Tunnel
 
-This setup exposes only `/booking/*` from booking public listener and blocks `/admin/*` at tunnel ingress level.
+This setup exposes `/booking/*` and public docs (`/openapi/*`) from booking public listener, while blocking `/admin/*` at tunnel ingress level.
 
 1. Start booking service on fixed local origin:
 
@@ -836,7 +878,7 @@ This setup exposes only `/booking/*` from booking public listener and blocks `/a
 http://127.0.0.1:18081
 ```
 
-3. Configure ingress rules (order matters: block admin -> allow booking -> deny all):
+3. Configure ingress rules (order matters: block admin -> allow booking+openapi -> deny all):
 
 ```yaml
 ingress:
@@ -845,6 +887,9 @@ ingress:
     service: http_status:403
   - hostname: booking-api.example.com
     path: ^/booking(/.*)?$
+    service: http://127.0.0.1:18081
+  - hostname: booking-api.example.com
+    path: ^/openapi(/.*)?$
     service: http://127.0.0.1:18081
   - hostname: booking-api.example.com
     service: http_status:404

@@ -1,0 +1,864 @@
+openapi: 3.0.3
+info:
+  title: Longtradego Public API
+  version: "1.0.0"
+  description: |
+    Public signed endpoints for booking and webhook integrations.
+    This contract only documents public business APIs.
+    Admin APIs (`/admin/*`) are intentionally excluded.
+servers:
+  - url: http://127.0.0.1:18081
+    description: Booking public listener (default local)
+  - url: http://127.0.0.1:8080
+    description: Webhook public listener (default local)
+tags:
+  - name: booking
+    description: Booking public APIs
+  - name: webhook
+    description: Webhook public APIs
+security:
+  - ThirdPartyID: []
+    WebhookTimestamp: []
+    WebhookToken: []
+paths:
+  /booking/catalog:
+    get:
+      tags: [booking]
+      summary: Query booking catalog
+      description: Query products and slots visible to public callers.
+      parameters:
+        - in: query
+          name: product_id
+          schema:
+            type: string
+          description: Filter by product id.
+        - in: query
+          name: from
+          schema:
+            type: string
+            format: date-time
+          description: Include slots whose start time is on or after this RFC3339 timestamp.
+        - in: query
+          name: to
+          schema:
+            type: string
+            format: date-time
+          description: Include slots whose start time is on or before this RFC3339 timestamp.
+        - in: query
+          name: include_full
+          schema:
+            type: boolean
+            default: false
+          description: When true, includes full slots that have no remaining capacity.
+      responses:
+        "200":
+          description: Catalog query success.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingCatalogResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /booking/reservations:
+    get:
+      tags: [booking]
+      summary: Query reservations
+      description: List reservations by optional filters.
+      parameters:
+        - in: query
+          name: user_id
+          schema:
+            type: string
+          description: Filter by reservation user id.
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, confirmed, rejected, cancelled]
+          description: Filter by reservation status.
+      responses:
+        "200":
+          description: Reservation query success.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingReservationListResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [booking]
+      summary: Create reservation directly
+      description: |
+        Create a pending reservation directly without intent parse/confirm flow.
+        `Idempotency-Key` is required for POST requests.
+      security:
+        - ThirdPartyID: []
+          WebhookTimestamp: []
+          WebhookToken: []
+          IdempotencyKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingCreateReservationRequest"
+      responses:
+        "201":
+          description: Reservation created.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingReservationCreateResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /booking/intents/parse:
+    post:
+      tags: [booking]
+      summary: Parse natural-language booking intent
+      description: |
+        Parse user text into a reservation draft.
+        `Idempotency-Key` is required for POST requests.
+      security:
+        - ThirdPartyID: []
+          WebhookTimestamp: []
+          WebhookToken: []
+          IdempotencyKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingIntentParseRequest"
+      responses:
+        "200":
+          description: Intent parse success.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingIntentParseResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedError"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/InternalError"
+  /booking/intents/confirm:
+    post:
+      tags: [booking]
+      summary: Confirm draft and create reservation
+      description: |
+        Confirm a draft created by `/booking/intents/parse`.
+        `Idempotency-Key` is required for POST requests.
+      security:
+        - ThirdPartyID: []
+          WebhookTimestamp: []
+          WebhookToken: []
+          IdempotencyKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingIntentConfirmRequest"
+      responses:
+        "201":
+          description: Draft confirmed and reservation created.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingIntentConfirmResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /webhook/{routePath}:
+    post:
+      tags: [webhook]
+      summary: Receive signed webhook event
+      description: |
+        Receive a signed webhook payload on a configured public route.
+
+        Route configuration is managed by webhook routing config. This OpenAPI template
+        uses `{routePath}` as a generic placeholder for one route segment under `/webhook/*`.
+        For multi-segment real routes, expose exact URLs in your integration docs.
+
+        `Idempotency-Key` is required for POST requests.
+      security:
+        - ThirdPartyID: []
+          WebhookTimestamp: []
+          WebhookToken: []
+          IdempotencyKey: []
+      parameters:
+        - in: path
+          name: routePath
+          required: true
+          schema:
+            type: string
+          description: Logical route segment (for example `events`, `orders`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Accepted and processed synchronously.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEventResponse"
+        "202":
+          description: Accepted and queued asynchronously.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEventResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+components:
+  headers:
+    XRequestID:
+      description: Request identifier for server-side trace and support.
+      schema:
+        type: string
+  securitySchemes:
+    ThirdPartyID:
+      type: apiKey
+      in: header
+      name: X-Third-Party-ID
+      description: Third-party caller identifier.
+    WebhookTimestamp:
+      type: apiKey
+      in: header
+      name: X-Webhook-Timestamp
+      description: Unix seconds (UTC), validated within +-5 minutes by server.
+    WebhookToken:
+      type: apiKey
+      in: header
+      name: X-Webhook-Token
+      description: Lowercase hex SHA-256 signature.
+    IdempotencyKey:
+      type: apiKey
+      in: header
+      name: Idempotency-Key
+      description: Required for public POST requests.
+  responses:
+    ValidationError:
+      description: Request body or query validation failed.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PublicErrorEnvelope"
+          examples:
+            validation_error:
+              value:
+                status: error
+                code: validation_error
+                message: user_id and content are required
+                details: null
+                request_id: req-20260504T000000.000000000Z-1-abc
+                ts: "2026-05-04T00:00:00.000000000Z"
+            invalid_json_body:
+              value:
+                status: error
+                code: invalid_json_body
+                message: "invalid json body: invalid character '}' looking for beginning of value"
+                details: null
+                request_id: req-20260504T000000.000000000Z-2-def
+                ts: "2026-05-04T00:00:00.000000000Z"
+    UnauthorizedError:
+      description: Signature validation failed.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PublicErrorEnvelope"
+          examples:
+            missing_required_headers:
+              value:
+                status: error
+                code: missing_required_headers
+                message: missing required headers
+                details: null
+                request_id: req-20260504T000000.000000000Z-3-ghi
+                ts: "2026-05-04T00:00:00.000000000Z"
+            invalid_timestamp_header:
+              value:
+                status: error
+                code: invalid_timestamp_header
+                message: "invalid timestamp header \"abc\": strconv.ParseInt: parsing \"abc\": invalid syntax"
+                details: null
+                request_id: req-20260504T000000.000000000Z-4-jkl
+                ts: "2026-05-04T00:00:00.000000000Z"
+            timestamp_outside_allowed_window:
+              value:
+                status: error
+                code: timestamp_outside_allowed_window
+                message: timestamp outside allowed window
+                details: null
+                request_id: req-20260504T000000.000000000Z-5-mno
+                ts: "2026-05-04T00:00:00.000000000Z"
+            token_not_found:
+              value:
+                status: error
+                code: token_not_found
+                message: token not found for third-party-id
+                details: null
+                request_id: req-20260504T000000.000000000Z-6-pqr
+                ts: "2026-05-04T00:00:00.000000000Z"
+            token_scope_not_allowed:
+              value:
+                status: error
+                code: token_scope_not_allowed
+                message: token scope not allowed for booking
+                details: null
+                request_id: req-20260504T000000.000000000Z-7-stu
+                ts: "2026-05-04T00:00:00.000000000Z"
+            signature_verification_failed:
+              value:
+                status: error
+                code: signature_verification_failed
+                message: signature verification failed
+                details: null
+                request_id: req-20260504T000000.000000000Z-8-vwx
+                ts: "2026-05-04T00:00:00.000000000Z"
+    MethodNotAllowedError:
+      description: HTTP method is not allowed for this endpoint.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PublicErrorEnvelope"
+          example:
+            status: error
+            code: method_not_allowed
+            message: method not allowed
+            details: null
+            request_id: req-20260504T000000.000000000Z-9-yza
+            ts: "2026-05-04T00:00:00.000000000Z"
+    ConflictError:
+      description: Request conflicts with existing state.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PublicErrorEnvelope"
+          examples:
+            conflict:
+              value:
+                status: error
+                code: conflict
+                message: slot capacity exceeded
+                details: null
+                request_id: req-20260504T000000.000000000Z-a-bcd
+                ts: "2026-05-04T00:00:00.000000000Z"
+            idempotency_key_conflict:
+              value:
+                status: error
+                code: idempotency_key_conflict
+                message: idempotency key was already used with a different payload
+                details:
+                  event:
+                    meta:
+                      event_id: evt-1
+                      received_at: "2026-05-04T00:00:00.000000000Z"
+                      validation:
+                        token_valid: true
+                        timestamp_valid: true
+                        json_valid: true
+                    data:
+                      hello: world
+                request_id: req-20260504T000000.000000000Z-b-cde
+                ts: "2026-05-04T00:00:00.000000000Z"
+    InternalError:
+      description: Internal processing failed.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PublicErrorEnvelope"
+          examples:
+            internal_error:
+              value:
+                status: error
+                code: internal_error
+                message: "token lookup failed: open conf/security_keys.json: no such file or directory"
+                details: null
+                request_id: req-20260504T000000.000000000Z-c-def
+                ts: "2026-05-04T00:00:00.000000000Z"
+            idempotency_store_error:
+              value:
+                status: error
+                code: idempotency_store_error
+                message: "idempotency lookup failed: read state failed"
+                details: null
+                request_id: req-20260504T000000.000000000Z-d-efg
+                ts: "2026-05-04T00:00:00.000000000Z"
+  schemas:
+    PublicSuccessEnvelope:
+      type: object
+      required: [status, code, message, data, request_id, ts]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        code:
+          type: string
+          enum: [ok]
+        message:
+          type: string
+        data:
+          description: Endpoint-specific payload.
+          nullable: true
+        request_id:
+          type: string
+        ts:
+          type: string
+          format: date-time
+    PublicErrorEnvelope:
+      type: object
+      required: [status, code, message, request_id, ts]
+      properties:
+        status:
+          type: string
+          enum: [error]
+        code:
+          type: string
+          enum:
+            - missing_required_headers
+            - invalid_timestamp_header
+            - timestamp_outside_allowed_window
+            - token_not_found
+            - token_scope_not_allowed
+            - signature_verification_failed
+            - invalid_json_body
+            - method_not_allowed
+            - validation_error
+            - conflict
+            - internal_error
+            - idempotency_key_required
+            - idempotency_key_conflict
+            - idempotency_store_error
+        message:
+          type: string
+        details:
+          description: Optional machine-readable details.
+          nullable: true
+        request_id:
+          type: string
+        ts:
+          type: string
+          format: date-time
+    BookingProduct:
+      type: object
+      required: [id, name, enabled]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    BookingSlotView:
+      type: object
+      required: [id, product_id, start_at, end_at, capacity, enabled, reserved, available_capacity]
+      properties:
+        id:
+          type: string
+        product_id:
+          type: string
+        product_name:
+          type: string
+        start_at:
+          type: string
+          format: date-time
+        end_at:
+          type: string
+          format: date-time
+        capacity:
+          type: integer
+        enabled:
+          type: boolean
+        reserved:
+          type: integer
+        available_capacity:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    BookingReservationPersonnel:
+      type: object
+      required: [contact_name, contact_phone]
+      properties:
+        contact_name:
+          type: string
+        contact_phone:
+          type: string
+        members:
+          type: array
+          items:
+            type: string
+    BookingReservationView:
+      type: object
+      required: [id, product_id, slot_id, user_id, party_size, personnel, status]
+      properties:
+        id:
+          type: string
+        product_id:
+          type: string
+        slot_id:
+          type: string
+        user_id:
+          type: string
+        party_size:
+          type: integer
+        personnel:
+          $ref: "#/components/schemas/BookingReservationPersonnel"
+        special_requirements:
+          type: string
+        status:
+          type: string
+          enum: [pending, confirmed, rejected, cancelled]
+        system_note:
+          type: string
+        product_name:
+          type: string
+        slot_start_at:
+          type: string
+          format: date-time
+        slot_end_at:
+          type: string
+          format: date-time
+        available_capacity:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    BookingCatalogData:
+      type: object
+      required: [products, slots]
+      properties:
+        products:
+          type: array
+          items:
+            $ref: "#/components/schemas/BookingProduct"
+        slots:
+          type: array
+          items:
+            $ref: "#/components/schemas/BookingSlotView"
+    BookingCatalogResponse:
+      allOf:
+        - $ref: "#/components/schemas/PublicSuccessEnvelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/BookingCatalogData"
+    BookingReservationListData:
+      type: object
+      required: [reservations]
+      properties:
+        reservations:
+          type: array
+          items:
+            $ref: "#/components/schemas/BookingReservationView"
+    BookingReservationListResponse:
+      allOf:
+        - $ref: "#/components/schemas/PublicSuccessEnvelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/BookingReservationListData"
+    BookingCreateReservationRequest:
+      type: object
+      required: [product_id, slot_id, user_id, party_size, personnel]
+      properties:
+        product_id:
+          type: string
+        slot_id:
+          type: string
+        user_id:
+          type: string
+        party_size:
+          type: integer
+          minimum: 1
+        personnel:
+          $ref: "#/components/schemas/BookingReservationPersonnel"
+        special_requirements:
+          type: string
+    BookingReservationCreateData:
+      type: object
+      required: [reservation_id, reservation]
+      properties:
+        reservation_id:
+          type: string
+        reservation:
+          $ref: "#/components/schemas/BookingReservationView"
+    BookingReservationCreateResponse:
+      allOf:
+        - $ref: "#/components/schemas/PublicSuccessEnvelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/BookingReservationCreateData"
+    BookingIntentParseRequest:
+      type: object
+      required: [user_id, content]
+      properties:
+        user_id:
+          type: string
+        channel:
+          type: string
+        content:
+          type: string
+    BookingIntentExtracted:
+      type: object
+      properties:
+        product_id:
+          type: string
+        product_name:
+          type: string
+        slot_id:
+          type: string
+        slot_start_at:
+          type: string
+          format: date-time
+        party_size:
+          type: integer
+        personnel:
+          $ref: "#/components/schemas/BookingReservationPersonnel"
+        special_requirements:
+          type: string
+        confidence:
+          type: number
+          format: double
+    BookingIntentDraft:
+      type: object
+      required: [id, user_id, content, status, extracted]
+      properties:
+        id:
+          type: string
+        user_id:
+          type: string
+        channel:
+          type: string
+        content:
+          type: string
+        status:
+          type: string
+          enum: [draft, confirmed, expired]
+        extracted:
+          $ref: "#/components/schemas/BookingIntentExtracted"
+        missing_fields:
+          type: array
+          items:
+            type: string
+        product_candidates:
+          type: array
+          items:
+            $ref: "#/components/schemas/BookingProduct"
+        slot_candidates:
+          type: array
+          items:
+            $ref: "#/components/schemas/BookingSlotView"
+        confirmed_reservation_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    BookingIntentParseData:
+      type: object
+      required: [action, draft_id, updated_fields, override_applied, draft]
+      properties:
+        action:
+          type: string
+        draft_id:
+          type: string
+        updated_fields:
+          type: array
+          items:
+            type: string
+        override_applied:
+          type: boolean
+        draft:
+          $ref: "#/components/schemas/BookingIntentDraft"
+    BookingIntentParseResponse:
+      allOf:
+        - $ref: "#/components/schemas/PublicSuccessEnvelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/BookingIntentParseData"
+    BookingIntentConfirmRequest:
+      type: object
+      required: [draft_id]
+      properties:
+        draft_id:
+          type: string
+        product_id:
+          type: string
+        slot_id:
+          type: string
+        party_size:
+          type: integer
+          minimum: 1
+        personnel:
+          $ref: "#/components/schemas/BookingReservationPersonnel"
+        special_requirements:
+          type: string
+    BookingIntentConfirmData:
+      type: object
+      required: [draft_id, reservation_id, reservation]
+      properties:
+        draft_id:
+          type: string
+        reservation_id:
+          type: string
+        reservation:
+          $ref: "#/components/schemas/BookingReservationView"
+    BookingIntentConfirmResponse:
+      allOf:
+        - $ref: "#/components/schemas/PublicSuccessEnvelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/BookingIntentConfirmData"
+    WebhookValidationStatus:
+      type: object
+      required: [token_valid, timestamp_valid, json_valid]
+      properties:
+        token_valid:
+          type: boolean
+        timestamp_valid:
+          type: boolean
+        json_valid:
+          type: boolean
+    WebhookEventMeta:
+      type: object
+      required: [event_id, received_at, validation]
+      properties:
+        event_id:
+          type: string
+        third_party_id:
+          type: string
+        received_at:
+          type: string
+          format: date-time
+        validation:
+          $ref: "#/components/schemas/WebhookValidationStatus"
+        error:
+          type: string
+    WebhookEventEnvelope:
+      type: object
+      required: [meta]
+      properties:
+        meta:
+          $ref: "#/components/schemas/WebhookEventMeta"
+        data:
+          description: Parsed JSON payload.
+          nullable: true
+          type: object
+          additionalProperties: true
+    WebhookEventResponse:
+      allOf:
+        - $ref: "#/components/schemas/PublicSuccessEnvelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/WebhookEventEnvelope"

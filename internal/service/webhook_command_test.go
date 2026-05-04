@@ -97,6 +97,98 @@ func TestWebhookSignPackageCanPassWebhookValidation(t *testing.T) {
 	}
 }
 
+func TestWebhookPublicIdempotencyEnvelopeAndReplay(t *testing.T) {
+	now := time.Unix(1710000000, 0).UTC()
+	tempDir := t.TempDir()
+	tokenStore := filepath.Join(tempDir, "webhook_tokens.json")
+	eventLog := filepath.Join(tempDir, "webhook_events.json")
+	idempotencyPath := filepath.Join(tempDir, "webhook_idempotency.json")
+
+	if err := writeWebhookTokenRecords(tokenStore, map[string]webhookTokenRecord{
+		"partner-a": {
+			ThirdPartyID: "partner-a",
+			Token:        "secret-token",
+			Scopes:       []string{securityScopeWebhook},
+			CreatedAt:    now.Format(time.RFC3339Nano),
+			UpdatedAt:    now.Format(time.RFC3339Nano),
+		},
+	}); err != nil {
+		t.Fatalf("writeWebhookTokenRecords failed: %v", err)
+	}
+	store, err := newPublicIdempotencyStore(idempotencyPath, time.Hour)
+	if err != nil {
+		t.Fatalf("newPublicIdempotencyStore failed: %v", err)
+	}
+
+	handler := newWebhookEventHandler(webhookServeOptions{
+		TokenStorePath:   tokenStore,
+		EventLogPath:     eventLog,
+		TimestampSkew:    5 * time.Minute,
+		MaxBodyBytes:     1024 * 1024,
+		IdempotencyStore: store,
+		Now: func() time.Time {
+			return now
+		},
+	})
+
+	send := func(body string, key string) (int, string, map[string]any) {
+		t.Helper()
+		timestamp := strconv.FormatInt(now.Unix(), 10)
+		signature := computeWebhookSignature("partner-a", timestamp, "secret-token", []byte(body))
+		req := httptest.NewRequest(http.MethodPost, "/webhook/events", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(webhookHeaderThirdPartyID, "partner-a")
+		req.Header.Set(webhookHeaderTimestamp, timestamp)
+		req.Header.Set(webhookHeaderSignature, signature)
+		if strings.TrimSpace(key) != "" {
+			req.Header.Set(publicAPIHeaderIdempotencyKey, key)
+		}
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		raw := rr.Body.String()
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatalf("decode response failed: %v body=%s", err, raw)
+		}
+		return rr.Code, raw, payload
+	}
+
+	firstStatus, firstBody, firstPayload := send(`{"order_id":"o-1","amount":123}`, "idem-webhook-1")
+	if firstStatus != http.StatusOK {
+		t.Fatalf("expected first request 200, got %d body=%s", firstStatus, firstBody)
+	}
+	if firstPayload["status"] != publicAPIStatusOK || firstPayload["code"] != publicAPIErrorCodeOK {
+		t.Fatalf("expected success envelope, got %+v", firstPayload)
+	}
+	if strings.TrimSpace(fmt.Sprintf("%v", firstPayload["request_id"])) == "" {
+		t.Fatalf("expected request_id present, got %+v", firstPayload)
+	}
+
+	secondStatus, secondBody, _ := send(`{"order_id":"o-1","amount":123}`, "idem-webhook-1")
+	if secondStatus != http.StatusOK {
+		t.Fatalf("expected replay status 200, got %d body=%s", secondStatus, secondBody)
+	}
+	if firstBody != secondBody {
+		t.Fatalf("expected replay body unchanged\nfirst=%s\nsecond=%s", firstBody, secondBody)
+	}
+
+	conflictStatus, conflictBody, conflictPayload := send(`{"order_id":"o-2","amount":123}`, "idem-webhook-1")
+	if conflictStatus != http.StatusConflict {
+		t.Fatalf("expected idempotency conflict 409, got %d body=%s", conflictStatus, conflictBody)
+	}
+	if conflictPayload["code"] != publicAPIErrorCodeIdempotencyKeyConflict {
+		t.Fatalf("expected conflict code %q, got %+v", publicAPIErrorCodeIdempotencyKeyConflict, conflictPayload)
+	}
+
+	missingStatus, missingBody, missingPayload := send(`{"order_id":"o-3","amount":123}`, "")
+	if missingStatus != http.StatusBadRequest {
+		t.Fatalf("expected missing idempotency key 400, got %d body=%s", missingStatus, missingBody)
+	}
+	if missingPayload["code"] != publicAPIErrorCodeIdempotencyKeyRequired {
+		t.Fatalf("expected key required code %q, got %+v", publicAPIErrorCodeIdempotencyKeyRequired, missingPayload)
+	}
+}
+
 func TestWebhookSendBuildPackageUsesSameSignature(t *testing.T) {
 	body := []byte(`{"hello":"world"}`)
 	signResult := buildWebhookSignResult(
@@ -2401,6 +2493,7 @@ func TestWebhookServeDualSurfaceRouteIsolation(t *testing.T) {
 
 	publicMux := http.NewServeMux()
 	adminMux := http.NewServeMux()
+	registerPublicOpenAPIDocsRoutes(publicMux)
 	registerWebhookManagementHandlers(
 		adminMux,
 		cfg,
@@ -2455,6 +2548,89 @@ func TestWebhookServeDualSurfaceRouteIsolation(t *testing.T) {
 	}
 	_ = publicLegacyHealthResp.Body.Close()
 
+	publicOpenAPIYAMLResp, err := http.Get(publicServer.URL + publicOpenAPISpecYAMLPath)
+	if err != nil {
+		t.Fatalf("GET public openapi yaml failed: %v", err)
+	}
+	if publicOpenAPIYAMLResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicOpenAPIYAMLResp)
+		t.Fatalf("expected public openapi yaml 200, got %d body=%s", publicOpenAPIYAMLResp.StatusCode, body)
+	}
+	_ = publicOpenAPIYAMLResp.Body.Close()
+
+	publicOpenAPIDocsResp, err := http.Get(publicServer.URL + publicOpenAPIHomePath)
+	if err != nil {
+		t.Fatalf("GET public openapi docs failed: %v", err)
+	}
+	if publicOpenAPIDocsResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicOpenAPIDocsResp)
+		t.Fatalf("expected public openapi docs 200, got %d body=%s", publicOpenAPIDocsResp.StatusCode, body)
+	}
+	publicOpenAPIDocsBody := readAllAndClose(t, publicOpenAPIDocsResp)
+	if !strings.Contains(publicOpenAPIDocsBody, "Longtradego Public API Portal") {
+		t.Fatalf("expected public openapi docs body contains title, got %s", publicOpenAPIDocsBody)
+	}
+
+	publicReferenceResp, err := http.Get(publicServer.URL + publicOpenAPIReferencePath)
+	if err != nil {
+		t.Fatalf("GET public openapi reference failed: %v", err)
+	}
+	if publicReferenceResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicReferenceResp)
+		t.Fatalf("expected public openapi reference 200, got %d body=%s", publicReferenceResp.StatusCode, body)
+	}
+	publicReferenceBody := readAllAndClose(t, publicReferenceResp)
+	if !strings.Contains(publicReferenceBody, "SwaggerUIBundle") {
+		t.Fatalf("expected public openapi reference contains SwaggerUIBundle, got %s", publicReferenceBody)
+	}
+
+	publicGuideResp, err := http.Get(publicServer.URL + publicOpenAPIGuideJSPath)
+	if err != nil {
+		t.Fatalf("GET public openapi guide html failed: %v", err)
+	}
+	if publicGuideResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicGuideResp)
+		t.Fatalf("expected public openapi guide html 200, got %d body=%s", publicGuideResp.StatusCode, body)
+	}
+	publicGuideBody := readAllAndClose(t, publicGuideResp)
+	if !strings.Contains(publicGuideBody, "Public API JS Integration Guide") {
+		t.Fatalf("expected public openapi guide html contains title, got %s", publicGuideBody)
+	}
+
+	publicGuideMDResp, err := http.Get(publicServer.URL + publicOpenAPIGuideJSMDPath)
+	if err != nil {
+		t.Fatalf("GET public openapi guide markdown failed: %v", err)
+	}
+	if publicGuideMDResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicGuideMDResp)
+		t.Fatalf("expected public openapi guide markdown 200, got %d body=%s", publicGuideMDResp.StatusCode, body)
+	}
+	_ = publicGuideMDResp.Body.Close()
+
+	docsRedirectClient := &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	publicDocsRedirectResp, err := docsRedirectClient.Get(publicServer.URL + legacyPublicDocsPath + "?from=test")
+	if err != nil {
+		t.Fatalf("GET public legacy /docs failed: %v", err)
+	}
+	if publicDocsRedirectResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected public legacy /docs 404, got %d", publicDocsRedirectResp.StatusCode)
+	}
+	_ = publicDocsRedirectResp.Body.Close()
+
+	publicLegacyDocsResp, err := http.Get(publicServer.URL + legacyPublicOpenAPIDocsPath)
+	if err != nil {
+		t.Fatalf("GET public legacy /openapi/v1/docs failed: %v", err)
+	}
+	if publicLegacyDocsResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected public legacy /openapi/v1/docs 404, got %d", publicLegacyDocsResp.StatusCode)
+	}
+	_ = publicLegacyDocsResp.Body.Close()
+
 	adminStatusResp, err := http.Get(adminServer.URL + webhookAdminStatusPath)
 	if err != nil {
 		t.Fatalf("GET admin status path failed: %v", err)
@@ -2473,6 +2649,16 @@ func TestWebhookServeDualSurfaceRouteIsolation(t *testing.T) {
 	}
 	_ = adminHealthResp.Body.Close()
 
+	adminOpenAPIYAMLResp, err := http.Get(adminServer.URL + publicOpenAPISpecYAMLPath)
+	if err != nil {
+		t.Fatalf("GET admin openapi yaml path failed: %v", err)
+	}
+	if adminOpenAPIYAMLResp.StatusCode != http.StatusNotFound {
+		body := readAllAndClose(t, adminOpenAPIYAMLResp)
+		t.Fatalf("expected admin openapi yaml path 404, got %d body=%s", adminOpenAPIYAMLResp.StatusCode, body)
+	}
+	_ = adminOpenAPIYAMLResp.Body.Close()
+
 	adminWebhookResp, err := http.Get(adminServer.URL + cfg.Path)
 	if err != nil {
 		t.Fatalf("GET admin webhook path failed: %v", err)
@@ -2488,6 +2674,12 @@ func TestValidateWebhookManagementPathConflictsIncludesAdminHome(t *testing.T) {
 		webhookAdminHomePath,
 		webhookAdminHomeSlash,
 		webhookAdminStopPath,
+		publicOpenAPIRootPath,
+		publicOpenAPIHomePath,
+		publicOpenAPIReferencePath,
+		publicOpenAPIReferencePrefix + "index.html",
+		legacyPublicDocsPath,
+		legacyPublicDocsPrefix + "client",
 	}
 	for _, reservedPath := range cases {
 		routes := []webhookResolvedRoute{
@@ -2676,11 +2868,35 @@ func TestDaemonCompletionIncludesWebhookRootCommand(t *testing.T) {
 
 func decodeWebhookResponse(t *testing.T, raw []byte) webhookEventEnvelope {
 	t.Helper()
-	var event webhookEventEnvelope
-	if err := json.Unmarshal(raw, &event); err != nil {
+	var direct webhookEventEnvelope
+	if err := json.Unmarshal(raw, &direct); err == nil {
+		if strings.TrimSpace(direct.Meta.EventID) != "" || strings.TrimSpace(direct.Meta.Error) != "" {
+			return direct
+		}
+	}
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
 		t.Fatalf("decode response failed: %v, raw=%s", err, string(raw))
 	}
-	return event
+	if data, ok := root["data"]; ok {
+		encoded, _ := json.Marshal(data)
+		var event webhookEventEnvelope
+		if err := json.Unmarshal(encoded, &event); err == nil {
+			if strings.TrimSpace(event.Meta.EventID) != "" || strings.TrimSpace(event.Meta.Error) != "" {
+				return event
+			}
+		}
+	}
+	if details, ok := root["details"].(map[string]any); ok {
+		if eventRaw, ok := details["event"]; ok {
+			encoded, _ := json.Marshal(eventRaw)
+			var event webhookEventEnvelope
+			if err := json.Unmarshal(encoded, &event); err == nil {
+				return event
+			}
+		}
+	}
+	return direct
 }
 
 func strconvFormatInt(value int64) string {
