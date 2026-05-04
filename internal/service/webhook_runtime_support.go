@@ -976,6 +976,9 @@ func validateWebhookManagementPathConflicts(routes []webhookResolvedRoute) error
 		if strings.HasPrefix(route.Record.Path, "/admin") {
 			return fmt.Errorf("route path %s conflicts with reserved admin namespace", route.Record.Path)
 		}
+		if isReservedPublicDocsPath(route.Record.Path) {
+			return fmt.Errorf("route path %s conflicts with reserved openapi/docs namespace", route.Record.Path)
+		}
 		if _, exists := reserved[route.Record.Path]; exists {
 			return fmt.Errorf("route path %s conflicts with reserved management endpoint", route.Record.Path)
 		}

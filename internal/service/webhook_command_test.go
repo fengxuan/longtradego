@@ -2493,6 +2493,7 @@ func TestWebhookServeDualSurfaceRouteIsolation(t *testing.T) {
 
 	publicMux := http.NewServeMux()
 	adminMux := http.NewServeMux()
+	registerPublicOpenAPIDocsRoutes(publicMux)
 	registerWebhookManagementHandlers(
 		adminMux,
 		cfg,
@@ -2547,6 +2548,89 @@ func TestWebhookServeDualSurfaceRouteIsolation(t *testing.T) {
 	}
 	_ = publicLegacyHealthResp.Body.Close()
 
+	publicOpenAPIYAMLResp, err := http.Get(publicServer.URL + publicOpenAPISpecYAMLPath)
+	if err != nil {
+		t.Fatalf("GET public openapi yaml failed: %v", err)
+	}
+	if publicOpenAPIYAMLResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicOpenAPIYAMLResp)
+		t.Fatalf("expected public openapi yaml 200, got %d body=%s", publicOpenAPIYAMLResp.StatusCode, body)
+	}
+	_ = publicOpenAPIYAMLResp.Body.Close()
+
+	publicOpenAPIDocsResp, err := http.Get(publicServer.URL + publicOpenAPIHomePath)
+	if err != nil {
+		t.Fatalf("GET public openapi docs failed: %v", err)
+	}
+	if publicOpenAPIDocsResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicOpenAPIDocsResp)
+		t.Fatalf("expected public openapi docs 200, got %d body=%s", publicOpenAPIDocsResp.StatusCode, body)
+	}
+	publicOpenAPIDocsBody := readAllAndClose(t, publicOpenAPIDocsResp)
+	if !strings.Contains(publicOpenAPIDocsBody, "Longtradego Public API Portal") {
+		t.Fatalf("expected public openapi docs body contains title, got %s", publicOpenAPIDocsBody)
+	}
+
+	publicReferenceResp, err := http.Get(publicServer.URL + publicOpenAPIReferencePath)
+	if err != nil {
+		t.Fatalf("GET public openapi reference failed: %v", err)
+	}
+	if publicReferenceResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicReferenceResp)
+		t.Fatalf("expected public openapi reference 200, got %d body=%s", publicReferenceResp.StatusCode, body)
+	}
+	publicReferenceBody := readAllAndClose(t, publicReferenceResp)
+	if !strings.Contains(publicReferenceBody, "SwaggerUIBundle") {
+		t.Fatalf("expected public openapi reference contains SwaggerUIBundle, got %s", publicReferenceBody)
+	}
+
+	publicGuideResp, err := http.Get(publicServer.URL + publicOpenAPIGuideJSPath)
+	if err != nil {
+		t.Fatalf("GET public openapi guide html failed: %v", err)
+	}
+	if publicGuideResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicGuideResp)
+		t.Fatalf("expected public openapi guide html 200, got %d body=%s", publicGuideResp.StatusCode, body)
+	}
+	publicGuideBody := readAllAndClose(t, publicGuideResp)
+	if !strings.Contains(publicGuideBody, "Public API JS Integration Guide") {
+		t.Fatalf("expected public openapi guide html contains title, got %s", publicGuideBody)
+	}
+
+	publicGuideMDResp, err := http.Get(publicServer.URL + publicOpenAPIGuideJSMDPath)
+	if err != nil {
+		t.Fatalf("GET public openapi guide markdown failed: %v", err)
+	}
+	if publicGuideMDResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicGuideMDResp)
+		t.Fatalf("expected public openapi guide markdown 200, got %d body=%s", publicGuideMDResp.StatusCode, body)
+	}
+	_ = publicGuideMDResp.Body.Close()
+
+	docsRedirectClient := &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	publicDocsRedirectResp, err := docsRedirectClient.Get(publicServer.URL + legacyPublicDocsPath + "?from=test")
+	if err != nil {
+		t.Fatalf("GET public legacy /docs failed: %v", err)
+	}
+	if publicDocsRedirectResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected public legacy /docs 404, got %d", publicDocsRedirectResp.StatusCode)
+	}
+	_ = publicDocsRedirectResp.Body.Close()
+
+	publicLegacyDocsResp, err := http.Get(publicServer.URL + legacyPublicOpenAPIDocsPath)
+	if err != nil {
+		t.Fatalf("GET public legacy /openapi/v1/docs failed: %v", err)
+	}
+	if publicLegacyDocsResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected public legacy /openapi/v1/docs 404, got %d", publicLegacyDocsResp.StatusCode)
+	}
+	_ = publicLegacyDocsResp.Body.Close()
+
 	adminStatusResp, err := http.Get(adminServer.URL + webhookAdminStatusPath)
 	if err != nil {
 		t.Fatalf("GET admin status path failed: %v", err)
@@ -2565,6 +2649,16 @@ func TestWebhookServeDualSurfaceRouteIsolation(t *testing.T) {
 	}
 	_ = adminHealthResp.Body.Close()
 
+	adminOpenAPIYAMLResp, err := http.Get(adminServer.URL + publicOpenAPISpecYAMLPath)
+	if err != nil {
+		t.Fatalf("GET admin openapi yaml path failed: %v", err)
+	}
+	if adminOpenAPIYAMLResp.StatusCode != http.StatusNotFound {
+		body := readAllAndClose(t, adminOpenAPIYAMLResp)
+		t.Fatalf("expected admin openapi yaml path 404, got %d body=%s", adminOpenAPIYAMLResp.StatusCode, body)
+	}
+	_ = adminOpenAPIYAMLResp.Body.Close()
+
 	adminWebhookResp, err := http.Get(adminServer.URL + cfg.Path)
 	if err != nil {
 		t.Fatalf("GET admin webhook path failed: %v", err)
@@ -2580,6 +2674,12 @@ func TestValidateWebhookManagementPathConflictsIncludesAdminHome(t *testing.T) {
 		webhookAdminHomePath,
 		webhookAdminHomeSlash,
 		webhookAdminStopPath,
+		publicOpenAPIRootPath,
+		publicOpenAPIHomePath,
+		publicOpenAPIReferencePath,
+		publicOpenAPIReferencePrefix + "index.html",
+		legacyPublicDocsPath,
+		legacyPublicDocsPrefix + "client",
 	}
 	for _, reservedPath := range cases {
 		routes := []webhookResolvedRoute{

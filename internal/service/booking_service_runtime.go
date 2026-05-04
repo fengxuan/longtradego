@@ -1691,6 +1691,8 @@ func (c *bookingServiceController) registerHandlers(publicMux *http.ServeMux, ad
 		}))
 	}
 
+	registerPublicOpenAPIDocsRoutes(publicMux)
+
 	registerAdminGet(bookingAdminHomePath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

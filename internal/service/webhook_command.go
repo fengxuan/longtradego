@@ -432,6 +432,7 @@ func newWebhookServeCommand(app *AppContext) *cobra.Command {
 
 			publicMux := http.NewServeMux()
 			adminMux := http.NewServeMux()
+			registerPublicOpenAPIDocsRoutes(publicMux)
 			var (
 				publicServer *http.Server
 				adminServer  *http.Server

@@ -1004,6 +1004,120 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	publicBaseURL := "http://" + bookingRuntimePublicAddress(runtime)
 	adminBaseURL := "http://" + bookingRuntimeAdminAddress(runtime)
 
+	publicOpenAPIYAMLResp, err := http.Get(publicBaseURL + publicOpenAPISpecYAMLPath)
+	if err != nil {
+		t.Fatalf("GET public openapi yaml failed: %v", err)
+	}
+	if publicOpenAPIYAMLResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicOpenAPIYAMLResp)
+		t.Fatalf("expected public openapi yaml 200, got %d body=%s", publicOpenAPIYAMLResp.StatusCode, body)
+	}
+	publicOpenAPIYAMLContentType := strings.ToLower(strings.TrimSpace(publicOpenAPIYAMLResp.Header.Get("Content-Type")))
+	if !strings.Contains(publicOpenAPIYAMLContentType, "yaml") {
+		body := readAllAndClose(t, publicOpenAPIYAMLResp)
+		t.Fatalf("expected public openapi yaml content-type contains yaml, got %q body=%s", publicOpenAPIYAMLContentType, body)
+	}
+	openapiYAMLBody := readAllAndClose(t, publicOpenAPIYAMLResp)
+	if !strings.Contains(openapiYAMLBody, "openapi: 3.0.3") {
+		t.Fatalf("expected public openapi yaml body contains openapi version, got %s", openapiYAMLBody)
+	}
+
+	publicOpenAPIJSONResp, err := http.Get(publicBaseURL + publicOpenAPISpecJSONPath)
+	if err != nil {
+		t.Fatalf("GET public openapi json failed: %v", err)
+	}
+	if publicOpenAPIJSONResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicOpenAPIJSONResp)
+		t.Fatalf("expected public openapi json 200, got %d body=%s", publicOpenAPIJSONResp.StatusCode, body)
+	}
+	var openapiJSONPayload map[string]any
+	if err := json.NewDecoder(publicOpenAPIJSONResp.Body).Decode(&openapiJSONPayload); err != nil {
+		t.Fatalf("decode public openapi json failed: %v", err)
+	}
+	_ = publicOpenAPIJSONResp.Body.Close()
+	if strings.TrimSpace(fmt.Sprintf("%v", openapiJSONPayload["openapi"])) != "3.0.3" {
+		t.Fatalf("expected public openapi json openapi=3.0.3, got %#v", openapiJSONPayload["openapi"])
+	}
+
+	publicDocsResp, err := http.Get(publicBaseURL + publicOpenAPIHomePath)
+	if err != nil {
+		t.Fatalf("GET public docs failed: %v", err)
+	}
+	if publicDocsResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicDocsResp)
+		t.Fatalf("expected public docs 200, got %d body=%s", publicDocsResp.StatusCode, body)
+	}
+	publicDocsContentType := strings.ToLower(strings.TrimSpace(publicDocsResp.Header.Get("Content-Type")))
+	if !strings.HasPrefix(publicDocsContentType, "text/html") {
+		body := readAllAndClose(t, publicDocsResp)
+		t.Fatalf("expected public docs text/html content-type, got %q body=%s", publicDocsContentType, body)
+	}
+	publicDocsBody := readAllAndClose(t, publicDocsResp)
+	for _, snippet := range []string{
+		"Longtradego Public API Portal",
+		publicOpenAPIReferencePath,
+		publicOpenAPISpecYAMLPath,
+		publicOpenAPIGuideJSPath,
+	} {
+		if !strings.Contains(publicDocsBody, snippet) {
+			t.Fatalf("expected public docs contains %q", snippet)
+		}
+	}
+
+	publicReferenceResp, err := http.Get(publicBaseURL + publicOpenAPIReferencePath)
+	if err != nil {
+		t.Fatalf("GET public reference failed: %v", err)
+	}
+	if publicReferenceResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicReferenceResp)
+		t.Fatalf("expected public reference 200, got %d body=%s", publicReferenceResp.StatusCode, body)
+	}
+	publicReferenceBody := readAllAndClose(t, publicReferenceResp)
+	if !strings.Contains(publicReferenceBody, "SwaggerUIBundle") {
+		t.Fatalf("expected public reference contains SwaggerUIBundle, got %s", publicReferenceBody)
+	}
+
+	publicGuideResp, err := http.Get(publicBaseURL + publicOpenAPIGuideJSPath)
+	if err != nil {
+		t.Fatalf("GET public js guide html failed: %v", err)
+	}
+	if publicGuideResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicGuideResp)
+		t.Fatalf("expected public js guide html 200, got %d body=%s", publicGuideResp.StatusCode, body)
+	}
+	publicGuideBody := readAllAndClose(t, publicGuideResp)
+	if !strings.Contains(publicGuideBody, "Public API JS Integration Guide") {
+		t.Fatalf("expected public js guide html contains title, got %s", publicGuideBody)
+	}
+
+	publicGuideMDResp, err := http.Get(publicBaseURL + publicOpenAPIGuideJSMDPath)
+	if err != nil {
+		t.Fatalf("GET public js guide markdown failed: %v", err)
+	}
+	if publicGuideMDResp.StatusCode != http.StatusOK {
+		body := readAllAndClose(t, publicGuideMDResp)
+		t.Fatalf("expected public js guide markdown 200, got %d body=%s", publicGuideMDResp.StatusCode, body)
+	}
+	_ = publicGuideMDResp.Body.Close()
+
+	docsRedirectResp, err := http.Get(publicBaseURL + legacyPublicDocsPath + "?from=test")
+	if err != nil {
+		t.Fatalf("GET legacy /docs failed: %v", err)
+	}
+	if docsRedirectResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected legacy /docs 404, got %d", docsRedirectResp.StatusCode)
+	}
+	_ = docsRedirectResp.Body.Close()
+
+	legacyPublicDocsResp, err := http.Get(publicBaseURL + legacyPublicOpenAPIDocsPath)
+	if err != nil {
+		t.Fatalf("GET legacy /openapi/v1/docs failed: %v", err)
+	}
+	if legacyPublicDocsResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected legacy /openapi/v1/docs 404, got %d", legacyPublicDocsResp.StatusCode)
+	}
+	_ = legacyPublicDocsResp.Body.Close()
+
 	unauthCatalogResp, err := http.Get(publicBaseURL + bookingPublicCatalogPath)
 	if err != nil {
 		t.Fatalf("GET catalog without key failed: %v", err)
@@ -1170,6 +1284,27 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 		t.Fatalf("expected public booking admin home endpoint 404, got %d body=%s", publicAdminHomeResp.StatusCode, body)
 	}
 	_ = publicAdminHomeResp.Body.Close()
+
+	adminOpenAPIReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+publicOpenAPISpecYAMLPath, nil)
+	adminOpenAPIResp, err := http.DefaultClient.Do(adminOpenAPIReq)
+	if err != nil {
+		t.Fatalf("GET admin listener openapi endpoint failed: %v", err)
+	}
+	if adminOpenAPIResp.StatusCode != http.StatusNotFound {
+		body := readAllAndClose(t, adminOpenAPIResp)
+		t.Fatalf("expected admin listener openapi endpoint 404, got %d body=%s", adminOpenAPIResp.StatusCode, body)
+	}
+	_ = adminOpenAPIResp.Body.Close()
+
+	adminJSGuidResp, err := http.Get(adminBaseURL + publicOpenAPIGuideJSPath)
+	if err != nil {
+		t.Fatalf("GET admin listener js integration guide endpoint failed: %v", err)
+	}
+	if adminJSGuidResp.StatusCode != http.StatusNotFound {
+		body := readAllAndClose(t, adminJSGuidResp)
+		t.Fatalf("expected admin listener js integration guide endpoint 404, got %d body=%s", adminJSGuidResp.StatusCode, body)
+	}
+	_ = adminJSGuidResp.Body.Close()
 
 	adminPublicReq, _ := http.NewRequest(http.MethodGet, adminBaseURL+bookingPublicCatalogPath, nil)
 	setBookingSignedHeaders(adminPublicReq, "partner-a", "booking-key", nil, time.Now().UTC())

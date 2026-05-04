@@ -353,6 +353,7 @@ go run . webhook sign \
 ```
 
 For cross-language client integration (JS/Python helper functions, signing rules, and troubleshooting), see [Public API Signing Guide](#public-api-signing-guide).
+For third-party JavaScript backend integrators, use the dedicated guide: [Public API JS Integration Guide](docs/public_api_js_integration.md).
 
 Quickly send a signed webhook test request:
 
@@ -392,6 +393,13 @@ This guide applies to all public signed endpoints:
 Authoritative spec:
 
 - OpenAPI: [`docs/openapi/public_api.yaml`](docs/openapi/public_api.yaml)
+- Runtime portal: `http://<public-host>/openapi/v1`
+- Runtime YAML: `http://<public-host>/openapi/v1/spec.yaml`
+- Runtime JSON: `http://<public-host>/openapi/v1/spec.json`
+- Runtime API reference UI: `http://<public-host>/openapi/v1/reference`
+- Runtime JS guide (HTML): `http://<public-host>/openapi/v1/guide/js`
+- Runtime JS guide (Markdown): `http://<public-host>/openapi/v1/guide/js.md`
+- JS integration guide: [`docs/public_api_js_integration.md`](docs/public_api_js_integration.md)
 
 Required signing headers:
 
@@ -856,7 +864,7 @@ HTTP semantics:
 
 ### Expose Booking Public APIs via Cloudflare Named Tunnel
 
-This setup exposes only `/booking/*` from booking public listener and blocks `/admin/*` at tunnel ingress level.
+This setup exposes `/booking/*` and public docs (`/openapi/*`) from booking public listener, while blocking `/admin/*` at tunnel ingress level.
 
 1. Start booking service on fixed local origin:
 
@@ -870,7 +878,7 @@ This setup exposes only `/booking/*` from booking public listener and blocks `/a
 http://127.0.0.1:18081
 ```
 
-3. Configure ingress rules (order matters: block admin -> allow booking -> deny all):
+3. Configure ingress rules (order matters: block admin -> allow booking+openapi -> deny all):
 
 ```yaml
 ingress:
@@ -879,6 +887,9 @@ ingress:
     service: http_status:403
   - hostname: booking-api.example.com
     path: ^/booking(/.*)?$
+    service: http://127.0.0.1:18081
+  - hostname: booking-api.example.com
+    path: ^/openapi(/.*)?$
     service: http://127.0.0.1:18081
   - hostname: booking-api.example.com
     service: http_status:404

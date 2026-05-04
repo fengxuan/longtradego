@@ -15,9 +15,14 @@ ingress:
     path: ^/admin(/.*)?$
     service: http_status:403
 
-  # Allow only booking public APIs.
+  # Allow booking public APIs.
   - hostname: booking-api.example.com
     path: ^/booking(/.*)?$
+    service: http://127.0.0.1:18081
+
+  # Allow public OpenAPI docs.
+  - hostname: booking-api.example.com
+    path: ^/openapi(/.*)?$
     service: http://127.0.0.1:18081
 
   # All other paths on this host are denied.
