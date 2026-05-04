@@ -273,6 +273,7 @@ func TestDaemonCompletionUpgradeFlags(t *testing.T) {
 func TestDaemonCompletionBookingSubcommandsAndFlags(t *testing.T) {
 	candidates := completionCandidatesFromLine("booking ")
 	if !slices.Contains(candidates, "product") ||
+		!slices.Contains(candidates, "agent") ||
 		!slices.Contains(candidates, "slot") ||
 		!slices.Contains(candidates, "reservation") ||
 		!slices.Contains(candidates, "service") ||
@@ -309,6 +310,19 @@ func TestDaemonCompletionBookingSubcommandsAndFlags(t *testing.T) {
 		!slices.Contains(serviceCandidates, "--security-keys") ||
 		!slices.Contains(serviceCandidates, "--llm-config") {
 		t.Fatalf("expected booking service start flags, got: %v", serviceCandidates)
+	}
+
+	agentReserveCandidates := completionCandidatesFromLine("booking agent reserve --")
+	if !slices.Contains(agentReserveCandidates, "--user-id") ||
+		!slices.Contains(agentReserveCandidates, "--content") ||
+		!slices.Contains(agentReserveCandidates, "--third-party-id") ||
+		!slices.Contains(agentReserveCandidates, "--token") ||
+		!slices.Contains(agentReserveCandidates, "--security-keys") ||
+		!slices.Contains(agentReserveCandidates, "--url") ||
+		!slices.Contains(agentReserveCandidates, "--idempotency-key") ||
+		!slices.Contains(agentReserveCandidates, "--slot-id") ||
+		!slices.Contains(agentReserveCandidates, "--contact-phone") {
+		t.Fatalf("expected booking agent reserve flags, got: %v", agentReserveCandidates)
 	}
 }
 

@@ -743,7 +743,32 @@ go run . booking reservation cancel r-3 --note "user canceled"
 
 # user-view query
 go run . booking query --product-id p-1 --from 2026-05-03T00:00:00+08:00 --to 2026-05-03T23:59:59+08:00
+
+# booking agent (simulate external AI flow: parse -> confirm)
+go run . booking agent reserve \
+  --user-id u-1 \
+  --content "我想明天上午两个人预约产品 p-1" \
+  --third-party-id partner-a \
+  --security-keys conf/security_keys.json \
+  --url http://127.0.0.1:18081
+
+# if parse still has missing fields, provide overrides
+go run . booking agent reserve \
+  --user-id u-1 \
+  --content "我想明天上午两个人预约" \
+  --third-party-id partner-a \
+  --security-keys conf/security_keys.json \
+  --slot-id slot-1 \
+  --contact-phone 13800138000
 ```
+
+`booking agent reserve` behavior:
+
+- Calls `/booking/intents/parse` then `/booking/intents/confirm` using unified signed headers.
+- Uses `--token` first; if empty, reads token from `--security-keys` by `third_party_id` and requires `booking` scope.
+- Uses runtime public address when `--url` is empty; if service is not running, command fails and asks to run `booking service start`.
+- Always sends `Idempotency-Key` to both POSTs (`<prefix>-parse` / `<prefix>-confirm`).
+- If required fields are still missing after overrides, command stops before confirm and prints `missing_fields` with recommended flags.
 
 Booking service APIs:
 
