@@ -97,6 +97,98 @@ func TestWebhookSignPackageCanPassWebhookValidation(t *testing.T) {
 	}
 }
 
+func TestWebhookPublicIdempotencyEnvelopeAndReplay(t *testing.T) {
+	now := time.Unix(1710000000, 0).UTC()
+	tempDir := t.TempDir()
+	tokenStore := filepath.Join(tempDir, "webhook_tokens.json")
+	eventLog := filepath.Join(tempDir, "webhook_events.json")
+	idempotencyPath := filepath.Join(tempDir, "webhook_idempotency.json")
+
+	if err := writeWebhookTokenRecords(tokenStore, map[string]webhookTokenRecord{
+		"partner-a": {
+			ThirdPartyID: "partner-a",
+			Token:        "secret-token",
+			Scopes:       []string{securityScopeWebhook},
+			CreatedAt:    now.Format(time.RFC3339Nano),
+			UpdatedAt:    now.Format(time.RFC3339Nano),
+		},
+	}); err != nil {
+		t.Fatalf("writeWebhookTokenRecords failed: %v", err)
+	}
+	store, err := newPublicIdempotencyStore(idempotencyPath, time.Hour)
+	if err != nil {
+		t.Fatalf("newPublicIdempotencyStore failed: %v", err)
+	}
+
+	handler := newWebhookEventHandler(webhookServeOptions{
+		TokenStorePath:   tokenStore,
+		EventLogPath:     eventLog,
+		TimestampSkew:    5 * time.Minute,
+		MaxBodyBytes:     1024 * 1024,
+		IdempotencyStore: store,
+		Now: func() time.Time {
+			return now
+		},
+	})
+
+	send := func(body string, key string) (int, string, map[string]any) {
+		t.Helper()
+		timestamp := strconv.FormatInt(now.Unix(), 10)
+		signature := computeWebhookSignature("partner-a", timestamp, "secret-token", []byte(body))
+		req := httptest.NewRequest(http.MethodPost, "/webhook/events", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(webhookHeaderThirdPartyID, "partner-a")
+		req.Header.Set(webhookHeaderTimestamp, timestamp)
+		req.Header.Set(webhookHeaderSignature, signature)
+		if strings.TrimSpace(key) != "" {
+			req.Header.Set(publicAPIHeaderIdempotencyKey, key)
+		}
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		raw := rr.Body.String()
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatalf("decode response failed: %v body=%s", err, raw)
+		}
+		return rr.Code, raw, payload
+	}
+
+	firstStatus, firstBody, firstPayload := send(`{"order_id":"o-1","amount":123}`, "idem-webhook-1")
+	if firstStatus != http.StatusOK {
+		t.Fatalf("expected first request 200, got %d body=%s", firstStatus, firstBody)
+	}
+	if firstPayload["status"] != publicAPIStatusOK || firstPayload["code"] != publicAPIErrorCodeOK {
+		t.Fatalf("expected success envelope, got %+v", firstPayload)
+	}
+	if strings.TrimSpace(fmt.Sprintf("%v", firstPayload["request_id"])) == "" {
+		t.Fatalf("expected request_id present, got %+v", firstPayload)
+	}
+
+	secondStatus, secondBody, _ := send(`{"order_id":"o-1","amount":123}`, "idem-webhook-1")
+	if secondStatus != http.StatusOK {
+		t.Fatalf("expected replay status 200, got %d body=%s", secondStatus, secondBody)
+	}
+	if firstBody != secondBody {
+		t.Fatalf("expected replay body unchanged\nfirst=%s\nsecond=%s", firstBody, secondBody)
+	}
+
+	conflictStatus, conflictBody, conflictPayload := send(`{"order_id":"o-2","amount":123}`, "idem-webhook-1")
+	if conflictStatus != http.StatusConflict {
+		t.Fatalf("expected idempotency conflict 409, got %d body=%s", conflictStatus, conflictBody)
+	}
+	if conflictPayload["code"] != publicAPIErrorCodeIdempotencyKeyConflict {
+		t.Fatalf("expected conflict code %q, got %+v", publicAPIErrorCodeIdempotencyKeyConflict, conflictPayload)
+	}
+
+	missingStatus, missingBody, missingPayload := send(`{"order_id":"o-3","amount":123}`, "")
+	if missingStatus != http.StatusBadRequest {
+		t.Fatalf("expected missing idempotency key 400, got %d body=%s", missingStatus, missingBody)
+	}
+	if missingPayload["code"] != publicAPIErrorCodeIdempotencyKeyRequired {
+		t.Fatalf("expected key required code %q, got %+v", publicAPIErrorCodeIdempotencyKeyRequired, missingPayload)
+	}
+}
+
 func TestWebhookSendBuildPackageUsesSameSignature(t *testing.T) {
 	body := []byte(`{"hello":"world"}`)
 	signResult := buildWebhookSignResult(
@@ -2676,11 +2768,35 @@ func TestDaemonCompletionIncludesWebhookRootCommand(t *testing.T) {
 
 func decodeWebhookResponse(t *testing.T, raw []byte) webhookEventEnvelope {
 	t.Helper()
-	var event webhookEventEnvelope
-	if err := json.Unmarshal(raw, &event); err != nil {
+	var direct webhookEventEnvelope
+	if err := json.Unmarshal(raw, &direct); err == nil {
+		if strings.TrimSpace(direct.Meta.EventID) != "" || strings.TrimSpace(direct.Meta.Error) != "" {
+			return direct
+		}
+	}
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
 		t.Fatalf("decode response failed: %v, raw=%s", err, string(raw))
 	}
-	return event
+	if data, ok := root["data"]; ok {
+		encoded, _ := json.Marshal(data)
+		var event webhookEventEnvelope
+		if err := json.Unmarshal(encoded, &event); err == nil {
+			if strings.TrimSpace(event.Meta.EventID) != "" || strings.TrimSpace(event.Meta.Error) != "" {
+				return event
+			}
+		}
+	}
+	if details, ok := root["details"].(map[string]any); ok {
+		if eventRaw, ok := details["event"]; ok {
+			encoded, _ := json.Marshal(eventRaw)
+			var event webhookEventEnvelope
+			if err := json.Unmarshal(encoded, &event); err == nil {
+				return event
+			}
+		}
+	}
+	return direct
 }
 
 func strconvFormatInt(value int64) string {

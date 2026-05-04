@@ -243,6 +243,7 @@ type webhookServeOptions struct {
 	AuditLogAppender   func(webhookAuditLogEntry) error
 	Metrics            *webhookServerMetrics
 	Now                func() time.Time
+	IdempotencyStore   *publicIdempotencyStore
 }
 
 type webhookServeConfig struct {
@@ -258,6 +259,7 @@ type webhookServeConfig struct {
 	DispatchQueuePath        string
 	DispatchHistoryPath      string
 	DeadLetterPath           string
+	IdempotencyPath          string
 	TimeSkew                 time.Duration
 	MaxBodyBytes             int64
 	AllowSysDownstream       bool
@@ -376,6 +378,10 @@ func newWebhookServeCommand(app *AppContext) *cobra.Command {
 			}
 			tokenCache.Start()
 			defer tokenCache.Stop()
+			idempotencyStore, err := newPublicIdempotencyStore(cfg.IdempotencyPath, defaultPublicIdempotencyTTL)
+			if err != nil {
+				return err
+			}
 
 			eventLogWriter, err := newWebhookEventLogWriter(cfg.EventLogPath)
 			if err != nil {
@@ -480,6 +486,7 @@ func newWebhookServeCommand(app *AppContext) *cobra.Command {
 					EventLogAppender:   eventAppender,
 					AuditLogAppender:   auditAppender,
 					Metrics:            metrics,
+					IdempotencyStore:   idempotencyStore,
 				})
 				publicMux.Handle(route.Record.Path, handler)
 			}
@@ -906,13 +913,14 @@ func newWebhookSignCommand(app *AppContext) *cobra.Command {
 
 func newWebhookSendCommand(app *AppContext) *cobra.Command {
 	var (
-		thirdPartyID  string
-		rawToken      string
-		dataText      string
-		dataFile      string
-		timestampText string
-		targetURL     string
-		timeout       time.Duration
+		thirdPartyID   string
+		rawToken       string
+		dataText       string
+		dataFile       string
+		timestampText  string
+		targetURL      string
+		idempotencyKey string
+		timeout        time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -952,6 +960,10 @@ func newWebhookSendCommand(app *AppContext) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if strings.TrimSpace(idempotencyKey) == "" {
+				idempotencyKey = fmt.Sprintf("send-%d", time.Now().UnixNano())
+			}
+			signResult.Headers[publicAPIHeaderIdempotencyKey] = strings.TrimSpace(idempotencyKey)
 			sendResult, sendErr := executeWebhookSendRequest(signResult, timeout)
 
 			app.SetExecution("webhook", []string{"send", thirdPartyID})
@@ -976,6 +988,7 @@ func newWebhookSendCommand(app *AppContext) *cobra.Command {
 	cmd.Flags().StringVar(&dataFile, "data-file", "", "Path to file containing raw JSON body")
 	cmd.Flags().StringVar(&timestampText, "timestamp", "", "Unix timestamp seconds (optional; defaults to now)")
 	cmd.Flags().StringVar(&targetURL, "url", "", "Target webhook URL")
+	cmd.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Idempotency key for public POST (optional; auto-generated when empty)")
 	cmd.Flags().DurationVar(&timeout, "timeout", defaultWebhookSendTimeout, "HTTP request timeout, e.g. 10s")
 	return cmd
 }
@@ -1047,6 +1060,7 @@ func newWebhookServeConfig() *webhookServeConfig {
 		DispatchQueuePath:        defaultWebhookDispatchQueuePath(),
 		DispatchHistoryPath:      defaultWebhookDispatchHistoryPath(),
 		DeadLetterPath:           defaultWebhookDeadLetterPath(),
+		IdempotencyPath:          defaultWebhookIdempotencyStatePath(defaultWebhookRuntimeStatePath()),
 		TimeSkew:                 defaultWebhookTimestampSkew,
 		MaxBodyBytes:             defaultWebhookMaxBodyBytes,
 		AllowSysDownstream:       false,
@@ -1084,7 +1098,11 @@ func (c *webhookServeConfig) validate() error {
 	c.DispatchQueuePath = strings.TrimSpace(c.DispatchQueuePath)
 	c.DispatchHistoryPath = strings.TrimSpace(c.DispatchHistoryPath)
 	c.DeadLetterPath = strings.TrimSpace(c.DeadLetterPath)
+	c.IdempotencyPath = strings.TrimSpace(c.IdempotencyPath)
 	c.TokenStore = strings.TrimSpace(c.TokenStore)
+	if c.IdempotencyPath == "" {
+		c.IdempotencyPath = defaultWebhookIdempotencyStatePath(c.RuntimePath)
+	}
 	if c.PublicAddr == "" {
 		return fmt.Errorf("public-addr is required")
 	}
@@ -1117,6 +1135,9 @@ func (c *webhookServeConfig) validate() error {
 	}
 	if c.DeadLetterPath == "" {
 		return fmt.Errorf("dead-letter is required")
+	}
+	if c.IdempotencyPath == "" {
+		return fmt.Errorf("idempotency-store is required")
 	}
 	if c.DispatchWorkers <= 0 {
 		return fmt.Errorf("dispatch-workers must be > 0")
@@ -1855,15 +1876,16 @@ func buildWebhookSignResult(thirdPartyID string, rawToken string, timestampText 
 }
 
 func executeWebhookSendRequest(signResult webhookSignResult, timeout time.Duration) (webhookSendResult, error) {
+	requestHeaders := map[string]string{
+		"Content-Type": "application/json",
+	}
+	for key, value := range signResult.Headers {
+		requestHeaders[key] = value
+	}
 	result := webhookSendResult{
-		TargetURL: signResult.URL,
-		RoutePath: ensureWebhookPath(signResult.Path),
-		RequestHeaders: map[string]string{
-			webhookHeaderThirdPartyID: signResult.Headers[webhookHeaderThirdPartyID],
-			webhookHeaderTimestamp:    signResult.Headers[webhookHeaderTimestamp],
-			webhookHeaderSignature:    signResult.Headers[webhookHeaderSignature],
-			"Content-Type":            "application/json",
-		},
+		TargetURL:      signResult.URL,
+		RoutePath:      ensureWebhookPath(signResult.Path),
+		RequestHeaders: requestHeaders,
 	}
 	if timeout <= 0 {
 		return result, fmt.Errorf("timeout must be > 0")
@@ -2006,8 +2028,43 @@ func parseWebhookResponseInsights(raw string) webhookResponseInsights {
 	if !ok {
 		return insights
 	}
-	meta, ok := root["meta"].(map[string]any)
-	if !ok {
+	if data, ok := root["data"].(map[string]any); ok {
+		if _, exists := data["meta"]; exists {
+			insights.ResponseJSON = data
+		}
+	}
+	if details, ok := root["details"].(map[string]any); ok {
+		if eventAny, ok := details["event"].(map[string]any); ok {
+			if _, exists := eventAny["meta"]; exists {
+				insights.ResponseJSON = eventAny
+			}
+		}
+	}
+
+	resolveMeta := func(container map[string]any) map[string]any {
+		if container == nil {
+			return nil
+		}
+		if meta, ok := container["meta"].(map[string]any); ok {
+			return meta
+		}
+		if data, ok := container["data"].(map[string]any); ok {
+			if meta, ok := data["meta"].(map[string]any); ok {
+				return meta
+			}
+		}
+		if details, ok := container["details"].(map[string]any); ok {
+			if eventAny, ok := details["event"].(map[string]any); ok {
+				if meta, ok := eventAny["meta"].(map[string]any); ok {
+					return meta
+				}
+			}
+		}
+		return nil
+	}
+
+	meta := resolveMeta(root)
+	if meta == nil {
 		return insights
 	}
 
@@ -2145,7 +2202,20 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAt := nowFn()
+		requestID := ""
+		if r != nil {
+			requestID = strings.TrimSpace(r.Header.Get(publicAPIHeaderRequestID))
+		}
+		if requestID == "" {
+			requestID = nextPublicRequestID(receivedAt)
+		}
 		writer := &webhookResponseCapture{ResponseWriter: w}
+		var (
+			idempotencyShouldSave bool
+			idempotencyKey        string
+			idempotencyThirdParty string
+			idempotencyBody       []byte
+		)
 		audit := webhookAuditLogEntry{
 			Timestamp:      receivedAt.Format(time.RFC3339Nano),
 			RouteID:        route.Record.ID,
@@ -2155,10 +2225,25 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			RequestHeaders: copyWebhookHeadersForAudit(r.Header),
 			RequestBody:    "",
 			ReceivedAt:     receivedAt.Format(time.RFC3339Nano),
+			RequestID:      requestID,
 		}
 		defer func() {
 			if writer.status == 0 {
 				writer.status = http.StatusOK
+			}
+			if idempotencyShouldSave && opts.IdempotencyStore != nil && strings.TrimSpace(idempotencyKey) != "" {
+				storeHeaders := map[string]string{
+					"Content-Type":           strings.TrimSpace(writer.Header().Get("Content-Type")),
+					publicAPIHeaderRequestID: strings.TrimSpace(writer.Header().Get(publicAPIHeaderRequestID)),
+				}
+				if saveErr := opts.IdempotencyStore.Save(path, idempotencyThirdParty, idempotencyKey, idempotencyBody, writer.status, storeHeaders, writer.body.Bytes()); saveErr != nil {
+					dispatch := audit.Dispatch
+					if dispatch == nil {
+						dispatch = &webhookDispatchAuditInfo{}
+						audit.Dispatch = dispatch
+					}
+					dispatch.Message = strings.TrimSpace(dispatch.Message + "; idempotency save failed: " + saveErr.Error())
+				}
 			}
 			audit.ResponseStatus = writer.status
 			audit.ResponseBody = writer.body.String()
@@ -2175,6 +2260,13 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			}
 			_ = auditLogAppender(audit)
 		}()
+		respondSuccess := func(status int, event webhookEventEnvelope) {
+			_ = writePublicAPISuccess(writer, status, requestID, "", event)
+		}
+		respondError := func(status int, code string, message string, details any) {
+			apiErr := newPublicAPIError(status, code, message, details)
+			_ = writePublicAPIError(writer, requestID, apiErr)
+		}
 
 		event := webhookEventEnvelope{
 			Meta: webhookEventMeta{
@@ -2191,7 +2283,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			event.Meta.Error = "method not allowed"
 			dispatch.Status = "method_not_allowed"
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusMethodNotAllowed, event)
+			respondError(http.StatusMethodNotAllowed, publicAPIErrorCodeMethodNotAllowed, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 		if routeParseErr != nil {
@@ -2199,7 +2291,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			dispatch.Status = "route_error"
 			dispatch.Message = routeParseErr.Error()
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusInternalServerError, event)
+			respondError(http.StatusInternalServerError, publicAPIErrorCodeInternalError, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 
@@ -2213,7 +2305,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			dispatch.Status = "read_body_failed"
 			dispatch.Message = err.Error()
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, status, event)
+			respondError(status, publicAPIErrorCodeInvalidJSONBody, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 		audit.RequestBody = string(body)
@@ -2228,7 +2320,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			event.Meta.Error = "missing required headers"
 			dispatch.Status = "header_validation_failed"
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusUnauthorized, event)
+			respondError(http.StatusUnauthorized, publicAPIErrorCodeMissingRequiredHeaders, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 
@@ -2238,7 +2330,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			dispatch.Status = "timestamp_parse_failed"
 			dispatch.Message = err.Error()
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusUnauthorized, event)
+			respondError(http.StatusUnauthorized, publicAPIErrorCodeInvalidTimestampHeader, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 		event.Meta.Validation.TimestampValid = webhookTimestampWithinWindow(receivedAt, timestamp, timestampSkew)
@@ -2246,7 +2338,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			event.Meta.Error = "timestamp is outside allowed window"
 			dispatch.Status = "timestamp_outside_window"
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusUnauthorized, event)
+			respondError(http.StatusUnauthorized, publicAPIErrorCodeTimestampOutsideWindow, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 
@@ -2256,21 +2348,21 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			dispatch.Status = "token_lookup_failed"
 			dispatch.Message = err.Error()
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusInternalServerError, event)
+			respondError(http.StatusInternalServerError, publicAPIErrorCodeInternalError, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 		if !found {
 			event.Meta.Error = "token not found for third-party-id"
 			dispatch.Status = "token_not_found"
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusUnauthorized, event)
+			respondError(http.StatusUnauthorized, publicAPIErrorCodeTokenNotFound, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 		if !securityRecordHasScope(record, securityScopeWebhook) {
-			event.Meta.Error = "token is not allowed for webhook scope"
+			event.Meta.Error = "token scope not allowed for webhook"
 			dispatch.Status = "token_scope_not_allowed"
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusUnauthorized, event)
+			respondError(http.StatusUnauthorized, publicAPIErrorCodeTokenScopeNotAllowed, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 
@@ -2280,7 +2372,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			event.Meta.Error = "signature verification failed"
 			dispatch.Status = "signature_failed"
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusUnauthorized, event)
+			respondError(http.StatusUnauthorized, publicAPIErrorCodeSignatureVerification, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 
@@ -2291,26 +2383,78 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			dispatch.Status = "json_invalid"
 			dispatch.Message = err.Error()
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusBadRequest, event)
+			respondError(http.StatusBadRequest, publicAPIErrorCodeInvalidJSONBody, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 		event.Meta.Validation.JSONValid = true
 		event.Data = data
 		event.RawBody = append([]byte(nil), body...)
+		if opts.IdempotencyStore != nil {
+			idempotencyKey = strings.TrimSpace(r.Header.Get(publicAPIHeaderIdempotencyKey))
+			if idempotencyKey == "" {
+				event.Meta.Error = "idempotency key is required for POST requests"
+				dispatch.Status = "idempotency_key_required"
+				audit.Dispatch = dispatch
+				respondError(http.StatusBadRequest, publicAPIErrorCodeIdempotencyKeyRequired, event.Meta.Error, map[string]any{
+					"header": publicAPIHeaderIdempotencyKey,
+					"event":  event,
+				})
+				return
+			}
+			replay, replayFound, replayConflict, replayErr := opts.IdempotencyStore.Lookup(path, thirdPartyID, idempotencyKey, body)
+			if replayErr != nil {
+				event.Meta.Error = fmt.Sprintf("idempotency lookup failed: %v", replayErr)
+				dispatch.Status = "idempotency_lookup_failed"
+				dispatch.Message = replayErr.Error()
+				audit.Dispatch = dispatch
+				respondError(http.StatusInternalServerError, publicAPIErrorCodeIdempotencyStoreInternal, event.Meta.Error, map[string]any{"event": event})
+				return
+			}
+			if replayConflict {
+				event.Meta.Error = "idempotency key was already used with a different payload"
+				dispatch.Status = "idempotency_key_conflict"
+				audit.Dispatch = dispatch
+				respondError(http.StatusConflict, publicAPIErrorCodeIdempotencyKeyConflict, event.Meta.Error, map[string]any{"event": event})
+				return
+			}
+			if replayFound {
+				dispatch.Status = "idempotency_replayed"
+				audit.Dispatch = dispatch
+				for headerKey, headerValue := range replay.Headers {
+					if strings.TrimSpace(headerKey) == "" {
+						continue
+					}
+					writer.Header().Set(headerKey, headerValue)
+				}
+				if strings.TrimSpace(writer.Header().Get(publicAPIHeaderRequestID)) == "" {
+					writer.Header().Set(publicAPIHeaderRequestID, requestID)
+				}
+				statusCode := replay.StatusCode
+				if statusCode <= 0 {
+					statusCode = http.StatusOK
+				}
+				writer.WriteHeader(statusCode)
+				_, _ = writer.Write(replay.ResponseBody)
+				return
+			}
+			idempotencyShouldSave = true
+			idempotencyThirdParty = thirdPartyID
+			idempotencyBody = append([]byte(nil), body...)
+		}
 
 		if err := eventLogAppender(event); err != nil {
 			event.Meta.Error = fmt.Sprintf("append event log failed: %v", err)
 			dispatch.Status = "event_log_failed"
 			dispatch.Message = err.Error()
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusInternalServerError, event)
+			respondError(http.StatusInternalServerError, publicAPIErrorCodeInternalError, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 
 		if len(route.Commands) == 0 {
 			dispatch.Status = "success"
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusOK, event)
+			respondSuccess(http.StatusOK, event)
 			return
 		}
 
@@ -2320,7 +2464,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 				dispatch.Status = "enqueue_failed"
 				dispatch.Message = event.Meta.Error
 				audit.Dispatch = dispatch
-				writeWebhookResponse(writer, http.StatusInternalServerError, event)
+				respondError(http.StatusInternalServerError, publicAPIErrorCodeInternalError, event.Meta.Error, map[string]any{"event": event})
 				return
 			}
 			job, enqueueErr := opts.Dispatcher.Enqueue(route, event)
@@ -2329,14 +2473,14 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 				dispatch.Status = "enqueue_failed"
 				dispatch.Message = enqueueErr.Error()
 				audit.Dispatch = dispatch
-				writeWebhookResponse(writer, http.StatusInternalServerError, event)
+				respondError(http.StatusInternalServerError, publicAPIErrorCodeInternalError, event.Meta.Error, map[string]any{"event": event})
 				return
 			}
 			dispatch.Status = "enqueued"
 			dispatch.JobID = job.JobID
 			dispatch.Attempt = job.Attempt
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusAccepted, event)
+			respondSuccess(http.StatusAccepted, event)
 			return
 		}
 
@@ -2354,7 +2498,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 			dispatch.Status = "downstream_failed"
 			dispatch.Message = runErr.Error()
 			audit.Dispatch = dispatch
-			writeWebhookResponse(writer, http.StatusInternalServerError, event)
+			respondError(http.StatusInternalServerError, publicAPIErrorCodeInternalError, event.Meta.Error, map[string]any{"event": event})
 			return
 		}
 		if downstreamResult != nil {
@@ -2363,7 +2507,7 @@ func newWebhookEventHandler(opts webhookServeOptions) http.Handler {
 
 		dispatch.Status = "success"
 		audit.Dispatch = dispatch
-		writeWebhookResponse(writer, http.StatusOK, event)
+		respondSuccess(http.StatusOK, event)
 	})
 }
 

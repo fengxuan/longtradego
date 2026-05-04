@@ -212,6 +212,15 @@ func TestBookingPublicAuthFailureReasons(t *testing.T) {
 		parseBody := readAllAndClose(t, parseResp)
 		return parseResp.StatusCode, parseBody
 	}
+	parseCode := func(raw string) string {
+		t.Helper()
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatalf("decode public error payload failed: %v body=%s", err, raw)
+		}
+		code, _ := payload["code"].(string)
+		return code
+	}
 
 	outOfWindowStatus, outOfWindowBody := signedParse(map[string]string{
 		webhookHeaderThirdPartyID: thirdPartyID,
@@ -224,6 +233,9 @@ func TestBookingPublicAuthFailureReasons(t *testing.T) {
 	if !strings.Contains(strings.ToLower(outOfWindowBody), "timestamp outside allowed window") {
 		t.Fatalf("expected timestamp reason, got %s", outOfWindowBody)
 	}
+	if got := parseCode(outOfWindowBody); got != publicAPIErrorCodeTimestampOutsideWindow {
+		t.Fatalf("expected code %q, got %q body=%s", publicAPIErrorCodeTimestampOutsideWindow, got, outOfWindowBody)
+	}
 
 	missingHeadersStatus, missingHeadersBody := signedParse(map[string]string{
 		webhookHeaderThirdPartyID: thirdPartyID,
@@ -233,6 +245,9 @@ func TestBookingPublicAuthFailureReasons(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(missingHeadersBody), "missing required headers") {
 		t.Fatalf("expected missing headers reason, got %s", missingHeadersBody)
+	}
+	if got := parseCode(missingHeadersBody); got != publicAPIErrorCodeMissingRequiredHeaders {
+		t.Fatalf("expected code %q, got %q body=%s", publicAPIErrorCodeMissingRequiredHeaders, got, missingHeadersBody)
 	}
 
 	invalidTimestampStatus, invalidTimestampBody := signedParse(map[string]string{
@@ -281,6 +296,9 @@ func TestBookingPublicAuthFailureReasons(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(signatureFailureBody), "signature verification failed") {
 		t.Fatalf("expected signature mismatch reason, got %s", signatureFailureBody)
+	}
+	if got := parseCode(signatureFailureBody); got != publicAPIErrorCodeSignatureVerification {
+		t.Fatalf("expected code %q, got %q body=%s", publicAPIErrorCodeSignatureVerification, got, signatureFailureBody)
 	}
 }
 
@@ -364,6 +382,7 @@ func TestBookingSignedAuthTokenHotReloadWithoutRestart(t *testing.T) {
 		req.Header.Set(webhookHeaderThirdPartyID, thirdPartyID)
 		req.Header.Set(webhookHeaderTimestamp, timestampText)
 		req.Header.Set(webhookHeaderSignature, signature)
+		req.Header.Set(publicAPIHeaderIdempotencyKey, "idem-hot-reload-"+token+"-"+strconv.FormatInt(time.Now().UnixNano(), 10))
 		resp, reqErr := http.DefaultClient.Do(req)
 		if reqErr != nil {
 			t.Fatalf("signed parse request failed: %v", reqErr)
@@ -409,6 +428,128 @@ func TestBookingSignedAuthTokenHotReloadWithoutRestart(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(oldBody), "signature verification failed") {
 		t.Fatalf("expected signature failure for old token, got %s", oldBody)
+	}
+}
+
+func TestBookingPublicIdempotencyEnvelopeAndReplay(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "booking_runtime.json")
+	catalogPath := filepath.Join(dir, "booking_catalog.json")
+	reservationsPath := filepath.Join(dir, "booking_reservations.json")
+	draftsPath := filepath.Join(dir, "booking_intake_drafts.json")
+	securityKeysPath := filepath.Join(dir, "security_keys.json")
+	llmConfigPath := filepath.Join(dir, "booking_llm.json")
+	adminAuthPath := filepath.Join(dir, "admin_auth.json")
+
+	if err := writeSecurityTokenRecords(securityKeysPath, map[string]webhookTokenRecord{
+		"partner-a": {
+			ThirdPartyID: "partner-a",
+			Token:        "booking-shared-token",
+			Scopes:       []string{securityScopeBooking},
+			CreatedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+			UpdatedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+		},
+	}); err != nil {
+		t.Fatalf("write security keys failed: %v", err)
+	}
+	if err := os.WriteFile(llmConfigPath, []byte(`{"api_key":"sk-test","base_url":"https://api.openai.com"}`), 0o644); err != nil {
+		t.Fatalf("write booking llm config failed: %v", err)
+	}
+	if err := os.WriteFile(adminAuthPath, []byte(testAdminAuthConfigJSON(t, "admin", "secret")), 0o644); err != nil {
+		t.Fatalf("write admin auth failed: %v", err)
+	}
+
+	oldParser := bookingParseIntentWithLLM
+	bookingParseIntentWithLLM = func(ctx context.Context, req bookingIntentParseRequest, parseCtx bookingIntentParseContext) (bookingIntentParseExtracted, error) {
+		return bookingIntentParseExtracted{
+			ProductID:  "p-1",
+			PartySize:  2,
+			Personnel:  bookingReservationPersonnel{ContactName: "Alice", ContactPhone: "13800138000"},
+			Confidence: 0.9,
+		}, nil
+	}
+	defer func() {
+		bookingParseIntentWithLLM = oldParser
+	}()
+
+	handle, err := startBookingHTTPService(context.Background(), &bookingServiceServeConfig{
+		Addr:             "127.0.0.1:0",
+		AdminAddr:        "127.0.0.1:0",
+		RuntimePath:      runtimePath,
+		CatalogPath:      catalogPath,
+		ReservationsPath: reservationsPath,
+		DraftsPath:       draftsPath,
+		APIKeysPath:      securityKeysPath,
+		LLMConfigPath:    llmConfigPath,
+		AdminAuthPath:    adminAuthPath,
+		MaxPortFallback:  0,
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("startBookingHTTPService failed: %v", err)
+	}
+	defer func() {
+		_ = handle.Close()
+	}()
+
+	runtime, exists, err := readBookingRuntimeState(runtimePath)
+	if err != nil || !exists || runtime == nil {
+		t.Fatalf("read runtime failed: %v runtime=%+v", err, runtime)
+	}
+	publicBaseURL := "http://" + bookingRuntimePublicAddress(runtime)
+
+	postParse := func(body string, idempotencyKey string) (*http.Response, string, map[string]any) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, publicBaseURL+bookingPublicIntentParsePath, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		setBookingSignedHeaders(req, "partner-a", "booking-shared-token", []byte(body), time.Now().UTC())
+		if strings.TrimSpace(idempotencyKey) != "" {
+			req.Header.Set(publicAPIHeaderIdempotencyKey, idempotencyKey)
+		}
+		resp, reqErr := http.DefaultClient.Do(req)
+		if reqErr != nil {
+			t.Fatalf("post parse failed: %v", reqErr)
+		}
+		rawBody := readAllAndClose(t, resp)
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(rawBody), &payload); err != nil {
+			t.Fatalf("decode envelope failed: %v body=%s", err, rawBody)
+		}
+		return resp, rawBody, payload
+	}
+
+	firstResp, firstBody, firstPayload := postParse(`{"user_id":"u-1","channel":"chat","content":"first"}`, "idem-booking-1")
+	if firstResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected first parse 200, got %d body=%s", firstResp.StatusCode, firstBody)
+	}
+	if firstPayload["status"] != publicAPIStatusOK || firstPayload["code"] != publicAPIErrorCodeOK {
+		t.Fatalf("expected success envelope, got %+v", firstPayload)
+	}
+	if strings.TrimSpace(fmt.Sprintf("%v", firstPayload["request_id"])) == "" {
+		t.Fatalf("expected request_id present, got %+v", firstPayload)
+	}
+
+	secondResp, secondBody, _ := postParse(`{"user_id":"u-1","channel":"chat","content":"first"}`, "idem-booking-1")
+	if secondResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected replay parse 200, got %d body=%s", secondResp.StatusCode, secondBody)
+	}
+	if firstBody != secondBody {
+		t.Fatalf("expected idempotent replay to return identical body\nfirst=%s\nsecond=%s", firstBody, secondBody)
+	}
+
+	conflictResp, conflictBody, conflictPayload := postParse(`{"user_id":"u-1","channel":"chat","content":"second"}`, "idem-booking-1")
+	if conflictResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected idempotency conflict 409, got %d body=%s", conflictResp.StatusCode, conflictBody)
+	}
+	if conflictPayload["code"] != publicAPIErrorCodeIdempotencyKeyConflict {
+		t.Fatalf("expected idempotency conflict code, got %+v", conflictPayload)
+	}
+
+	missingResp, missingBody, missingPayload := postParse(`{"user_id":"u-1","channel":"chat","content":"third"}`, "")
+	if missingResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected missing idempotency key 400, got %d body=%s", missingResp.StatusCode, missingBody)
+	}
+	if missingPayload["code"] != publicAPIErrorCodeIdempotencyKeyRequired {
+		t.Fatalf("expected idempotency required code, got %+v", missingPayload)
 	}
 }
 
@@ -889,6 +1030,7 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	parseReq, _ := http.NewRequest(http.MethodPost, publicBaseURL+bookingPublicIntentParsePath, strings.NewReader(parseBody))
 	parseReq.Header.Set("Content-Type", "application/json")
 	setBookingSignedHeaders(parseReq, "partner-a", "booking-key", []byte(parseBody), time.Now().UTC())
+	parseReq.Header.Set(publicAPIHeaderIdempotencyKey, "idem-intent-parse-flow")
 	parseResp, err := http.DefaultClient.Do(parseReq)
 	if err != nil {
 		t.Fatalf("POST intents/parse failed: %v", err)
@@ -901,7 +1043,11 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	if err := json.Unmarshal([]byte(parseRespBody), &parsePayload); err != nil {
 		t.Fatalf("decode parse payload failed: %v body=%s", err, parseRespBody)
 	}
-	draftObj, ok := parsePayload["draft"].(map[string]any)
+	parseData, ok := parsePayload["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected data payload in parse response: %s", parseRespBody)
+	}
+	draftObj, ok := parseData["draft"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected draft payload in parse response: %s", parseRespBody)
 	}
@@ -914,6 +1060,7 @@ func TestStartBookingHTTPServiceAuthAndIntentFlow(t *testing.T) {
 	confirmReq, _ := http.NewRequest(http.MethodPost, publicBaseURL+bookingPublicIntentConfirmPath, strings.NewReader(confirmBody))
 	confirmReq.Header.Set("Content-Type", "application/json")
 	setBookingSignedHeaders(confirmReq, "partner-a", "booking-key", []byte(confirmBody), time.Now().UTC())
+	confirmReq.Header.Set(publicAPIHeaderIdempotencyKey, "idem-intent-confirm-flow")
 	confirmResp, err := http.DefaultClient.Do(confirmReq)
 	if err != nil {
 		t.Fatalf("POST intents/confirm failed: %v", err)
@@ -1402,6 +1549,7 @@ func TestBookingIntentParseLLMUnavailable(t *testing.T) {
 	parseReq, _ := http.NewRequest(http.MethodPost, publicBaseURL+bookingPublicIntentParsePath, strings.NewReader(parseBodyJSON))
 	parseReq.Header.Set("Content-Type", "application/json")
 	setBookingSignedHeaders(parseReq, "partner-a", "booking-key", []byte(parseBodyJSON), time.Now().UTC())
+	parseReq.Header.Set(publicAPIHeaderIdempotencyKey, "idem-llm-missing-parse")
 	parseResp, err := http.DefaultClient.Do(parseReq)
 	if err != nil {
 		t.Fatalf("POST intents/parse failed: %v", err)
@@ -1538,6 +1686,7 @@ func TestBookingIntentParseAutoContinueDraft(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodPost, baseURL+bookingPublicIntentParsePath, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		setBookingSignedHeaders(req, "partner-a", "booking-key", []byte(body), time.Now().UTC())
+		req.Header.Set(publicAPIHeaderIdempotencyKey, "idem-draft-"+strconv.FormatInt(time.Now().UnixNano(), 10))
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatalf("POST intents/parse failed: %v", err)
@@ -1550,7 +1699,11 @@ func TestBookingIntentParseAutoContinueDraft(t *testing.T) {
 		if err := json.Unmarshal([]byte(respBody), &payload); err != nil {
 			t.Fatalf("decode parse payload failed: %v body=%s", err, respBody)
 		}
-		return payload
+		data, ok := payload["data"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected data payload wrapper, got: %s", respBody)
+		}
+		return data
 	}
 
 	first := parseOnce(`{"user_id":"u-1","channel":"chat","content":"first request"}`)

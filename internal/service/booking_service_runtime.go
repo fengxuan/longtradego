@@ -146,6 +146,7 @@ type bookingServiceServeConfig struct {
 	CatalogPath      string
 	ReservationsPath string
 	DraftsPath       string
+	IdempotencyPath  string
 	APIKeysPath      string
 	LLMConfigPath    string
 	AdminAuthPath    string
@@ -169,6 +170,7 @@ type bookingServiceController struct {
 	apiKeys         map[string]struct{}
 	tokenRecords    map[string]webhookTokenRecord
 	tokenCache      *webhookTokenCache
+	idempotency     *publicIdempotencyStore
 	authConfig      daemonAdminAuthConfig
 	authConfigPath  string
 	draftsPath      string
@@ -679,6 +681,10 @@ func defaultBookingIntakeDraftsPath() string {
 	return filepath.Join(daemonDataDir, bookingIntakeDraftsFile)
 }
 
+func defaultBookingIdempotencyPath(runtimePath string) string {
+	return defaultBookingIdempotencyStatePath(runtimePath)
+}
+
 func newBookingServiceServeConfig() *bookingServiceServeConfig {
 	return &bookingServiceServeConfig{
 		Addr:             defaultBookingServiceAddr,
@@ -688,6 +694,7 @@ func newBookingServiceServeConfig() *bookingServiceServeConfig {
 		CatalogPath:      defaultBookingCatalogStatePath(),
 		ReservationsPath: defaultBookingReservationsStatePath(),
 		DraftsPath:       defaultBookingIntakeDraftsPath(),
+		IdempotencyPath:  defaultBookingIdempotencyPath(defaultBookingRuntimeStatePath()),
 		APIKeysPath:      defaultBookingAPIKeysConfigPath(),
 		LLMConfigPath:    defaultBookingLLMConfigPath(),
 		AdminAuthPath:    defaultDaemonAdminAuthConfigPath(),
@@ -716,6 +723,7 @@ func (cfg *bookingServiceServeConfig) validate() error {
 	cfg.CatalogPath = strings.TrimSpace(cfg.CatalogPath)
 	cfg.ReservationsPath = strings.TrimSpace(cfg.ReservationsPath)
 	cfg.DraftsPath = strings.TrimSpace(cfg.DraftsPath)
+	cfg.IdempotencyPath = strings.TrimSpace(cfg.IdempotencyPath)
 	cfg.APIKeysPath = strings.TrimSpace(cfg.APIKeysPath)
 	cfg.LLMConfigPath = strings.TrimSpace(cfg.LLMConfigPath)
 	cfg.AdminAuthPath = strings.TrimSpace(cfg.AdminAuthPath)
@@ -736,6 +744,12 @@ func (cfg *bookingServiceServeConfig) validate() error {
 	}
 	if cfg.DraftsPath == "" {
 		return fmt.Errorf("drafts is required")
+	}
+	if cfg.IdempotencyPath == "" {
+		cfg.IdempotencyPath = defaultBookingIdempotencyPath(cfg.RuntimePath)
+	}
+	if cfg.IdempotencyPath == "" {
+		return fmt.Errorf("idempotency path is required")
 	}
 	if cfg.APIKeysPath == "" {
 		return fmt.Errorf("security-keys is required")
@@ -1387,6 +1401,10 @@ func startBookingHTTPService(ctx context.Context, cfg *bookingServiceServeConfig
 	if err != nil {
 		return nil, err
 	}
+	idempotencyStore, err := newPublicIdempotencyStore(cfg.IdempotencyPath, defaultPublicIdempotencyTTL)
+	if err != nil {
+		return nil, err
+	}
 	tokenCache.Start()
 	tokenCacheStarted := true
 	defer func() {
@@ -1425,6 +1443,7 @@ func startBookingHTTPService(ctx context.Context, cfg *bookingServiceServeConfig
 		service:         newBookingService(cfg.CatalogPath, cfg.ReservationsPath),
 		tokenRecords:    tokenRecords,
 		tokenCache:      tokenCache,
+		idempotency:     idempotencyStore,
 		authConfig:      authCfg,
 		authConfigPath:  strings.TrimSpace(cfg.AdminAuthPath),
 		draftsPath:      cfg.DraftsPath,
@@ -1586,15 +1605,41 @@ func (c *bookingServiceController) registerHandlers(publicMux *http.ServeMux, ad
 	}
 	var adminStopOnce sync.Once
 
+	newRequestID := func(r *http.Request) string {
+		headerRequestID := ""
+		if r != nil {
+			headerRequestID = strings.TrimSpace(r.Header.Get(publicAPIHeaderRequestID))
+		}
+		if headerRequestID != "" {
+			return headerRequestID
+		}
+		return nextPublicRequestID(c.now())
+	}
+	writePublicMethodNotAllowed := func(w http.ResponseWriter, requestID string) {
+		_ = writePublicAPIError(w, requestID, newPublicAPIError(
+			http.StatusMethodNotAllowed,
+			publicAPIErrorCodeMethodNotAllowed,
+			"method not allowed",
+			nil,
+		))
+	}
+	writePublicBusinessError := func(w http.ResponseWriter, requestID string, err error) {
+		if err == nil {
+			return
+		}
+		_ = writePublicAPIError(w, requestID, bookingBusinessErrorToPublic(err))
+	}
+	writePublicAuthError := func(w http.ResponseWriter, requestID string, err publicAPIError) {
+		_ = writePublicAPIError(w, requestID, err)
+	}
+
 	requireAPIKey := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			authorized, reason := c.isPublicAuthorized(r)
+			requestID := newRequestID(r)
+			authorized, authErr := c.isPublicAuthorized(r)
 			if !authorized {
-				c.logPublicAuthFailure(r, reason)
-				if strings.TrimSpace(reason) == "" {
-					reason = "unauthorized"
-				}
-				http.Error(w, reason, http.StatusUnauthorized)
+				c.logPublicAuthFailure(r, authErr.Code, authErr.Message, requestID)
+				writePublicAuthError(w, requestID, authErr)
 				return
 			}
 			next(w, r)
@@ -1611,11 +1656,16 @@ func (c *bookingServiceController) registerHandlers(publicMux *http.ServeMux, ad
 		}
 	}
 
-	registerPublic := func(path string, handler http.HandlerFunc) {
+	registerPublic := func(path string, handler http.HandlerFunc, idempotent bool) {
 		if publicMux == nil {
 			return
 		}
-		publicMux.HandleFunc(path, requireAPIKey(handler))
+		wrapped := handler
+		if idempotent {
+			wrapped = applyPublicIdempotencyMiddleware(wrapped, c.idempotency, path)
+		}
+		wrapped = requireAPIKey(wrapped)
+		publicMux.HandleFunc(path, wrapped)
 	}
 	registerAdminGet := func(path string, handler http.HandlerFunc) {
 		if adminMux == nil {
@@ -1728,24 +1778,26 @@ func (c *bookingServiceController) registerHandlers(publicMux *http.ServeMux, ad
 	}
 
 	registerPublic(bookingPublicCatalogPath, func(w http.ResponseWriter, r *http.Request) {
+		requestID := newRequestID(r)
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writePublicMethodNotAllowed(w, requestID)
 			return
 		}
 		query, err := parseDaemonBookingCatalogQuery(r)
 		if err != nil {
-			writeBookingJSON(w, bookingHTTPStatus(err), map[string]any{"status": "error", "message": err.Error()})
+			writePublicBusinessError(w, requestID, err)
 			return
 		}
 		result, err := c.service.QueryCatalog(query)
 		if err != nil {
-			writeBookingJSON(w, bookingHTTPStatus(err), map[string]any{"status": "error", "message": err.Error()})
+			writePublicBusinessError(w, requestID, err)
 			return
 		}
-		writeBookingJSON(w, http.StatusOK, result)
-	})
+		_ = writePublicAPISuccess(w, http.StatusOK, requestID, "", result)
+	}, false)
 
 	registerPublic(bookingPublicReservationsPath, func(w http.ResponseWriter, r *http.Request) {
+		requestID := newRequestID(r)
 		switch r.Method {
 		case http.MethodGet:
 			filter := bookingReservationListFilter{
@@ -1754,14 +1806,28 @@ func (c *bookingServiceController) registerHandlers(publicMux *http.ServeMux, ad
 			}
 			reservations, err := c.service.ListReservations(filter)
 			if err != nil {
-				writeBookingJSON(w, bookingHTTPStatus(err), map[string]any{"status": "error", "message": err.Error()})
+				writePublicBusinessError(w, requestID, err)
 				return
 			}
-			writeBookingJSON(w, http.StatusOK, map[string]any{"reservations": reservations})
+			_ = writePublicAPISuccess(w, http.StatusOK, requestID, "", map[string]any{"reservations": reservations})
 		case http.MethodPost:
+			rawBody, readErr := readPublicBody(r, defaultWebhookMaxBodyBytes)
+			if readErr != nil {
+				apiErr, ok := readErr.(publicAPIError)
+				if !ok {
+					apiErr = newPublicAPIError(http.StatusBadRequest, publicAPIErrorCodeInvalidJSONBody, readErr.Error(), nil)
+				}
+				_ = writePublicAPIError(w, requestID, apiErr)
+				return
+			}
+			r.Body = cloneReadCloserFromBytes(rawBody)
 			var payload daemonBookingCreateReservationRequest
-			if err := decodeDaemonAdminJSONBody(r, &payload); err != nil {
-				writeBookingJSON(w, bookingHTTPStatus(err), map[string]any{"status": "error", "message": err.Error()})
+			if err := decodePublicJSONBody(rawBody, &payload); err != nil {
+				apiErr, ok := err.(publicAPIError)
+				if !ok {
+					apiErr = newPublicAPIError(http.StatusBadRequest, publicAPIErrorCodeInvalidJSONBody, err.Error(), nil)
+				}
+				_ = writePublicAPIError(w, requestID, apiErr)
 				return
 			}
 			reservation, err := c.service.CreateReservation(bookingReservationCreateInput{
@@ -1777,72 +1843,110 @@ func (c *bookingServiceController) registerHandlers(publicMux *http.ServeMux, ad
 				SpecialRequirements: strings.TrimSpace(payload.SpecialRequirements),
 			})
 			if err != nil {
-				writeBookingJSON(w, bookingHTTPStatus(err), map[string]any{"status": "error", "message": err.Error()})
+				writePublicBusinessError(w, requestID, err)
 				return
 			}
-			writeBookingJSON(w, http.StatusCreated, map[string]any{
-				"status":         "created",
+			_ = writePublicAPISuccess(w, http.StatusCreated, requestID, "", map[string]any{
 				"reservation_id": reservation.ID,
 				"reservation":    reservation,
 			})
 		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writePublicMethodNotAllowed(w, requestID)
 		}
-	})
+	}, true)
 
 	registerPublic(bookingPublicIntentParsePath, func(w http.ResponseWriter, r *http.Request) {
+		requestID := newRequestID(r)
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writePublicMethodNotAllowed(w, requestID)
 			return
 		}
+		rawBody, readErr := readPublicBody(r, defaultWebhookMaxBodyBytes)
+		if readErr != nil {
+			apiErr, ok := readErr.(publicAPIError)
+			if !ok {
+				apiErr = newPublicAPIError(http.StatusBadRequest, publicAPIErrorCodeInvalidJSONBody, readErr.Error(), nil)
+			}
+			_ = writePublicAPIError(w, requestID, apiErr)
+			return
+		}
+		r.Body = cloneReadCloserFromBytes(rawBody)
 		var payload bookingIntentParseRequest
-		if err := decodeDaemonAdminJSONBody(r, &payload); err != nil {
-			writeBookingJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "message": err.Error()})
+		if err := decodePublicJSONBody(rawBody, &payload); err != nil {
+			apiErr, ok := err.(publicAPIError)
+			if !ok {
+				apiErr = newPublicAPIError(http.StatusBadRequest, publicAPIErrorCodeInvalidJSONBody, err.Error(), nil)
+			}
+			_ = writePublicAPIError(w, requestID, apiErr)
 			return
 		}
 		payload.UserID = strings.TrimSpace(payload.UserID)
 		payload.Content = strings.TrimSpace(payload.Content)
 		payload.Channel = strings.TrimSpace(payload.Channel)
 		if payload.UserID == "" || payload.Content == "" {
-			writeBookingJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "message": "user_id and content are required"})
+			_ = writePublicAPIError(w, requestID, newPublicAPIError(
+				http.StatusBadRequest,
+				publicAPIErrorCodeValidationError,
+				"user_id and content are required",
+				nil,
+			))
 			return
 		}
 		result, err := c.parseIntentDraft(r.Context(), payload)
 		if err != nil {
 			if errors.Is(err, errBookingLLMNotConfigured) {
-				writeBookingJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
+				_ = writePublicAPIError(w, requestID, newPublicAPIError(
+					http.StatusServiceUnavailable,
+					publicAPIErrorCodeInternalError,
+					err.Error(),
+					nil,
+				))
 				return
 			}
-			writeBookingJSON(w, bookingHTTPStatus(err), map[string]any{"status": "error", "message": err.Error()})
+			writePublicBusinessError(w, requestID, err)
 			return
 		}
-		writeBookingJSON(w, http.StatusOK, map[string]any{
-			"status":           "ok",
+		_ = writePublicAPISuccess(w, http.StatusOK, requestID, "", map[string]any{
 			"action":           result.Action,
 			"draft_id":         result.DraftID,
 			"updated_fields":   result.UpdatedFields,
 			"override_applied": result.OverrideApplied,
 			"draft":            result.Draft,
 		})
-	})
+	}, true)
 
 	registerPublic(bookingPublicIntentConfirmPath, func(w http.ResponseWriter, r *http.Request) {
+		requestID := newRequestID(r)
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writePublicMethodNotAllowed(w, requestID)
 			return
 		}
+		rawBody, readErr := readPublicBody(r, defaultWebhookMaxBodyBytes)
+		if readErr != nil {
+			apiErr, ok := readErr.(publicAPIError)
+			if !ok {
+				apiErr = newPublicAPIError(http.StatusBadRequest, publicAPIErrorCodeInvalidJSONBody, readErr.Error(), nil)
+			}
+			_ = writePublicAPIError(w, requestID, apiErr)
+			return
+		}
+		r.Body = cloneReadCloserFromBytes(rawBody)
 		var payload bookingIntentConfirmRequest
-		if err := decodeDaemonAdminJSONBody(r, &payload); err != nil {
-			writeBookingJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "message": err.Error()})
+		if err := decodePublicJSONBody(rawBody, &payload); err != nil {
+			apiErr, ok := err.(publicAPIError)
+			if !ok {
+				apiErr = newPublicAPIError(http.StatusBadRequest, publicAPIErrorCodeInvalidJSONBody, err.Error(), nil)
+			}
+			_ = writePublicAPIError(w, requestID, apiErr)
 			return
 		}
 		result, err := c.confirmIntentDraft(payload)
 		if err != nil {
-			writeBookingJSON(w, bookingHTTPStatus(err), map[string]any{"status": "error", "message": err.Error()})
+			writePublicBusinessError(w, requestID, err)
 			return
 		}
-		writeBookingJSON(w, http.StatusCreated, map[string]any{"status": "created", "result": result})
-	})
+		_ = writePublicAPISuccess(w, http.StatusCreated, requestID, "", result)
+	}, true)
 
 	registerAdminGet(bookingAdminStatusPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1992,9 +2096,9 @@ func (c *bookingServiceController) isAPIKeyAuthorized(r *http.Request) bool {
 	return authorized
 }
 
-func (c *bookingServiceController) isPublicAuthorized(r *http.Request) (bool, string) {
+func (c *bookingServiceController) isPublicAuthorized(r *http.Request) (bool, publicAPIError) {
 	if r == nil {
-		return false, "invalid request"
+		return false, newPublicAPIError(http.StatusBadRequest, publicAPIErrorCodeValidationError, "invalid request", nil)
 	}
 	thirdPartyID := normalizeThirdPartyID(r.Header.Get(webhookHeaderThirdPartyID))
 	timestampText := strings.TrimSpace(r.Header.Get(webhookHeaderTimestamp))
@@ -2007,40 +2111,40 @@ func (c *bookingServiceController) isBookingSignedAuthorized(
 	thirdPartyID string,
 	timestampText string,
 	signatureText string,
-) (bool, string) {
+) (bool, publicAPIError) {
 	if r == nil {
-		return false, "invalid request"
+		return false, newPublicAPIError(http.StatusBadRequest, publicAPIErrorCodeValidationError, "invalid request", nil)
 	}
 	if thirdPartyID == "" || timestampText == "" || signatureText == "" {
-		return false, "missing required headers"
+		return false, newPublicAPIError(http.StatusUnauthorized, publicAPIErrorCodeMissingRequiredHeaders, "missing required headers", nil)
 	}
 	timestamp, err := parseWebhookTimestamp(timestampText)
 	if err != nil {
-		return false, err.Error()
+		return false, newPublicAPIError(http.StatusUnauthorized, publicAPIErrorCodeInvalidTimestampHeader, err.Error(), nil)
 	}
 	if !webhookTimestampWithinWindow(c.now(), timestamp, defaultWebhookTimestampSkew) {
-		return false, "timestamp outside allowed window"
+		return false, newPublicAPIError(http.StatusUnauthorized, publicAPIErrorCodeTimestampOutsideWindow, "timestamp outside allowed window", nil)
 	}
 	record, found, err := c.findBookingTokenByThirdPartyID(thirdPartyID)
 	if err != nil {
-		return false, fmt.Sprintf("token lookup failed: %v", err)
+		return false, newPublicAPIError(http.StatusInternalServerError, publicAPIErrorCodeInternalError, fmt.Sprintf("token lookup failed: %v", err), nil)
 	}
 	if !found {
-		return false, "token not found for third-party-id"
+		return false, newPublicAPIError(http.StatusUnauthorized, publicAPIErrorCodeTokenNotFound, "token not found for third-party-id", nil)
 	}
 	if !securityRecordHasScope(record, securityScopeBooking) {
-		return false, "token scope not allowed for booking"
+		return false, newPublicAPIError(http.StatusUnauthorized, publicAPIErrorCodeTokenScopeNotAllowed, "token scope not allowed for booking", nil)
 	}
 	body, err := readWebhookBody(r.Body, defaultWebhookMaxBodyBytes)
 	if err != nil {
-		return false, err.Error()
+		return false, newPublicAPIError(http.StatusBadRequest, publicAPIErrorCodeInvalidJSONBody, err.Error(), nil)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	expected := computeWebhookSignature(thirdPartyID, timestampText, record.Token, body)
 	if !hmac.Equal([]byte(signatureText), []byte(expected)) {
-		return false, "signature verification failed"
+		return false, newPublicAPIError(http.StatusUnauthorized, publicAPIErrorCodeSignatureVerification, "signature verification failed", nil)
 	}
-	return true, ""
+	return true, publicAPIError{}
 }
 
 func (c *bookingServiceController) findBookingTokenByThirdPartyID(thirdPartyID string) (webhookTokenRecord, bool, error) {
@@ -2064,9 +2168,12 @@ func (c *bookingServiceController) findBookingTokenByThirdPartyID(thirdPartyID s
 	return record, found, nil
 }
 
-func (c *bookingServiceController) logPublicAuthFailure(r *http.Request, reason string) {
+func (c *bookingServiceController) logPublicAuthFailure(r *http.Request, code string, reason string, requestID string) {
 	if strings.TrimSpace(reason) == "" {
 		reason = "unauthorized"
+	}
+	if strings.TrimSpace(code) == "" {
+		code = publicAPIErrorCodeInternalError
 	}
 	path := ""
 	method := ""
@@ -2078,7 +2185,7 @@ func (c *bookingServiceController) logPublicAuthFailure(r *http.Request, reason 
 		remote = strings.TrimSpace(r.RemoteAddr)
 		thirdPartyID = normalizeThirdPartyID(r.Header.Get(webhookHeaderThirdPartyID))
 	}
-	log.Printf("booking public auth failed: method=%s path=%s remote=%s third_party_id=%s reason=%s", method, path, remote, thirdPartyID, reason)
+	log.Printf("booking public auth failed: request_id=%s method=%s path=%s remote=%s third_party_id=%s code=%s reason=%s", strings.TrimSpace(requestID), method, path, remote, thirdPartyID, code, reason)
 }
 
 func (c *bookingServiceController) isAdminAuthorized(r *http.Request) bool {
@@ -2140,6 +2247,21 @@ func bookingHTTPStatus(err error) int {
 		return http.StatusBadRequest
 	}
 	return http.StatusInternalServerError
+}
+
+func bookingBusinessErrorToPublic(err error) publicAPIError {
+	if err == nil {
+		return newPublicAPIError(http.StatusOK, publicAPIErrorCodeOK, "", nil)
+	}
+	status := bookingHTTPStatus(err)
+	switch status {
+	case http.StatusConflict:
+		return newPublicAPIError(status, publicAPIErrorCodeConflict, err.Error(), nil)
+	case http.StatusBadRequest:
+		return newPublicAPIError(status, publicAPIErrorCodeValidationError, err.Error(), nil)
+	default:
+		return newPublicAPIError(status, publicAPIErrorCodeInternalError, err.Error(), nil)
+	}
 }
 
 func readBookingDraftState(path string) (bookingIntakeDraftState, error) {

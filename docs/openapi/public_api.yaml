@@ -1,0 +1,291 @@
+openapi: 3.0.3
+info:
+  title: Longtradego Public API
+  version: "1.0.0"
+  description: |
+    Public signed endpoints for booking and webhook integrations.
+    Admin endpoints are intentionally excluded from this spec.
+servers:
+  - url: http://127.0.0.1:18081
+    description: Booking public listener (default local)
+  - url: http://127.0.0.1:8080
+    description: Webhook public listener (default local)
+tags:
+  - name: booking
+  - name: webhook
+security:
+  - ThirdPartyID: []
+    WebhookTimestamp: []
+    WebhookToken: []
+paths:
+  /booking/catalog:
+    get:
+      tags: [booking]
+      summary: Query booking catalog
+      parameters:
+        - in: query
+          name: product_id
+          schema:
+            type: string
+        - in: query
+          name: from
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: to
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: include_full
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicSuccessEnvelope"
+        "4XX":
+          $ref: "#/components/responses/PublicError"
+        "5XX":
+          $ref: "#/components/responses/PublicError"
+  /booking/reservations:
+    get:
+      tags: [booking]
+      summary: Query reservations
+      parameters:
+        - in: query
+          name: user_id
+          schema:
+            type: string
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, confirmed, rejected, cancelled]
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicSuccessEnvelope"
+        "4XX":
+          $ref: "#/components/responses/PublicError"
+        "5XX":
+          $ref: "#/components/responses/PublicError"
+    post:
+      tags: [booking]
+      summary: Create reservation
+      security:
+        - ThirdPartyID: []
+          WebhookTimestamp: []
+          WebhookToken: []
+          IdempotencyKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicSuccessEnvelope"
+        "4XX":
+          $ref: "#/components/responses/PublicError"
+        "409":
+          $ref: "#/components/responses/PublicError"
+        "5XX":
+          $ref: "#/components/responses/PublicError"
+  /booking/intents/parse:
+    post:
+      tags: [booking]
+      summary: Parse natural language booking intent into draft
+      security:
+        - ThirdPartyID: []
+          WebhookTimestamp: []
+          WebhookToken: []
+          IdempotencyKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, content]
+              properties:
+                user_id:
+                  type: string
+                channel:
+                  type: string
+                content:
+                  type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicSuccessEnvelope"
+        "4XX":
+          $ref: "#/components/responses/PublicError"
+        "5XX":
+          $ref: "#/components/responses/PublicError"
+  /booking/intents/confirm:
+    post:
+      tags: [booking]
+      summary: Confirm draft and create pending reservation
+      security:
+        - ThirdPartyID: []
+          WebhookTimestamp: []
+          WebhookToken: []
+          IdempotencyKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicSuccessEnvelope"
+        "4XX":
+          $ref: "#/components/responses/PublicError"
+        "409":
+          $ref: "#/components/responses/PublicError"
+        "5XX":
+          $ref: "#/components/responses/PublicError"
+  /webhook/{routePath}:
+    post:
+      tags: [webhook]
+      summary: Receive signed webhook event
+      security:
+        - ThirdPartyID: []
+          WebhookTimestamp: []
+          WebhookToken: []
+          IdempotencyKey: []
+      parameters:
+        - in: path
+          name: routePath
+          required: true
+          schema:
+            type: string
+          description: Route suffix under `/webhook/*`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Accepted and processed synchronously
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicSuccessEnvelope"
+        "202":
+          description: Accepted and queued asynchronously
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicSuccessEnvelope"
+        "4XX":
+          $ref: "#/components/responses/PublicError"
+        "5XX":
+          $ref: "#/components/responses/PublicError"
+components:
+  securitySchemes:
+    ThirdPartyID:
+      type: apiKey
+      in: header
+      name: X-Third-Party-ID
+    WebhookTimestamp:
+      type: apiKey
+      in: header
+      name: X-Webhook-Timestamp
+    WebhookToken:
+      type: apiKey
+      in: header
+      name: X-Webhook-Token
+    IdempotencyKey:
+      type: apiKey
+      in: header
+      name: Idempotency-Key
+  responses:
+    PublicError:
+      description: Public API error envelope
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PublicErrorEnvelope"
+  schemas:
+    PublicSuccessEnvelope:
+      type: object
+      required: [status, code, message, data, request_id, ts]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        code:
+          type: string
+          enum: [ok]
+        message:
+          type: string
+        data:
+          description: Endpoint-specific payload.
+          nullable: true
+        request_id:
+          type: string
+        ts:
+          type: string
+          format: date-time
+    PublicErrorEnvelope:
+      type: object
+      required: [status, code, message, request_id, ts]
+      properties:
+        status:
+          type: string
+          enum: [error]
+        code:
+          type: string
+          enum:
+            - missing_required_headers
+            - invalid_timestamp_header
+            - timestamp_outside_allowed_window
+            - token_not_found
+            - token_scope_not_allowed
+            - signature_verification_failed
+            - invalid_json_body
+            - method_not_allowed
+            - validation_error
+            - conflict
+            - internal_error
+            - idempotency_key_required
+            - idempotency_key_conflict
+            - idempotency_store_error
+        message:
+          type: string
+        details:
+          description: Optional machine-readable details.
+          nullable: true
+        request_id:
+          type: string
+        ts:
+          type: string
+          format: date-time
