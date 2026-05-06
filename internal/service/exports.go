@@ -14,6 +14,10 @@ func NewSystemCommand(app *AppContext) *cobra.Command {
 	return newSystemCommand(app)
 }
 
+func NewLongbridgeCommand(app *AppContext) *cobra.Command {
+	return newLongbridgeCommand(app)
+}
+
 func NewAdminCommand(app *AppContext) *cobra.Command {
 	return newAdminCommand(app)
 }

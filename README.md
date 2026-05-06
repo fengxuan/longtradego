@@ -6,6 +6,7 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 
 - `cobra`-based CLI command structure
 - `quote` command with multiple symbols
+- `longbridge` passthrough command for full Longbridge CLI access (`lb` alias)
 - `email` command for SMTP notifications
 - `email receive` command for IMAP inbox polling and action trigger
 - `email monitor` command for new-mail monitoring (polling)
@@ -15,7 +16,7 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 - `sys` command for Linux/system automation commands
 - `version` command for build metadata (`version/commit/build date/platform`)
 - `upgrade` command (`check` / install / dry-run) with GitHub Releases
-- Automatic update reminder cache (`data/update_state.json`, max once per 24h check)
+- Automatic update reminder cache (`data/update_state.json`, checked at daemon startup, max once per 24h)
 - `webhook` command for signature generation, test sending, managed lifecycle (`start/status/stop/kill-port`), and dual-surface endpoints (public `/webhook/*`; admin `/admin`, `/admin/healthz`, `/admin/readyz`, `/admin/webhook/status`, `/admin/metrics`, `/admin/webhook/stop`)
 - `booking` command for product/slot/reservation/query management and independent dual-surface service lifecycle (`booking service start/status/stop`)
 - Unified external security key config (`conf/security_keys.json`, scopes: `booking` / `webhook`)
@@ -100,6 +101,13 @@ Alias:
 go run ./cmd/longtradego q AAPL.US TSLA.US
 ```
 
+Run any Longbridge CLI command directly:
+
+```bash
+go run ./cmd/longtradego longbridge quote AAPL.US --format json
+go run ./cmd/longtradego lb portfolio --format json
+```
+
 Version and upgrade:
 
 ```bash
@@ -121,7 +129,7 @@ Upgrade notes:
 - `upgrade` downloads release assets from GitHub Releases and verifies `checksums.txt` before replacement.
 - `upgrade` refuses to run while daemon is running; stop daemon first.
 - `upgrade` refuses `go run .` execution mode; install and run released binary first.
-- Automatic update checks are cached in `data/update_state.json` and throttled to at most once per 24 hours.
+- Automatic update checks run at daemon startup, are cached in `data/update_state.json`, and are throttled to at most once per 24 hours.
 - Update reminder text is shown only in interactive terminals (non-interactive runs stay silent).
 
 Send email notification:

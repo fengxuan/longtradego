@@ -71,6 +71,7 @@ func newServiceRootCommand(app *AppContext, commandLogger *CommandFileLogger) *c
 		SilenceErrors: true,
 	}
 	rootCmd.AddCommand(newQuoteCommand(app))
+	rootCmd.AddCommand(newLongbridgeCommand(app))
 	rootCmd.AddCommand(newEmailCommand(app))
 	rootCmd.AddCommand(newSystemCommand(app))
 	rootCmd.AddCommand(newAdminCommand(app))

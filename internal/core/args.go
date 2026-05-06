@@ -37,6 +37,12 @@ func InferCommandMetadata(args []string) (command string, symbols []string) {
 			parsed = []string{"AAPL.US"}
 		}
 		return "quote", parsed
+	case "longbridge", "lb":
+		forwarded := append([]string(nil), args[1:]...)
+		if len(forwarded) == 0 {
+			forwarded = []string{"--help"}
+		}
+		return "longbridge", forwarded
 	case "sys", "shell":
 		return "sys", nil
 	default:
@@ -53,7 +59,7 @@ func InferCommandMetadata(args []string) (command string, symbols []string) {
 
 func isKnownCommandName(name string) bool {
 	switch name {
-	case "quote", "q", "email", "mail", "sys", "shell", "admin", "daemon", "d", "task", "webhook", "booking", "version", "upgrade", "help", "completion":
+	case "quote", "q", "longbridge", "lb", "email", "mail", "sys", "shell", "admin", "daemon", "d", "task", "webhook", "booking", "version", "upgrade", "help", "completion":
 		return true
 	default:
 		return false

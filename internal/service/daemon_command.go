@@ -1720,6 +1720,8 @@ var (
 	daemonRootCommandCandidates = []string{
 		"quote",
 		"q",
+		"longbridge",
+		"lb",
 		"email",
 		"mail",
 		"sys",
@@ -2075,6 +2077,8 @@ func daemonCompletionCandidates(segments [][]rune) [][]rune {
 	switch strings.ToLower(stageParts[0]) {
 	case "quote", "q":
 		return stringCandidatesToRunes(daemonQuoteSymbolCandidates)
+	case "longbridge", "lb":
+		return nil
 	case "email", "mail":
 		return emailCompletionCandidates(stageParts)
 	case "sys", "shell":

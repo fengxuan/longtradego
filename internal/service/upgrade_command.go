@@ -359,14 +359,14 @@ func MaybeNotifyUpgradeAvailable(ctx context.Context, rawArgs []string, out io.W
 
 func shouldSkipAutomaticUpgradeCheck(args []string) bool {
 	if len(args) == 0 {
-		return false
+		return true
 	}
 	first := strings.ToLower(strings.TrimSpace(args[0]))
 	switch first {
-	case "upgrade", "version", "help", "completion":
-		return true
-	default:
+	case "daemon", "d":
 		return false
+	default:
+		return true
 	}
 }
 

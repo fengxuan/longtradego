@@ -114,6 +114,9 @@ func TestDaemonCompletionPipelineRootAfterPipe(t *testing.T) {
 	if !slices.Contains(candidates, "booking") {
 		t.Fatalf("expected root command completion after pipe to include booking, got: %v", candidates)
 	}
+	if !slices.Contains(candidates, "longbridge") || !slices.Contains(candidates, "lb") {
+		t.Fatalf("expected root command completion after pipe to include longbridge/lb, got: %v", candidates)
+	}
 	if !slices.Contains(candidates, "version") || !slices.Contains(candidates, "upgrade") {
 		t.Fatalf("expected root command completion after pipe to include version/upgrade, got: %v", candidates)
 	}

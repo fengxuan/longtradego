@@ -328,10 +328,14 @@ func TestShouldSkipAutomaticUpgradeCheck(t *testing.T) {
 		args []string
 		want bool
 	}{
+		{args: nil, want: true},
 		{args: []string{"upgrade"}, want: true},
 		{args: []string{"version"}, want: true},
 		{args: []string{"help"}, want: true},
-		{args: []string{"quote", "AAPL.US"}, want: false},
+		{args: []string{"quote", "AAPL.US"}, want: true},
+		{args: []string{"longbridge", "quote", "AAPL.US"}, want: true},
+		{args: []string{"daemon"}, want: false},
+		{args: []string{"d"}, want: false},
 	}
 	for _, tc := range cases {
 		if got := shouldSkipAutomaticUpgradeCheck(tc.args); got != tc.want {
