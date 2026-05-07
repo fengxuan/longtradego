@@ -72,6 +72,7 @@ func newServiceRootCommand(app *AppContext, commandLogger *CommandFileLogger) *c
 	}
 	rootCmd.AddCommand(newQuoteCommand(app))
 	rootCmd.AddCommand(newLongbridgeCommand(app))
+	rootCmd.AddCommand(newSkillCommand(app))
 	rootCmd.AddCommand(newEmailCommand(app))
 	rootCmd.AddCommand(newSystemCommand(app))
 	rootCmd.AddCommand(newAdminCommand(app))

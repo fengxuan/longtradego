@@ -18,6 +18,10 @@ func NewLongbridgeCommand(app *AppContext) *cobra.Command {
 	return newLongbridgeCommand(app)
 }
 
+func NewSkillCommand(app *AppContext) *cobra.Command {
+	return newSkillCommand(app)
+}
+
 func NewAdminCommand(app *AppContext) *cobra.Command {
 	return newAdminCommand(app)
 }

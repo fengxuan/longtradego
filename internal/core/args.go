@@ -43,6 +43,11 @@ func InferCommandMetadata(args []string) (command string, symbols []string) {
 			forwarded = []string{"--help"}
 		}
 		return "longbridge", forwarded
+	case "skill":
+		if len(args) >= 2 && strings.EqualFold(strings.TrimSpace(args[1]), "run") {
+			return "skill", parseSkillSymbolsFromArgs(args[2:])
+		}
+		return "skill", nil
 	case "sys", "shell":
 		return "sys", nil
 	default:
@@ -59,11 +64,33 @@ func InferCommandMetadata(args []string) (command string, symbols []string) {
 
 func isKnownCommandName(name string) bool {
 	switch name {
-	case "quote", "q", "longbridge", "lb", "email", "mail", "sys", "shell", "admin", "daemon", "d", "task", "webhook", "booking", "version", "upgrade", "help", "completion":
+	case "quote", "q", "longbridge", "lb", "skill", "email", "mail", "sys", "shell", "admin", "daemon", "d", "task", "webhook", "booking", "version", "upgrade", "help", "completion":
 		return true
 	default:
 		return false
 	}
+}
+
+func parseSkillSymbolsFromArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	symbolTokens := make([]string, 0, 1)
+	for index := 0; index < len(args); index++ {
+		token := strings.TrimSpace(args[index])
+		if token == "" {
+			continue
+		}
+		if strings.HasPrefix(token, "--symbols=") {
+			symbolTokens = append(symbolTokens, strings.TrimSpace(strings.TrimPrefix(token, "--symbols=")))
+			continue
+		}
+		if token == "--symbols" && index+1 < len(args) {
+			index++
+			symbolTokens = append(symbolTokens, strings.TrimSpace(args[index]))
+		}
+	}
+	return ParseSymbols(symbolTokens)
 }
 
 func looksLikeSymbolArg(arg string) bool {

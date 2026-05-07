@@ -75,11 +75,18 @@ func TestDaemonCompletionEmailAnalyzeFlags(t *testing.T) {
 
 func TestDaemonCompletionMailAliasWithMultipleFlags(t *testing.T) {
 	candidates := completionCandidatesFromLine("mail send --to alice@example.com --subject Notice --")
-	if !slices.Contains(candidates, "--body") || !slices.Contains(candidates, "--body-file") {
+	if !slices.Contains(candidates, "--body") || !slices.Contains(candidates, "--body-file") || !slices.Contains(candidates, "--attach") {
 		t.Fatalf("expected email completion to include remaining body flags, got: %v", candidates)
 	}
 	if slices.Contains(candidates, "--to") || slices.Contains(candidates, "--subject") {
 		t.Fatalf("expected used flags to be skipped, got: %v", candidates)
+	}
+}
+
+func TestDaemonCompletionEmailAttachFlagRepeatable(t *testing.T) {
+	candidates := completionCandidatesFromLine("mail send --to alice@example.com --subject Notice --attach ./a.pdf --")
+	if !slices.Contains(candidates, "--attach") {
+		t.Fatalf("expected repeatable --attach flag to remain available, got: %v", candidates)
 	}
 }
 
@@ -111,6 +118,9 @@ func TestDaemonCompletionPipelineRootAfterPipe(t *testing.T) {
 	if !slices.Contains(candidates, "task") || !slices.Contains(candidates, "sys") || !slices.Contains(candidates, "admin") {
 		t.Fatalf("expected root command completion after pipe to include task/sys/admin, got: %v", candidates)
 	}
+	if !slices.Contains(candidates, "skill") {
+		t.Fatalf("expected root command completion after pipe to include skill, got: %v", candidates)
+	}
 	if !slices.Contains(candidates, "booking") {
 		t.Fatalf("expected root command completion after pipe to include booking, got: %v", candidates)
 	}
@@ -122,6 +132,23 @@ func TestDaemonCompletionPipelineRootAfterPipe(t *testing.T) {
 	}
 	if slices.Contains(candidates, "quit") {
 		t.Fatalf("expected quit removed from daemon completion, got: %v", candidates)
+	}
+}
+
+func TestDaemonCompletionSkillSubcommandsAndFlags(t *testing.T) {
+	subCandidates := completionCandidatesFromLine("skill ")
+	if !slices.Contains(subCandidates, "run") || !slices.Contains(subCandidates, "list") || !slices.Contains(subCandidates, "validate") {
+		t.Fatalf("expected skill completion subcommands, got: %v", subCandidates)
+	}
+
+	runFlagCandidates := completionCandidatesFromLine("skill run --")
+	if !slices.Contains(runFlagCandidates, "--text") || !slices.Contains(runFlagCandidates, "--symbols") || !slices.Contains(runFlagCandidates, "--dry-run") {
+		t.Fatalf("expected skill run completion flags, got: %v", runFlagCandidates)
+	}
+
+	formatCandidates := completionCandidatesFromLine("skill run --format ")
+	if !slices.Contains(formatCandidates, "json") || !slices.Contains(formatCandidates, "table") {
+		t.Fatalf("expected skill run --format values, got: %v", formatCandidates)
 	}
 }
 
@@ -826,6 +853,62 @@ func TestParsePipelineCommandLine(t *testing.T) {
 	}
 	if commands[1][0] != "email" || commands[1][1] != "send" {
 		t.Fatalf("expected second command to be email send, got %v", commands[1])
+	}
+}
+
+func TestExecuteDaemonPipelineSkillStageFeedsMailStage(t *testing.T) {
+	oldExecutor := cliExecutor
+	t.Cleanup(func() {
+		SetCLIExecutor(oldExecutor)
+	})
+
+	var captured [][]string
+	SetCLIExecutor(func(ctx context.Context, app *AppContext, commandLogger *CommandFileLogger, rawArgs []string) error {
+		cloned := append([]string(nil), rawArgs...)
+		captured = append(captured, cloned)
+		app.SetExecution(strings.ToLower(strings.TrimSpace(cloned[0])), cloned[1:])
+		if strings.EqualFold(strings.TrimSpace(cloned[0]), "skill") {
+			app.SetResult(map[string]any{
+				"skill_id": "longbridge",
+				"matched":  1,
+			})
+			return nil
+		}
+		app.SetResult(map[string]any{"sent": true})
+		return nil
+	})
+
+	app := NewAppContext()
+	defer app.Close()
+
+	err := executeDaemonPipeline(
+		context.Background(),
+		app,
+		nil,
+		nil,
+		[][]string{
+			{"skill", "run", "--text", "screen", "--symbols", "700.HK"},
+			{"mail", "send", "--to", "a@example.com", "--subject", "Report"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("execute daemon pipeline failed: %v", err)
+	}
+	if len(captured) != 2 {
+		t.Fatalf("expected two pipeline stages to execute, got %d", len(captured))
+	}
+
+	second := captured[1]
+	bodyIndex := slices.Index(second, "--body")
+	if bodyIndex < 0 || bodyIndex+1 >= len(second) {
+		t.Fatalf("expected email stage body injection, got %v", second)
+	}
+	body := second[bodyIndex+1]
+	if !strings.Contains(body, "source_command: skill run") {
+		t.Fatalf("expected injected body to include source command, got %q", body)
+	}
+	if !strings.Contains(body, `"skill_id": "longbridge"`) {
+		t.Fatalf("expected injected body to include skill result json, got %q", body)
 	}
 }
 

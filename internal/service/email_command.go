@@ -1,14 +1,19 @@
 package service
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -27,17 +32,25 @@ type smtpConfig struct {
 }
 
 type emailRequest struct {
-	To      []string
-	Subject string
-	Body    string
+	To          []string
+	Subject     string
+	Body        string
+	Attachments []emailAttachment
+}
+
+type emailAttachment struct {
+	FileName    string
+	ContentType string
+	Content     []byte
 }
 
 type emailCommandResult struct {
-	Provider string   `json:"provider"`
-	From     string   `json:"from"`
-	To       []string `json:"to"`
-	Subject  string   `json:"subject"`
-	SentAt   string   `json:"sent_at"`
+	Provider    string   `json:"provider"`
+	From        string   `json:"from"`
+	To          []string `json:"to"`
+	Subject     string   `json:"subject"`
+	Attachments []string `json:"attachments,omitempty"`
+	SentAt      string   `json:"sent_at"`
 }
 
 type emailAliasConfig struct {
@@ -52,14 +65,15 @@ func newEmailCommand(app *AppContext) *cobra.Command {
 	}
 
 	var (
-		to       string
-		subject  string
-		body     string
-		bodyFile string
+		to          string
+		subject     string
+		body        string
+		bodyFile    string
+		attachments []string
 	)
 
 	sendCmd := &cobra.Command{
-		Use:   "send --to <email[,email...]> --subject <text> [--body <text> | --body-file <path>]",
+		Use:   "send --to <email[,email...]> --subject <text> [--body <text> | --body-file <path>] [--attach <path>]...",
 		Short: "Send one email message",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			recipients, err := parseRecipients(to)
@@ -74,7 +88,23 @@ func newEmailCommand(app *AppContext) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if strings.TrimSpace(content) == "" {
+			attachmentItems, err := resolveEmailAttachments(attachments)
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(content) == "" && len(attachmentItems) == 0 {
+				pipedContent, pipeErr := readPipedText(os.Stdin)
+				if pipeErr != nil {
+					return pipeErr
+				}
+				if strings.TrimSpace(pipedContent) != "" {
+					content = pipedContent
+				}
+			}
+			if strings.TrimSpace(content) == "" && len(attachmentItems) > 0 {
+				content = "Please see attached file(s)."
+			}
+			if strings.TrimSpace(content) == "" && len(attachmentItems) == 0 {
 				return fmt.Errorf("email body is empty")
 			}
 
@@ -86,20 +116,26 @@ func newEmailCommand(app *AppContext) *cobra.Command {
 			}
 
 			req := emailRequest{
-				To:      recipients,
-				Subject: subject,
-				Body:    content,
+				To:          recipients,
+				Subject:     subject,
+				Body:        content,
+				Attachments: attachmentItems,
 			}
 			if err := sendSMTPMail(cfg, req); err != nil {
 				return err
 			}
 
+			attachmentNames := make([]string, 0, len(attachmentItems))
+			for _, item := range attachmentItems {
+				attachmentNames = append(attachmentNames, item.FileName)
+			}
 			result := emailCommandResult{
-				Provider: fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-				From:     cfg.From,
-				To:       append([]string(nil), recipients...),
-				Subject:  subject,
-				SentAt:   time.Now().Format(time.RFC3339),
+				Provider:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+				From:        cfg.From,
+				To:          append([]string(nil), recipients...),
+				Subject:     subject,
+				Attachments: attachmentNames,
+				SentAt:      time.Now().Format(time.RFC3339),
 			}
 			app.SetResult(result)
 
@@ -112,6 +148,7 @@ func newEmailCommand(app *AppContext) *cobra.Command {
 	sendCmd.Flags().StringVar(&subject, "subject", "", "Email subject")
 	sendCmd.Flags().StringVar(&body, "body", "", "Email body text")
 	sendCmd.Flags().StringVar(&bodyFile, "body-file", "", "Path to a file used as email body")
+	sendCmd.Flags().StringArrayVar(&attachments, "attach", nil, "Attachment file path (repeatable)")
 	_ = sendCmd.MarkFlagRequired("to")
 	_ = sendCmd.MarkFlagRequired("subject")
 
@@ -239,6 +276,58 @@ func resolveEmailBody(body string, bodyFile string) (string, error) {
 		return string(data), nil
 	}
 	return body + "\n" + string(data), nil
+}
+
+func readPipedText(stdin *os.File) (string, error) {
+	if stdin == nil {
+		return "", nil
+	}
+	info, err := stdin.Stat()
+	if err != nil {
+		return "", fmt.Errorf("inspect stdin failed: %w", err)
+	}
+	if info.Mode()&os.ModeCharDevice != 0 {
+		return "", nil
+	}
+	data, err := io.ReadAll(stdin)
+	if err != nil {
+		return "", fmt.Errorf("read stdin failed: %w", err)
+	}
+	return string(data), nil
+}
+
+func resolveEmailAttachments(paths []string) ([]emailAttachment, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+
+	items := make([]emailAttachment, 0, len(paths))
+	for _, raw := range paths {
+		path := strings.TrimSpace(raw)
+		if path == "" {
+			continue
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read attachment file %s: %w", path, err)
+		}
+		fileName := filepath.Base(path)
+		if strings.TrimSpace(fileName) == "" || fileName == "." || fileName == string(os.PathSeparator) {
+			return nil, fmt.Errorf("invalid attachment file name from path: %s", path)
+		}
+		contentType := mime.TypeByExtension(strings.ToLower(filepath.Ext(fileName)))
+		if strings.TrimSpace(contentType) == "" {
+			contentType = "application/octet-stream"
+		}
+
+		items = append(items, emailAttachment{
+			FileName:    fileName,
+			ContentType: contentType,
+			Content:     data,
+		})
+	}
+	return items, nil
 }
 
 func loadSMTPConfigFromEnv() (smtpConfig, error) {
@@ -372,12 +461,69 @@ func buildEmailMessage(from string, req emailRequest) []byte {
 	builder.WriteString("To: " + strings.Join(toHeader, ", ") + "\r\n")
 	builder.WriteString("Subject: " + encodedSubject + "\r\n")
 	builder.WriteString("MIME-Version: 1.0\r\n")
-	builder.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
-	builder.WriteString("Content-Transfer-Encoding: base64\r\n")
-	builder.WriteString("\r\n")
-	builder.WriteString(encodedBody)
-	builder.WriteString("\r\n")
 
+	buildPlain := func() []byte {
+		var plainBuilder strings.Builder
+		plainBuilder.WriteString(builder.String())
+		plainBuilder.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
+		plainBuilder.WriteString("Content-Transfer-Encoding: base64\r\n")
+		plainBuilder.WriteString("\r\n")
+		plainBuilder.WriteString(encodedBody)
+		plainBuilder.WriteString("\r\n")
+		return []byte(plainBuilder.String())
+	}
+
+	if len(req.Attachments) == 0 {
+		return buildPlain()
+	}
+
+	var body bytes.Buffer
+	mixedWriter := multipart.NewWriter(&body)
+
+	textHeader := textproto.MIMEHeader{}
+	textHeader.Set("Content-Type", `text/plain; charset="UTF-8"`)
+	textHeader.Set("Content-Transfer-Encoding", "base64")
+	textPart, err := mixedWriter.CreatePart(textHeader)
+	if err != nil {
+		return buildPlain()
+	}
+	if _, err := io.WriteString(textPart, encodedBody); err != nil {
+		return buildPlain()
+	}
+	if _, err := io.WriteString(textPart, "\r\n"); err != nil {
+		return buildPlain()
+	}
+
+	for _, attachment := range req.Attachments {
+		fileName := sanitizeHeader(attachment.FileName)
+		contentType := sanitizeHeader(attachment.ContentType)
+		if strings.TrimSpace(contentType) == "" {
+			contentType = "application/octet-stream"
+		}
+		partHeader := textproto.MIMEHeader{}
+		partHeader.Set("Content-Type", fmt.Sprintf(`%s; name="%s"`, contentType, fileName))
+		partHeader.Set("Content-Transfer-Encoding", "base64")
+		partHeader.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fileName))
+
+		part, err := mixedWriter.CreatePart(partHeader)
+		if err != nil {
+			return buildPlain()
+		}
+		encodedAttachment := wrapBase64(base64.StdEncoding.EncodeToString(attachment.Content))
+		if _, err := io.WriteString(part, encodedAttachment); err != nil {
+			return buildPlain()
+		}
+		if _, err := io.WriteString(part, "\r\n"); err != nil {
+			return buildPlain()
+		}
+	}
+
+	if err := mixedWriter.Close(); err != nil {
+		return buildPlain()
+	}
+	builder.WriteString(fmt.Sprintf("Content-Type: multipart/mixed; boundary=\"%s\"\r\n", mixedWriter.Boundary()))
+	builder.WriteString("\r\n")
+	builder.Write(body.Bytes())
 	return []byte(builder.String())
 }
 

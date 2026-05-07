@@ -1,0 +1,24 @@
+{
+  "min_confidence": 0.55,
+  "skills": {
+    "longbridge": {
+      "enabled": true,
+      "executor": "market_screen_v1",
+      "allowed_actions": [
+        "lb",
+        "email",
+        "task"
+      ],
+      "description": "Longbridge market screening skill"
+    },
+    "weather": {
+      "enabled": true,
+      "allowed_actions": [
+        "sys",
+        "email",
+        "task"
+      ],
+      "description": "Weather skill powered by wttr.in / open-meteo"
+    }
+  }
+}

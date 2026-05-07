@@ -1722,6 +1722,7 @@ var (
 		"q",
 		"longbridge",
 		"lb",
+		"skill",
 		"email",
 		"mail",
 		"sys",
@@ -1748,6 +1749,10 @@ var (
 		"--subject",
 		"--body",
 		"--body-file",
+		"--attach",
+	}
+	daemonEmailRepeatableFlags = map[string]struct{}{
+		"--attach": {},
 	}
 	daemonEmailSubcommandCandidates = []string{
 		"send",
@@ -1760,6 +1765,7 @@ var (
 		"--subject":   {"Notification"},
 		"--body":      {"message"},
 		"--body-file": {"./message.txt"},
+		"--attach":    {"./report.pdf"},
 	}
 	daemonEmailReceiveFlagCandidates = []string{
 		"--mail-alias",
@@ -1932,6 +1938,35 @@ var (
 		"check",
 		"help",
 	}
+	daemonSkillSubcommandCandidates = []string{
+		"run",
+		"list",
+		"validate",
+		"help",
+	}
+	daemonSkillRunFlagCandidates = []string{
+		"--text",
+		"--symbols",
+		"--dry-run",
+		"--format",
+		"--min-confidence",
+		"--llm-config",
+		"--skills-config",
+	}
+	daemonSkillListFlagCandidates = []string{
+		"--format",
+		"--skills-config",
+		"--llm-config",
+	}
+	daemonSkillValidateFlagCandidates = []string{
+		"--format",
+		"--skills-config",
+		"--llm-config",
+	}
+	daemonSkillFormatCandidates = []string{
+		"table",
+		"json",
+	}
 	daemonBookingSubcommandCandidates = []string{
 		"product",
 		"slot",
@@ -2079,6 +2114,8 @@ func daemonCompletionCandidates(segments [][]rune) [][]rune {
 		return stringCandidatesToRunes(daemonQuoteSymbolCandidates)
 	case "longbridge", "lb":
 		return nil
+	case "skill":
+		return skillCompletionCandidates(stageParts)
 	case "email", "mail":
 		return emailCompletionCandidates(stageParts)
 	case "sys", "shell":
@@ -2169,6 +2206,53 @@ func splitCompletionTokenByPipe(token string) []string {
 	}
 	parts = append(parts, current.String())
 	return parts
+}
+
+func skillCompletionCandidates(parts []string) [][]rune {
+	if len(parts) <= 2 {
+		return stringCandidatesToRunes(daemonSkillSubcommandCandidates)
+	}
+
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	args := parts[2:]
+	current := args[len(args)-1]
+
+	switch sub {
+	case "run":
+		if len(args) >= 2 && args[len(args)-2] == "--format" && current == "" {
+			return stringCandidatesToRunes(daemonSkillFormatCandidates)
+		}
+		if len(args) >= 2 && args[len(args)-2] == "--text" && current == "" {
+			return stringCandidatesToRunes([]string{`"US + HK tech screen: market cap > 50B, PE < 25, recent MACD golden cross"`})
+		}
+		if len(args) >= 2 && args[len(args)-2] == "--symbols" && current == "" {
+			return stringCandidatesToRunes([]string{"700.HK,9988.HK,IBM.US,1810.HK"})
+		}
+		if current == "" || strings.HasPrefix(current, "--") {
+			return stringCandidatesToRunes(daemonSkillRunFlagCandidates)
+		}
+		return nil
+	case "list":
+		if len(args) >= 2 && args[len(args)-2] == "--format" && current == "" {
+			return stringCandidatesToRunes(daemonSkillFormatCandidates)
+		}
+		if current == "" || strings.HasPrefix(current, "--") {
+			return stringCandidatesToRunes(daemonSkillListFlagCandidates)
+		}
+		return nil
+	case "validate":
+		if len(args) >= 2 && args[len(args)-2] == "--format" && current == "" {
+			return stringCandidatesToRunes(daemonSkillFormatCandidates)
+		}
+		if current == "" || strings.HasPrefix(current, "--") {
+			return stringCandidatesToRunes(daemonSkillValidateFlagCandidates)
+		}
+		return nil
+	case "help":
+		return nil
+	default:
+		return stringCandidatesToRunes(daemonSkillSubcommandCandidates)
+	}
 }
 
 func emailCompletionCandidates(parts []string) [][]rune {
@@ -3108,6 +3192,10 @@ func parseEmailCompletionState(args []string) (map[string]struct{}, string) {
 func remainingEmailFlags(usedFlags map[string]struct{}) []string {
 	remaining := make([]string, 0, len(daemonEmailFlagCandidates))
 	for _, flag := range daemonEmailFlagCandidates {
+		if _, repeatable := daemonEmailRepeatableFlags[flag]; repeatable {
+			remaining = append(remaining, flag)
+			continue
+		}
 		if _, exists := usedFlags[flag]; exists {
 			continue
 		}
@@ -3148,6 +3236,10 @@ func commandTemplate(args []string) (string, bool) {
 	case "task":
 		if len(args) == 1 {
 			return `task add --every 1m -- quote AAPL.US`, true
+		}
+	case "skill":
+		if len(args) == 1 {
+			return `skill run --text "US + HK tech screen: market cap > 50B, PE < 25, recent MACD golden cross" --symbols "700.HK,9988.HK,IBM.US"`, true
 		}
 	case "admin":
 		if len(args) == 1 {
