@@ -19,4 +19,11 @@ var (
 	writeFileAtomic           = core.WriteFileAtomic
 	appendLogLineWithRotation = core.AppendLogLineWithRotation
 	getEnvFirst               = core.GetEnvFirst
+	defaultConfigDir          = core.DefaultConfigDir
+	defaultDataDir            = core.DefaultDataDir
+	defaultLogDir             = core.DefaultLogDir
+	resolveConfigPath         = core.ResolveConfigPath
+	resolveDataPath           = core.ResolveDataPath
+	resolveLogPath            = core.ResolveLogPath
+	useRepoRelativeLayout     = core.UseRepoRelativeLayout
 )

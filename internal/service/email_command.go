@@ -254,7 +254,7 @@ func parseRecipientsWithAliasPath(raw string, aliasPath string) ([]string, error
 }
 
 func defaultEmailAliasConfigPath() string {
-	return filepath.Join("conf", "email_aliases.json")
+	return resolveConfigPath("email_aliases.json")
 }
 
 func normalizeRecipientAlias(alias string) string {

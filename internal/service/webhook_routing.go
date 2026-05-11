@@ -169,23 +169,23 @@ type webhookDispatchManager struct {
 }
 
 func defaultWebhookRouteStatePath() string {
-	return filepath.Join(daemonConfigDir, webhookRouteStateFile)
+	return resolveConfigPath(webhookRouteStateFile)
 }
 
 func defaultWebhookDispatchQueuePath() string {
-	return filepath.Join(daemonDataDir, webhookDispatchQueueFile)
+	return resolveDataPath(webhookDispatchQueueFile)
 }
 
 func defaultWebhookDispatchHistoryPath() string {
-	return filepath.Join(daemonDataDir, webhookDispatchHistoryFile)
+	return resolveDataPath(webhookDispatchHistoryFile)
 }
 
 func defaultWebhookDeadLetterPath() string {
-	return filepath.Join(daemonDataDir, webhookDeadLetterFile)
+	return resolveDataPath(webhookDeadLetterFile)
 }
 
 func defaultWebhookAuditLogPath() string {
-	return filepath.Join(commandLogDir, webhookAuditLogFile)
+	return resolveLogPath(webhookAuditLogFile)
 }
 
 func normalizeWebhookRouteMode(mode string) string {

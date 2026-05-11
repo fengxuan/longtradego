@@ -10,29 +10,30 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 - `email` command for SMTP notifications or `mails` CLI delivery
 - `email receive` command for IMAP inbox polling and action trigger
 - `email monitor` command for new-mail monitoring (polling)
-- `mail monitor` cursor persistence (`data/mail_monitor_cursors.json`) for restart-safe UID continuation (daemon monitors are isolated by `MONITOR_ID`)
+- `mail monitor` cursor persistence (`data/mail_monitor_cursors.json` in repo mode; `~/.config/longtradego/data/mail_monitor_cursors.json` after install) for restart-safe UID continuation (daemon monitors are isolated by `MONITOR_ID`)
 - `email analyze` command to print current mail element fields for downstream logic
-- `email --to` alias lookup via `conf/email_aliases.json`
+- `email --to` alias lookup via default email alias config
 - `sys` command for Linux/system automation commands
 - `version` command for build metadata (`version/commit/build date/platform`)
+- `config` command for resolved path inspection and example config bootstrap
 - `upgrade` command (`check` / install / dry-run) with GitHub Releases
-- Automatic update reminder cache (`data/update_state.json`, checked at daemon startup, max once per 24h)
+- Automatic update reminder cache (`data/update_state.json` in repo mode; `~/.config/longtradego/data/update_state.json` after install, checked at daemon startup, max once per 24h)
 - `webhook` command for signature generation, test sending, managed lifecycle (`start/status/stop/kill-port`), and dual-surface endpoints (public `/webhook/*`; admin `/admin`, `/admin/healthz`, `/admin/readyz`, `/admin/webhook/status`, `/admin/metrics`, `/admin/webhook/stop`)
 - `booking` command for product/slot/reservation/query management and independent dual-surface service lifecycle (`booking service start/status/stop`)
-- Unified external security key config (`conf/security_keys.json`, scopes: `booking` / `webhook`)
+- Unified external security key config (`conf/security_keys.json` in repo mode; `~/.config/longtradego/conf/security_keys.json` after install, scopes: `booking` / `webhook`)
 - Cloudflare Named Tunnel example config for booking-only public exposure (`conf-example/cloudflared_booking_tunnel.yml`)
 - `admin` command for daemon-admin runtime inspection (`admin status`)
 - Daemon scheduled task management (`task add/list/pause/resume/global-pause/global-resume/remove`)
-- Daemon task persistence across restarts (`conf/daemon_tasks.json`)
-- Removed task backup history with deletion timestamp (`data/daemon_tasks_history.json`)
-- Daemon mail monitor persistence across restarts (`conf/daemon_monitors.json`)
-- Daemon-owned independent admin service runtime (`conf/admin_runtime.json`)
-- Daemon admin Basic Auth config (`conf/admin_auth.json`)
+- Daemon task persistence across restarts (`conf/daemon_tasks.json` in repo mode; `~/.config/longtradego/conf/daemon_tasks.json` after install)
+- Removed task backup history with deletion timestamp (`data/daemon_tasks_history.json` in repo mode; `~/.config/longtradego/data/daemon_tasks_history.json` after install)
+- Daemon mail monitor persistence across restarts (`conf/daemon_monitors.json` in repo mode; `~/.config/longtradego/conf/daemon_monitors.json` after install)
+- Daemon-owned independent admin service runtime (`conf/admin_runtime.json` in repo mode; `~/.config/longtradego/conf/admin_runtime.json` after install)
+- Daemon admin Basic Auth config (`conf/admin_auth.json` in repo mode; `~/.config/longtradego/conf/admin_auth.json` after install)
 - Symbol-first backward compatibility (`go run . AAPL.US TSLA.US`)
 - OAuth client id flow support (`LONGBRIDGE_CLIENT_ID`)
 - Reuse quote session across commands; reconnect lazily only when a running command hits session expiration
 - Structured command execution logs
-- Log file rotation when `logs/command.log` exceeds `5MB`
+- Log file rotation when active `command.log` exceeds `5MB`
 
 ## Project Layout
 
@@ -83,8 +84,8 @@ Notes:
 
 - On first OAuth run, CLI prints an authorization URL.
 - Token is managed by Longbridge SDK and persisted locally.
-- IMAP for `mail receive/monitor/analyze` reads `conf/mail_receive_setting.json` only (no IMAP credential fallback from `.env`).
-- Booking intent parse (`/booking/intents/parse`) reads `conf/booking_llm.json` only (no LLM credential fallback from environment variables).
+- IMAP for `mail receive/monitor/analyze` reads the default mail settings config only (no IMAP credential fallback from `.env`).
+- Booking intent parse (`/booking/intents/parse`) reads the default booking LLM config only (no LLM credential fallback from environment variables).
 
 ## Run
 
@@ -100,11 +101,56 @@ Install a specific version:
 curl -fsSL https://raw.githubusercontent.com/fengxuan/longtradego/main/scripts/install.sh | bash -s -- v0.1.0
 ```
 
-After install, verify the binary:
+After install, verify the binary and resolved directories:
 
 ```bash
 ~/.local/bin/longtradego version
+~/.local/bin/longtradego config paths
 ```
+
+Installed binary default directories:
+
+- config: `~/.config/longtradego/conf`
+- data: `~/.config/longtradego/data`
+- logs: `~/.config/longtradego/logs`
+
+Initialize example config files into the resolved config directory:
+
+```bash
+~/.local/bin/longtradego config init
+# or only generate one file
+~/.local/bin/longtradego config init --only security_keys
+```
+
+This writes example files such as:
+
+- `~/.config/longtradego/conf/admin_auth.json`
+- `~/.config/longtradego/conf/booking_llm.json`
+- `~/.config/longtradego/conf/email_aliases.json`
+- `~/.config/longtradego/conf/mail_receive_setting.json`
+- `~/.config/longtradego/conf/security_keys.json`
+
+Post-install verification checklist:
+
+```bash
+# 1. confirm release metadata and resolved directories
+~/.local/bin/longtradego version
+~/.local/bin/longtradego config paths
+
+# 2. generate example config files once
+~/.local/bin/longtradego config init
+
+# 3. inspect the generated config directory
+ls ~/.config/longtradego/conf
+
+# 4. trigger a log-producing command
+~/.local/bin/longtradego sys --shell 'echo longtradego-ready'
+
+# 5. confirm logs are written under the installed default log dir
+ls ~/.config/longtradego/logs
+```
+
+When you run from the repo with `go run .`, the current workspace-relative `conf/`, `data/`, and `logs/` layout stays unchanged.
 
 If `longtradego` is not on your PATH yet:
 
@@ -158,7 +204,7 @@ Upgrade notes:
 - `upgrade` downloads release assets from GitHub Releases and verifies `checksums.txt` before replacement.
 - `upgrade` refuses to run while daemon is running; stop daemon first.
 - `upgrade` refuses `go run .` execution mode; install and run released binary first.
-- Automatic update checks run at daemon startup, are cached in `data/update_state.json`, and are throttled to at most once per 24 hours.
+- Automatic update checks run at daemon startup, are cached in `data/update_state.json` in repo mode or `~/.config/longtradego/data/update_state.json` after install, and are throttled to at most once per 24 hours.
 - Update reminder text is shown only in interactive terminals (non-interactive runs stay silent).
 
 Send email notification:
@@ -230,6 +276,8 @@ go run . mail recv \
   --files-dir ./logs/mail_files
 ```
 
+For installed binaries, the default attachment directory is `~/.config/longtradego/logs/mail_files`.
+
 Monitor new incoming mail and trigger follow-up commands:
 
 ```bash
@@ -260,7 +308,7 @@ Daemon pipeline example (new mail -> analyze):
 longtradego> mail monitor --poll-interval 15s --wait-timeout 5m --with-body | mail analyze
 ```
 
-Email alias config file (`conf/email_aliases.json`):
+Email alias config file (`conf/email_aliases.json` in repo mode; `~/.config/longtradego/conf/email_aliases.json` after install):
 
 ```json
 {
@@ -272,7 +320,7 @@ Email alias config file (`conf/email_aliases.json`):
 }
 ```
 
-IMAP settings file (`conf/mail_receive_setting.json`):
+IMAP settings file (`conf/mail_receive_setting.json` in repo mode; `~/.config/longtradego/conf/mail_receive_setting.json` after install):
 
 ```json
 {
@@ -306,7 +354,7 @@ go run . sys --shell "uname -a && date"
 ```
 
 `sys --shell` uses `$SHELL` when available (falls back to `zsh`, then `sh`).
-`sys` writes execution logs (stdout/stderr/exit code) to `logs/system_command.log` and does not print command output to terminal, to avoid interfering with interactive input.
+`sys` writes execution logs (stdout/stderr/exit code) to `logs/system_command.log` in repo mode or `~/.config/longtradego/logs/system_command.log` after install, and does not print command output to terminal, to avoid interfering with interactive input.
 For readable JSON payloads, keep using `stdout`/`stderr` for raw text compatibility and prefer `stdout_json` / `stderr_json` when present.
 
 Skill routing (V2 sidecar mode):
@@ -337,6 +385,7 @@ Skill router notes:
 - Sidecar status is available at `GET /v1/status` (JSON) and `GET /status` (HTML page).
 - Explicit commands (for example `longbridge quote ...`, `pdftotext ...`) are still locally routed and do not require sidecar.
 - `conf/skills_llm.json` now uses V2 schema with top-level `router` / `llm` / `sidecar`; legacy flat schema (`api_key`, `base_url`, `model`) is rejected with migration guidance.
+- For installed binaries, prefer an absolute `sidecar.runtime`, `sidecar.log`, and `sidecar.skills_catalog` path if you copy the example from `conf/skills_llm.json`.
 
 Webhook lifecycle and usage:
 
@@ -398,7 +447,8 @@ go run . webhook start \
 
 Start behavior notes:
 
-- Runtime/log paths remain relative to current workspace (`conf/`, `data/`, `logs/`).
+- In repo mode, runtime/log paths stay workspace-relative (`conf/`, `data/`, `logs/`).
+- After install, the same defaults resolve under `~/.config/longtradego/conf`, `~/.config/longtradego/data`, and `~/.config/longtradego/logs`.
 - Webhook runtime state now defaults to `data/webhook_runtime.json` (legacy `conf/webhook_runtime.json` is auto-migrated on read when using default runtime path).
 - `webhook start` enforces best-effort single service on the same address pair (`--public-addr` + `--admin-addr`): if either port is already in use, it returns `already_running` and does not spawn a new process.
 - After spawn, startup is verified by checking process liveness and management endpoint readiness to avoid false-positive "started" states.
@@ -640,7 +690,7 @@ Common mismatch causes:
 | `missing_required_headers` | Are all signing headers present? | Always send all three signing headers. |
 | `invalid_timestamp_header` | Unix seconds string format? | Send integer seconds, not ms/RFC3339. |
 | `timestamp_outside_allowed_window` | Clock skew / send delay? | Sync time, regenerate timestamp, resend. |
-| `token_not_found` | Does `third_party_id` exist in `conf/security_keys.json`? | Create/reset token for that ID. |
+| `token_not_found` | Does `third_party_id` exist in `conf/security_keys.json` or the installed default config dir? | Run `longtradego config init --only security_keys`, then create/reset token for that ID. |
 | `token_scope_not_allowed` | Does token scope include target API? | Add scope `booking`, `webhook`, or both. |
 | `signature_verification_failed` | Sign inputs exactly matched? | Re-sign exact payload with correct token. |
 | `idempotency_key_required` | Is `Idempotency-Key` set on POST? | Always send unique key for each logical write operation. |
@@ -658,15 +708,15 @@ Webhook downstream processing model:
 - Route mode `async`: enqueue and return `202` immediately; background worker retries with backoff, then dead-letters on max attempts.
 - Downstream allowlist is enabled by default; `sys/shell` requires explicit `--allow-sys-downstream`.
 - Webhook endpoints only accept `POST`; non-POST requests return `405`.
-- Token verification uses in-memory cache with periodic refresh from `conf/security_keys.json`.
+- Token verification uses in-memory cache with periodic refresh from the configured security keys file.
 
 Webhook logs and audit:
 
-- Accepted events: `data/webhook_events.json` (`meta + data`)
-- Async queue: `data/webhook_dispatch_queue.json`
-- Async history: `data/webhook_dispatch_history.jsonl`
-- Dead letter: `data/webhook_dead_letters.jsonl`
-- Full request/response audit (raw headers/body + response): `logs/webhook_audit.log` (with rotation)
+- Accepted events: `data/webhook_events.json` in repo mode; `~/.config/longtradego/data/webhook_events.json` after install (`meta + data`)
+- Async queue: `data/webhook_dispatch_queue.json` in repo mode; `~/.config/longtradego/data/webhook_dispatch_queue.json` after install
+- Async history: `data/webhook_dispatch_history.jsonl` in repo mode; `~/.config/longtradego/data/webhook_dispatch_history.jsonl` after install
+- Dead letter: `data/webhook_dead_letters.jsonl` in repo mode; `~/.config/longtradego/data/webhook_dead_letters.jsonl` after install
+- Full request/response audit (raw headers/body + response): `logs/webhook_audit.log` in repo mode; `~/.config/longtradego/logs/webhook_audit.log` after install (with rotation)
 - Event/audit writes are buffered asynchronously (batch flush) and use sync fallback when queue is full.
 - Backward-compatible raw fields are kept (`request_body`, `response_body`), while structured fields (`request_json`, `response_json`) are preferred for debugging and search.
 
@@ -740,7 +790,7 @@ Daemon also starts an independent admin service (default base address `:18080`) 
 - It tries `:18080` first, then auto-fallbacks to `+1 ... +20` if port is occupied.
 - If all candidate ports are unavailable, daemon keeps running and prints a warning.
 - This admin service is independent from webhook lifecycle, so when webhook is stopped, task/monitor admin page still works.
-- Runtime state is saved to `conf/admin_runtime.json`, and daemon exit only cleans this file when runtime `pid` matches current daemon process.
+- Runtime state is saved to `conf/admin_runtime.json` in repo mode or `~/.config/longtradego/conf/admin_runtime.json` after install, and daemon exit only cleans this file when runtime `pid` matches current daemon process.
 
 Check admin runtime quickly:
 
@@ -774,13 +824,13 @@ The daemon admin page (`/admin`) intentionally hides the `kill-port` button to r
 Booking system (independent service, system-first + client-ready):
 
 - Runtime data files:
-  - `data/booking_catalog.json` (products + slots)
-  - `data/booking_reservations.json` (reservations + state transitions)
+  - `data/booking_catalog.json` in repo mode or `~/.config/longtradego/data/booking_catalog.json` after install (products + slots)
+  - `data/booking_reservations.json` in repo mode or `~/.config/longtradego/data/booking_reservations.json` after install (reservations + state transitions)
 - Reservation states: `pending -> confirmed | rejected | cancelled`
 - Capacity rule: `available_capacity = slot.capacity - sum(confirmed.party_size)`
 - Default query behavior: `/booking/catalog` only returns slots with `available_capacity > 0`; use `include_full=true` to include full slots.
-- Runtime file: `data/booking_runtime.json` (service pid/public+admin address/state)
-- Draft intake file: `data/booking_intake_drafts.json` (text parse drafts)
+- Runtime file: `data/booking_runtime.json` in repo mode or `~/.config/longtradego/data/booking_runtime.json` after install (service pid/public+admin address/state)
+- Draft intake file: `data/booking_intake_drafts.json` in repo mode or `~/.config/longtradego/data/booking_intake_drafts.json` after install (text parse drafts)
 
 Start/stop/status booking service (public default `:18081`, admin default `127.0.0.1:18082`, fallback `+1...+20` with same offset on both):
 
@@ -808,9 +858,9 @@ go run . booking service start \
 
 Booking service security config (fail-closed on missing/invalid config):
 
-- `conf/security_keys.json` (unified external tokens, scopes: `booking` / `webhook`)
-- `conf/booking_llm.json` (OpenAI-compatible parse config: `api_key`, `base_url`, optional `model`)
-- `conf/admin_auth.json` (booking admin basic auth, shared with daemon admin)
+- `conf/security_keys.json` in repo mode or `~/.config/longtradego/conf/security_keys.json` after install (unified external tokens, scopes: `booking` / `webhook`)
+- `conf/booking_llm.json` in repo mode or `~/.config/longtradego/conf/booking_llm.json` after install (OpenAI-compatible parse config: `api_key`, `base_url`, optional `model`)
+- `conf/admin_auth.json` in repo mode or `~/.config/longtradego/conf/admin_auth.json` after install (booking admin basic auth, shared with daemon admin)
 
 Booking CLI examples:
 
@@ -874,7 +924,7 @@ Booking service APIs:
 - `GET /booking/reservations?user_id=<id>&status=<pending|confirmed|rejected|cancelled>`
 - `POST /booking/intents/parse` (text -> draft via OpenAI-compatible API)
 - `POST /booking/intents/confirm` (confirm draft -> create pending reservation)
-- If `conf/booking_llm.json` is missing/invalid, `POST /booking/intents/parse` returns `503` while other booking APIs remain available.
+- If `conf/booking_llm.json` in repo mode or `~/.config/longtradego/conf/booking_llm.json` after install is missing/invalid, `POST /booking/intents/parse` returns `503` while other booking APIs remain available.
 
 Intent parse follow-up behavior:
 
@@ -939,7 +989,7 @@ Admin booking APIs (Basic Auth required, hosted by booking service):
 HTTP semantics:
 
 - `/booking/*` requires unified signed headers.
-- `/admin/*` requires Basic Auth (`conf/admin_auth.json`).
+- `/admin/*` requires Basic Auth (`conf/admin_auth.json` in repo mode or `~/.config/longtradego/conf/admin_auth.json` after install).
 - Booking public listener does not expose admin routes (`/admin/*` returns `404` on public address).
 - Action endpoints are POST-only (`405` on wrong method).
 - Validation errors return `400`; capacity conflicts return `409`.
@@ -1019,7 +1069,7 @@ sudo systemctl stop cloudflared
 
 This removes public ingress immediately while keeping local booking service running.
 
-Daemon admin auth config (`conf/admin_auth.json`, hash-first):
+Daemon admin auth config (`conf/admin_auth.json` in repo mode; `~/.config/longtradego/conf/admin_auth.json` after install, hash-first):
 
 ```json
 {
@@ -1038,7 +1088,7 @@ Admin password operations:
 - `admin auth verify --config conf/admin_auth.json --username admin --password 'candidate-password'`
 - Raw/original password is not recoverable from `password_hash`; only verify/reset/generate are supported.
 
-Unified security key config (`conf/security_keys.json`):
+Unified security key config (`conf/security_keys.json` in repo mode; `~/.config/longtradego/conf/security_keys.json` after install):
 
 ```json
 {
@@ -1055,7 +1105,7 @@ Unified security key config (`conf/security_keys.json`):
 }
 ```
 
-Booking LLM config (`conf/booking_llm.json`, OpenAI-compatible):
+Booking LLM config (`conf/booking_llm.json` in repo mode; `~/.config/longtradego/conf/booking_llm.json` after install, OpenAI-compatible):
 
 ```json
 {
@@ -1067,7 +1117,7 @@ Booking LLM config (`conf/booking_llm.json`, OpenAI-compatible):
 
 `base_url` supports root URL, `/v1`, or full chat endpoint. The service normalizes it to a single `.../chat/completions` request URL (no duplicated `/v1`).
 
-If `conf/admin_auth.json` is missing or invalid, daemon keeps running but skips daemon admin service startup.
+If `conf/admin_auth.json` in repo mode or `~/.config/longtradego/conf/admin_auth.json` after install is missing or invalid, daemon keeps running but skips daemon admin service startup.
 
 When daemon exits (`exit` / EOF), it closes runtime contexts/connections and only cleans webhook process if ownership matches current daemon session (`owner_session_id` + `owner_start_token` double check). This avoids stopping webhook instances started by other daemon sessions or external terminals.
 
@@ -1091,7 +1141,7 @@ Daemon monitor control:
 - `monitor remove <id> <confirm-id>`: remove one monitor config permanently (requires id confirmation)
 - Alias forms are supported: `mail monitor list`, `mail monitor start <id|all>`, `mail monitor stop <id|all>`, `mail monitor remove <id> <confirm-id>`
 - Same mailbox/filter monitor runs as single instance in daemon (duplicate start is rejected)
-- Running monitor definitions are persisted to `conf/daemon_monitors.json`; only non-paused monitors auto-restore on next daemon start
+- Running monitor definitions are persisted to `conf/daemon_monitors.json` in repo mode or `~/.config/longtradego/conf/daemon_monitors.json` after install; only non-paused monitors auto-restore on next daemon start
 - Pipelines that start with `mail monitor` run as background monitor jobs (non-blocking daemon input), and are included in monitor list/start/stop/persistence
 - Legacy input `webhook serve ...` in daemon is auto rewritten to `webhook start ...` to prevent blocking the prompt
 - `booking service serve ...` in daemon is auto rewritten to `booking service start ...`
@@ -1145,7 +1195,7 @@ longtradego> task add --cron "*/5 * * * *" --auto-resume -- quote AAPL.US | emai
 
 Tasks are persisted automatically. When daemon restarts, previously saved tasks are restored from:
 
-- `conf/daemon_tasks.json`
+- `conf/daemon_tasks.json` in repo mode or `~/.config/longtradego/conf/daemon_tasks.json` after install
 
 Newly added tasks are `paused` by default. Use `--auto-resume` to skip the manual step, or resume explicitly:
 
@@ -1191,7 +1241,7 @@ longtradego> task remove task-1 task-1
 
 Each successful remove also appends a backup record (including deletion timestamp) to:
 
-- `data/daemon_tasks_history.json`
+- `data/daemon_tasks_history.json` in repo mode or `~/.config/longtradego/data/daemon_tasks_history.json` after install
 
 Default behavior:
 
@@ -1209,9 +1259,9 @@ go run . quote AAPL.US
 
 Command execution logs are written to:
 
-- `logs/command.log`
-- `logs/system_command.log`
-- `logs/mail_monitor.log`
+- `logs/command.log` in repo mode or `~/.config/longtradego/logs/command.log` after install
+- `logs/system_command.log` in repo mode or `~/.config/longtradego/logs/system_command.log` after install
+- `logs/mail_monitor.log` in repo mode or `~/.config/longtradego/logs/mail_monitor.log` after install
 
 Format:
 
@@ -1222,10 +1272,10 @@ Format:
 Rotation:
 
 - All logs above rotate at `5MB`.
-- If next write would exceed `5MB`, current file is rotated to:
-  - `logs/command_YYYYMMDD_HHMMSS.log`
-  - `logs/system_command_YYYYMMDD_HHMMSS.log`
-  - `logs/mail_monitor_YYYYMMDD_HHMMSS.log`
+- If next write would exceed `5MB`, current file is rotated to the same directory with a timestamp suffix, for example:
+  - `command_YYYYMMDD_HHMMSS.log`
+  - `system_command_YYYYMMDD_HHMMSS.log`
+  - `mail_monitor_YYYYMMDD_HHMMSS.log`
 - Then a new active log file is created for continued writes.
 
 ## Release Packaging

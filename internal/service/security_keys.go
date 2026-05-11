@@ -33,7 +33,7 @@ type legacyBookingAPIKeysConfig struct {
 }
 
 func defaultSecurityKeysPath() string {
-	return filepath.Join(daemonConfigDir, securityKeysConfigFile)
+	return resolveConfigPath(securityKeysConfigFile)
 }
 
 func normalizeSecurityScope(value string) string {
@@ -115,7 +115,7 @@ func loadSecurityTokenRecords(path string, allowMissing bool) (map[string]webhoo
 			if allowMissing {
 				return map[string]webhookTokenRecord{}, nil
 			}
-			return nil, fmt.Errorf("security keys config %s not found; copy conf-example/security_keys.json to %s and set at least one booking/webhook token", trimmedPath, trimmedPath)
+			return nil, fmt.Errorf("security keys config %s not found; run `longtradego config init --only security_keys` or create it manually, then set at least one booking/webhook token", trimmedPath)
 		}
 		return nil, err
 	}

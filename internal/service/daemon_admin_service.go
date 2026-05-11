@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -556,11 +555,11 @@ var daemonAdminHomeTemplate = template.Must(template.New("daemon_admin_home").Pa
 `))
 
 func defaultDaemonAdminRuntimePath() string {
-	return filepath.Join(daemonConfigDir, daemonAdminRuntimeStateFile)
+	return resolveConfigPath(daemonAdminRuntimeStateFile)
 }
 
 func defaultDaemonAdminAuthConfigPath() string {
-	return filepath.Join(daemonConfigDir, daemonAdminAuthConfigFile)
+	return resolveConfigPath(daemonAdminAuthConfigFile)
 }
 
 func defaultDaemonAdminURL(address string) string {

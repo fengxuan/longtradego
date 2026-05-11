@@ -27,7 +27,7 @@ import (
 const (
 	updateStateFileName        = "update_state.json"
 	updateStateVersion         = 1
-	defaultUpgradeReleaseRepo  = "jianfengxuan/longtradego"
+	defaultUpgradeReleaseRepo  = "fengxuan/longtradego"
 	defaultUpgradeCheckEvery   = 24 * time.Hour
 	defaultUpgradeCheckTimeout = 4 * time.Second
 	upgradeGithubAPIBase       = "https://api.github.com"
@@ -165,7 +165,7 @@ func runUpgradeInstallCommand(ctx context.Context, app *AppContext, targetVersio
 }
 
 func defaultUpdateStatePath() string {
-	return filepath.Join(daemonDataDir, updateStateFileName)
+	return resolveDataPath(updateStateFileName)
 }
 
 func resolveUpgradeReleaseRepo() string {

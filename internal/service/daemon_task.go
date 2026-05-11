@@ -259,11 +259,11 @@ func buildTaskTimerDelay(now time.Time, nextRunAt time.Time) (time.Duration, boo
 }
 
 func defaultDaemonTaskStatePath() string {
-	return filepath.Join(daemonConfigDir, daemonTaskStateFile)
+	return resolveConfigPath(daemonTaskStateFile)
 }
 
 func defaultDaemonTaskHistoryPath() string {
-	return filepath.Join(daemonDataDir, daemonTaskHistoryFile)
+	return resolveDataPath(daemonTaskHistoryFile)
 }
 
 func deriveDaemonTaskHistoryPath(statePath string) string {

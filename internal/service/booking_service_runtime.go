@@ -662,11 +662,11 @@ type bookingIntentParseResult struct {
 var errBookingLLMNotConfigured = errors.New("booking llm not configured")
 
 func defaultBookingRuntimeStatePath() string {
-	return filepath.Join(daemonDataDir, bookingRuntimeStateFile)
+	return resolveDataPath(bookingRuntimeStateFile)
 }
 
 func defaultBookingServiceLogPath() string {
-	return filepath.Join(commandLogDir, bookingServiceLogFile)
+	return resolveLogPath(bookingServiceLogFile)
 }
 
 func defaultBookingAPIKeysConfigPath() string {
@@ -674,11 +674,11 @@ func defaultBookingAPIKeysConfigPath() string {
 }
 
 func defaultBookingLLMConfigPath() string {
-	return filepath.Join(daemonConfigDir, bookingLLMConfigFile)
+	return resolveConfigPath(bookingLLMConfigFile)
 }
 
 func defaultBookingIntakeDraftsPath() string {
-	return filepath.Join(daemonDataDir, bookingIntakeDraftsFile)
+	return resolveDataPath(bookingIntakeDraftsFile)
 }
 
 func defaultBookingIdempotencyPath(runtimePath string) string {

@@ -26,6 +26,7 @@ func newRootCommand(app *core.AppContext, commandLogger *core.CommandFileLogger)
 	rootCmd.AddCommand(service.NewWebhookCommand(app))
 	rootCmd.AddCommand(service.NewBookingCommand(app))
 	rootCmd.AddCommand(service.NewVersionCommand(app))
+	rootCmd.AddCommand(service.NewConfigCommand(app))
 	rootCmd.AddCommand(service.NewUpgradeCommand(app))
 	return rootCmd
 }

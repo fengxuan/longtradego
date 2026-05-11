@@ -228,7 +228,7 @@ func newEmailReceiveCommand(app *AppContext) *cobra.Command {
 		},
 	}
 
-	receiveCmd.Flags().StringVar(&mailAlias, "mail-alias", "", "IMAP alias from conf/mail_receive_setting.json, defaults to default_alias")
+	receiveCmd.Flags().StringVar(&mailAlias, "mail-alias", "", "IMAP alias from the default mail settings config, defaults to default_alias")
 	receiveCmd.Flags().StringVar(&mailbox, "mailbox", "", "Mailbox name override, defaults to alias IMAP_MAILBOX or INBOX")
 	receiveCmd.Flags().IntVar(&limit, "limit", 20, "Max number of recent messages to inspect")
 	receiveCmd.Flags().BoolVar(&unreadOnly, "unread-only", true, "Only inspect unread messages")
@@ -240,7 +240,7 @@ func newEmailReceiveCommand(app *AppContext) *cobra.Command {
 	receiveCmd.Flags().DurationVar(&actionTimeout, "action-timeout", 0, "Timeout for action command, e.g. 5s")
 	receiveCmd.Flags().BoolVar(&withBody, "with-body", false, "Fetch and include message text content")
 	receiveCmd.Flags().BoolVar(&withFiles, "with-files", false, "Fetch and save attachment files")
-	receiveCmd.Flags().StringVar(&filesDir, "files-dir", filepath.Join(commandLogDir, "mail_files"), "Directory used to save fetched attachment files")
+	receiveCmd.Flags().StringVar(&filesDir, "files-dir", resolveLogPath("mail_files"), "Directory used to save fetched attachment files")
 	receiveCmd.Flags().IntVar(&bodyMaxBytes, "body-max-bytes", 20000, "Max bytes stored in body_text for each message")
 
 	return receiveCmd
@@ -396,7 +396,7 @@ func newEmailMonitorCommand(app *AppContext) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&mailAlias, "mail-alias", "", "IMAP alias from conf/mail_receive_setting.json, defaults to default_alias")
+	cmd.Flags().StringVar(&mailAlias, "mail-alias", "", "IMAP alias from the default mail settings config, defaults to default_alias")
 	cmd.Flags().StringVar(&mailbox, "mailbox", "", "Mailbox name override, defaults to alias IMAP_MAILBOX or INBOX")
 	cmd.Flags().IntVar(&limit, "limit", 0, "Max number of recent messages to inspect when polling")
 	cmd.Flags().BoolVar(&unreadOnly, "unread-only", true, "Only monitor unread messages")
@@ -410,7 +410,7 @@ func newEmailMonitorCommand(app *AppContext) *cobra.Command {
 	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", 0, "Max monitoring duration, e.g. 10m (0 means no timeout)")
 	cmd.Flags().BoolVar(&withBody, "with-body", true, "Fetch and include message text content for new emails")
 	cmd.Flags().BoolVar(&withFiles, "with-files", false, "Fetch and save attachment files for new emails")
-	cmd.Flags().StringVar(&filesDir, "files-dir", filepath.Join(commandLogDir, "mail_files"), "Directory used to save fetched attachment files")
+	cmd.Flags().StringVar(&filesDir, "files-dir", resolveLogPath("mail_files"), "Directory used to save fetched attachment files")
 	cmd.Flags().IntVar(&bodyMaxBytes, "body-max-bytes", 0, "Max bytes stored in body_text for each message")
 	cmd.Flags().Uint32Var(&sinceUID, "since-uid", 0, "Only notify messages with UID greater than this value")
 	cmd.Flags().StringVar(&monitorID, "monitor-id", "", "Internal monitor config id for cursor isolation")
@@ -495,7 +495,7 @@ func newEmailAnalyzeCommand(app *AppContext) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&mailAlias, "mail-alias", "", "IMAP alias from conf/mail_receive_setting.json, defaults to default_alias")
+	cmd.Flags().StringVar(&mailAlias, "mail-alias", "", "IMAP alias from the default mail settings config, defaults to default_alias")
 	cmd.Flags().StringVar(&mailbox, "mailbox", "", "Mailbox name override, defaults to alias IMAP_MAILBOX or INBOX")
 	cmd.Flags().IntVar(&limit, "limit", 20, "Max number of recent messages to inspect")
 	cmd.Flags().BoolVar(&unreadOnly, "unread-only", true, "Only inspect unread messages")
@@ -503,7 +503,7 @@ func newEmailAnalyzeCommand(app *AppContext) *cobra.Command {
 	cmd.Flags().StringVar(&fromContains, "from-contains", "", "Filter sender containing text (case-insensitive)")
 	cmd.Flags().DurationVar(&connectTimeout, "connect-timeout", 10*time.Second, "IMAP connect timeout")
 	cmd.Flags().BoolVar(&withFiles, "with-files", false, "Fetch and save attachment files during analysis")
-	cmd.Flags().StringVar(&filesDir, "files-dir", filepath.Join(commandLogDir, "mail_files"), "Directory used to save fetched attachment files")
+	cmd.Flags().StringVar(&filesDir, "files-dir", resolveLogPath("mail_files"), "Directory used to save fetched attachment files")
 	cmd.Flags().IntVar(&bodyMaxBytes, "body-max-bytes", 20000, "Max bytes stored in body_text for each message")
 	cmd.Flags().StringVar(&inputJSON, "input-json", "", "Internal pipeline input JSON payload")
 	_ = cmd.Flags().MarkHidden("input-json")
@@ -1059,7 +1059,7 @@ func printAnalyzeResultElements(result imapReceiveResult) {
 }
 
 func defaultIMAPSettingsConfigPath() string {
-	return filepath.Join("conf", "mail_receive_setting.json")
+	return resolveConfigPath("mail_receive_setting.json")
 }
 
 func loadIMAPConfig(mailAlias string) (imapConfig, error) {
@@ -1209,7 +1209,7 @@ func resolveMonitorLimitWithKey(envKey string, flagValue int, fallback int) int 
 }
 
 func defaultMailMonitorCursorPath() string {
-	return filepath.Join(daemonDataDir, mailMonitorCursorFile)
+	return resolveDataPath(mailMonitorCursorFile)
 }
 
 func buildMailMonitorCursorKey(cfg imapConfig, opts imapReceiveOptions, monitorID string) string {
@@ -1295,7 +1295,7 @@ func writeMailMonitorCursorState(path string, state mailMonitorCursorState) erro
 
 func appendMailMonitorLogf(format string, args ...any) {
 	message := fmt.Sprintf(format, args...)
-	path := filepath.Join(commandLogDir, "mail_monitor.log")
+	path := resolveLogPath("mail_monitor.log")
 	line := []byte(fmt.Sprintf("%s %s\n", time.Now().Format(time.RFC3339), message))
 	_ = appendLogLineWithRotation(path, line, commandLogMaxSize, "mail_monitor")
 }

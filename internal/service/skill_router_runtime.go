@@ -729,11 +729,11 @@ func stopSkillRouter(runtimePath string, timeout time.Duration) (skillRouterStop
 }
 
 func defaultSkillRouterRuntimeStatePath() string {
-	return filepath.Join(daemonDataDir, skillRouterRuntimeStateFile)
+	return resolveDataPath(skillRouterRuntimeStateFile)
 }
 
 func defaultSkillRouterLogPath() string {
-	return filepath.Join(commandLogDir, "skill_router.log")
+	return resolveLogPath("skill_router.log")
 }
 
 func readSkillRouterRuntimeState(path string) (*skillRouterRuntimeInfo, bool, error) {

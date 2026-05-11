@@ -1764,19 +1764,19 @@ func defaultWebhookTokenStatePath() string {
 }
 
 func defaultWebhookRuntimeStatePath() string {
-	return filepath.Join(daemonDataDir, webhookRuntimeStateFile)
+	return resolveDataPath(webhookRuntimeStateFile)
 }
 
 func defaultWebhookLegacyRuntimeStatePath() string {
-	return filepath.Join(daemonConfigDir, webhookRuntimeStateFile)
+	return resolveConfigPath(webhookRuntimeStateFile)
 }
 
 func defaultWebhookEventLogPath() string {
-	return filepath.Join(daemonDataDir, webhookEventLogFile)
+	return resolveDataPath(webhookEventLogFile)
 }
 
 func defaultWebhookServerLogPath() string {
-	return filepath.Join(commandLogDir, "webhook_server.log")
+	return resolveLogPath("webhook_server.log")
 }
 
 func normalizeThirdPartyID(value string) string {

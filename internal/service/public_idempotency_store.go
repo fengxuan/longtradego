@@ -58,7 +58,7 @@ type publicIdempotencyStore struct {
 func defaultBookingIdempotencyStatePath(runtimePath string) string {
 	trimmedRuntime := strings.TrimSpace(runtimePath)
 	if trimmedRuntime == "" {
-		return filepath.Join(daemonDataDir, bookingIdempotencyStateFile)
+		return resolveDataPath(bookingIdempotencyStateFile)
 	}
 	return filepath.Join(filepath.Dir(trimmedRuntime), bookingIdempotencyStateFile)
 }
@@ -66,7 +66,7 @@ func defaultBookingIdempotencyStatePath(runtimePath string) string {
 func defaultWebhookIdempotencyStatePath(runtimePath string) string {
 	trimmedRuntime := strings.TrimSpace(runtimePath)
 	if trimmedRuntime == "" {
-		return filepath.Join(daemonDataDir, webhookIdempotencyStateFile)
+		return resolveDataPath(webhookIdempotencyStateFile)
 	}
 	return filepath.Join(filepath.Dir(trimmedRuntime), webhookIdempotencyStateFile)
 }

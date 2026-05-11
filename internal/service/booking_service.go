@@ -204,11 +204,11 @@ func isBookingConflictError(err error) bool {
 }
 
 func defaultBookingCatalogStatePath() string {
-	return filepath.Join(daemonDataDir, bookingCatalogStateFile)
+	return resolveDataPath(bookingCatalogStateFile)
 }
 
 func defaultBookingReservationsStatePath() string {
-	return filepath.Join(daemonDataDir, bookingReservationsStateFile)
+	return resolveDataPath(bookingReservationsStateFile)
 }
 
 func newBookingService(catalogPath string, reservationsPath string) *bookingService {

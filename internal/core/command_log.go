@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	commandLogDir      = "logs"
+	commandLogDir      = repoLogDirName
 	commandLogFileName = "command.log"
 	commandLogMaxSize  = int64(5 * 1024 * 1024)
 )
@@ -48,11 +48,12 @@ type commandLogRequest struct {
 }
 
 func NewCommandFileLogger() (*CommandFileLogger, error) {
-	if err := os.MkdirAll(commandLogDir, 0o755); err != nil {
+	logDir := DefaultLogDir()
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, err
 	}
 
-	activePath := filepath.Join(commandLogDir, commandLogFileName)
+	activePath := filepath.Join(logDir, commandLogFileName)
 	if err := rotateLogIfNeeded(activePath); err != nil {
 		return nil, err
 	}

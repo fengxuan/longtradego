@@ -92,7 +92,7 @@ func newSystemCommand(app *AppContext) *cobra.Command {
 }
 
 func defaultSystemCommandLogPath() string {
-	return filepath.Join(commandLogDir, systemCommandLogFileName)
+	return resolveLogPath(systemCommandLogFileName)
 }
 
 func runSystemCommand(ctx context.Context, args []string, shellCommand string) (systemCommandResult, error) {

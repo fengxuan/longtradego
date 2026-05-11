@@ -906,8 +906,8 @@ func TestBookingServiceStartFailsWhenAPIKeysConfigMissing(t *testing.T) {
 	if !strings.Contains(err.Error(), apiKeysPath) {
 		t.Fatalf("expected error includes missing api keys path %s, got %v", apiKeysPath, err)
 	}
-	if !strings.Contains(err.Error(), "copy conf-example/security_keys.json") {
-		t.Fatalf("expected error includes copy hint, got %v", err)
+	if !strings.Contains(err.Error(), "config init --only security_keys") {
+		t.Fatalf("expected error includes init hint, got %v", err)
 	}
 
 	rawLog, readErr := os.ReadFile(logPath)

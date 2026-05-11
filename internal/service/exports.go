@@ -46,6 +46,10 @@ func NewVersionCommand(app *AppContext) *cobra.Command {
 	return newVersionCommand(app)
 }
 
+func NewConfigCommand(app *AppContext) *cobra.Command {
+	return newConfigCommand(app)
+}
+
 func NewUpgradeCommand(app *AppContext) *cobra.Command {
 	return newUpgradeCommand(app)
 }

@@ -1611,7 +1611,7 @@ func printDaemonMonitorHelp() {
 }
 
 func defaultDaemonMonitorStatePath() string {
-	return filepath.Join(daemonConfigDir, daemonMonitorStateFile)
+	return resolveConfigPath(daemonMonitorStateFile)
 }
 
 func cloneDaemonMonitorRecords(records map[string]daemonMonitorRecord) map[string]daemonMonitorRecord {
@@ -1705,11 +1705,12 @@ func writeDaemonMonitorState(path string, records map[string]daemonMonitorRecord
 }
 
 func newDaemonReadline() (*readline.Instance, error) {
-	if err := os.MkdirAll(commandLogDir, 0o755); err != nil {
+	logDir := defaultLogDir()
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, err
 	}
 
-	historyPath := filepath.Join(commandLogDir, "daemon.history")
+	historyPath := filepath.Join(logDir, "daemon.history")
 	return readline.NewEx(&readline.Config{
 		Prompt:          "longtradego> ",
 		HistoryFile:     historyPath,
