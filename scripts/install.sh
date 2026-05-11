@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${LONGTRADEGO_RELEASE_REPO:-jianfengxuan/longtradego}"
+REPO="${LONGTRADEGO_RELEASE_REPO:-fengxuan/longtradego}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 REQUESTED_VERSION="${1:-latest}"
 

@@ -88,6 +88,30 @@ Notes:
 
 ## Run
 
+Install from GitHub Release (macOS, one command):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fengxuan/longtradego/main/scripts/install.sh | bash
+```
+
+Install a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fengxuan/longtradego/main/scripts/install.sh | bash -s -- v0.1.0
+```
+
+After install, verify the binary:
+
+```bash
+~/.local/bin/longtradego version
+```
+
+If `longtradego` is not on your PATH yet:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 Install dependencies:
 
 ```bash
