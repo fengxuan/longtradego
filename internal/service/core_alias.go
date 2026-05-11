@@ -19,6 +19,7 @@ var (
 	writeFileAtomic           = core.WriteFileAtomic
 	appendLogLineWithRotation = core.AppendLogLineWithRotation
 	getEnvFirst               = core.GetEnvFirst
+	defaultAppHomeDir         = core.DefaultAppHomeDir
 	defaultConfigDir          = core.DefaultConfigDir
 	defaultDataDir            = core.DefaultDataDir
 	defaultLogDir             = core.DefaultLogDir

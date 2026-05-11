@@ -80,6 +80,15 @@ func TestRunConfigPathsUserHome(t *testing.T) {
 
 func TestRunConfigInitCreatesTemplates(t *testing.T) {
 	dir := t.TempDir()
+	oldUseRepoRelativeLayout := useRepoRelativeLayout
+	oldDefaultConfigDir := defaultConfigDir
+	defer func() {
+		useRepoRelativeLayout = oldUseRepoRelativeLayout
+		defaultConfigDir = oldDefaultConfigDir
+	}()
+	useRepoRelativeLayout = func() bool { return true }
+	defaultConfigDir = func() string { return "conf" }
+
 	cmd := newConfigInitCommand(nil)
 	cmd.SetArgs([]string{"--dir", dir, "--only", "security_keys", "--only", "email_aliases", "--only", "env"})
 	var out bytes.Buffer
@@ -208,5 +217,69 @@ func TestRunConfigInitOnlyEnv(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "security_keys.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected security_keys.json not created, err=%v", err)
+	}
+}
+
+func TestRunConfigInitHomeFlagUsesInstalledConfigDir(t *testing.T) {
+	baseDir := t.TempDir()
+	oldDefaultAppHomeDir := defaultAppHomeDir
+	oldDefaultConfigDir := defaultConfigDir
+	oldUseRepoRelativeLayout := useRepoRelativeLayout
+	defer func() {
+		defaultAppHomeDir = oldDefaultAppHomeDir
+		defaultConfigDir = oldDefaultConfigDir
+		useRepoRelativeLayout = oldUseRepoRelativeLayout
+	}()
+
+	defaultAppHomeDir = func() string { return baseDir }
+	defaultConfigDir = func() string { return "conf" }
+	useRepoRelativeLayout = func() bool { return true }
+
+	cmd := newConfigInitCommand(nil)
+	cmd.SetArgs([]string{"--home", "--only", "env"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("config init execute failed: %v", err)
+	}
+
+	envPath := filepath.Join(baseDir, "conf", "longtradego.env")
+	if _, err := os.Stat(envPath); err != nil {
+		t.Fatalf("expected home env created: %v", err)
+	}
+	if !strings.Contains(out.String(), "initialized config dir: "+filepath.Join(baseDir, "conf")) {
+		t.Fatalf("expected home dir output, got %q", out.String())
+	}
+	if strings.Contains(out.String(), "layout hint:") {
+		t.Fatalf("did not expect repo layout hint for --home output, got %q", out.String())
+	}
+}
+
+func TestRunConfigInitReportsRepoRelativeHint(t *testing.T) {
+	dir := t.TempDir()
+	oldUseRepoRelativeLayout := useRepoRelativeLayout
+	oldDefaultConfigDir := defaultConfigDir
+	defer func() {
+		useRepoRelativeLayout = oldUseRepoRelativeLayout
+		defaultConfigDir = oldDefaultConfigDir
+	}()
+
+	useRepoRelativeLayout = func() bool { return true }
+	defaultConfigDir = func() string { return dir }
+
+	cmd := newConfigInitCommand(nil)
+	cmd.SetArgs([]string{"--only", "env"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("config init execute failed: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "layout hint: current run is repo_relative") {
+		t.Fatalf("expected repo_relative hint, got %q", output)
+	}
+	if !strings.Contains(output, "created: "+filepath.Join(dir, "longtradego.env")) {
+		t.Fatalf("expected created env path, got %q", output)
 	}
 }

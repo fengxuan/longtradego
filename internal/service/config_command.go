@@ -154,6 +154,7 @@ func newConfigInitCommand(app *AppContext) *cobra.Command {
 		dir       string
 		overwrite bool
 		only      []string
+		useHome   bool
 	)
 
 	cmd := &cobra.Command{
@@ -161,13 +162,16 @@ func newConfigInitCommand(app *AppContext) *cobra.Command {
 		Short: "Write example config files into the resolved config directory",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			targetDir := strings.TrimSpace(dir)
-			if targetDir == "" {
+			if useHome {
+				targetDir = filepath.Join(defaultAppHomeDir(), "conf")
+			} else if targetDir == "" {
 				targetDir = defaultConfigDir()
 			}
 			return runConfigInit(cmd, app, targetDir, overwrite, only)
 		},
 	}
 	cmd.Flags().StringVar(&dir, "dir", "", "Target config directory (defaults to resolved config dir)")
+	cmd.Flags().BoolVar(&useHome, "home", false, "Write into the installed home config dir (~/.config/longtradego/conf)")
 	cmd.Flags().BoolVar(&overwrite, "overwrite", false, "Overwrite existing files")
 	cmd.Flags().StringArrayVar(&only, "only", nil, "Only write selected template names (repeatable: admin_auth, booking_llm, email_aliases, env, mail_receive_setting, security_keys)")
 	return cmd
@@ -236,6 +240,9 @@ func runConfigInit(cmd *cobra.Command, app *AppContext, dir string, overwrite bo
 	}
 
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "initialized config dir: %s\n", dir)
+	if useRepoRelativeLayout() && dir == defaultConfigDir() {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "layout hint: current run is repo_relative, so files were written under ./%s\n", filepath.Clean(dir))
+	}
 	for _, path := range created {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "created: %s\n", path)
 	}

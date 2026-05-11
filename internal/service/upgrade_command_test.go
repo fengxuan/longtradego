@@ -203,6 +203,89 @@ func TestRunAutomaticUpgradeCheckInteractiveReminder(t *testing.T) {
 	}
 }
 
+func TestPerformUpgradeInstallPromptsForVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	withUpgradeTestWorkingDir(t, tmpDir)
+	exePath := filepath.Join(tmpDir, "longtradego")
+	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
+		t.Fatalf("write executable failed: %v", err)
+	}
+
+	release := testUpgradeRelease("v1.1.0")
+	binaryAsset := release.Assets[0]
+	checksumAsset := release.Assets[1]
+	archive := mustBuildTarGzBinary(t, "longtradego", []byte("new-binary"))
+	checksums := []byte(fmt.Sprintf("%s  %s\n", sha256Hex(archive), binaryAsset.Name))
+
+	oldVersion := buildVersion
+	oldFetch := upgradeFetchRelease
+	oldDaemonStatus := upgradeDaemonRuntimeStatus
+	oldExecutable := upgradeResolveExecutablePath
+	oldDownload := upgradeDownloadContent
+	oldInteractive := upgradeInteractiveTerminal
+	buildVersion = "v1.0.0"
+	upgradeFetchRelease = func(ctx context.Context, repo string, targetVersion string) (githubRelease, error) {
+		if targetVersion != "v1.1.0" {
+			t.Fatalf("expected prompted version v1.1.0, got %q", targetVersion)
+		}
+		return release, nil
+	}
+	upgradeDaemonRuntimeStatus = func(path string) (string, *daemonAdminRuntimeInfo, error) {
+		return "stopped", nil, nil
+	}
+	upgradeResolveExecutablePath = func() (string, error) { return exePath, nil }
+	upgradeDownloadContent = func(ctx context.Context, downloadURL string) ([]byte, error) {
+		switch downloadURL {
+		case binaryAsset.BrowserDownloadURL:
+			return archive, nil
+		case checksumAsset.BrowserDownloadURL:
+			return checksums, nil
+		default:
+			return nil, fmt.Errorf("unexpected download url: %s", downloadURL)
+		}
+	}
+	upgradeInteractiveTerminal = func() bool { return true }
+	defer func() {
+		buildVersion = oldVersion
+		upgradeFetchRelease = oldFetch
+		upgradeDaemonRuntimeStatus = oldDaemonStatus
+		upgradeResolveExecutablePath = oldExecutable
+		upgradeDownloadContent = oldDownload
+		upgradeInteractiveTerminal = oldInteractive
+	}()
+
+	var out bytes.Buffer
+	result, err := performUpgradeInstall(context.Background(), "", true, false, strings.NewReader("v1.1.0\n"), &out)
+	if err != nil {
+		t.Fatalf("performUpgradeInstall prompt flow failed: %v", err)
+	}
+	if result.Status != "upgraded" {
+		t.Fatalf("expected upgraded status, got %+v", result)
+	}
+	if !strings.Contains(out.String(), "enter target version") {
+		t.Fatalf("expected version prompt output, got %q", out.String())
+	}
+}
+
+func TestPerformUpgradeInstallRequiresVersionInNonInteractiveMode(t *testing.T) {
+	oldInteractive := upgradeInteractiveTerminal
+	defer func() { upgradeInteractiveTerminal = oldInteractive }()
+	upgradeInteractiveTerminal = func() bool { return false }
+
+	_, err := performUpgradeInstall(context.Background(), "", true, true, strings.NewReader(""), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "requires --version") {
+		t.Fatalf("expected requires --version error, got %v", err)
+	}
+}
+
+func TestPrintUpgradeReminderIncludesVersionCommand(t *testing.T) {
+	var out bytes.Buffer
+	printUpgradeReminder(&out, "v1.0.0", "v1.2.0")
+	if !strings.Contains(out.String(), "longtradego upgrade --version v1.2.0") {
+		t.Fatalf("expected versioned upgrade hint, got %q", out.String())
+	}
+}
+
 func TestPerformUpgradeInstallDryRun(t *testing.T) {
 	tmpDir := t.TempDir()
 	withUpgradeTestWorkingDir(t, tmpDir)
@@ -230,7 +313,7 @@ func TestPerformUpgradeInstallDryRun(t *testing.T) {
 		upgradeResolveExecutablePath = oldExecutable
 	}()
 
-	result, err := performUpgradeInstall(context.Background(), "", true, true, strings.NewReader(""), io.Discard)
+	result, err := performUpgradeInstall(context.Background(), "v1.1.0", true, true, strings.NewReader(""), io.Discard)
 	if err != nil {
 		t.Fatalf("performUpgradeInstall dry-run failed: %v", err)
 	}
@@ -260,7 +343,7 @@ func TestPerformUpgradeInstallBlocksDaemonRunning(t *testing.T) {
 		upgradeDaemonRuntimeStatus = oldDaemonStatus
 	}()
 
-	_, err := performUpgradeInstall(context.Background(), "", true, false, strings.NewReader(""), io.Discard)
+	_, err := performUpgradeInstall(context.Background(), "v1.1.0", true, false, strings.NewReader(""), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "daemon is running") {
 		t.Fatalf("expected daemon running error, got %v", err)
 	}
@@ -285,7 +368,7 @@ func TestPerformUpgradeInstallRejectsGoRunBinary(t *testing.T) {
 		upgradeResolveExecutablePath = oldExecutable
 	}()
 
-	_, err := performUpgradeInstall(context.Background(), "", true, false, strings.NewReader(""), io.Discard)
+	_, err := performUpgradeInstall(context.Background(), "v1.1.0", true, false, strings.NewReader(""), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "go run") {
 		t.Fatalf("expected go run rejection error, got %v", err)
 	}
@@ -336,7 +419,7 @@ func TestPerformUpgradeInstallSuccessReplacesBinary(t *testing.T) {
 		upgradeDownloadContent = oldDownload
 	}()
 
-	result, err := performUpgradeInstall(context.Background(), "", true, false, strings.NewReader(""), io.Discard)
+	result, err := performUpgradeInstall(context.Background(), "v1.1.0", true, false, strings.NewReader(""), io.Discard)
 	if err != nil {
 		t.Fatalf("performUpgradeInstall failed: %v", err)
 	}
@@ -394,7 +477,7 @@ func TestPerformUpgradeInstallChecksumMismatchDoesNotReplace(t *testing.T) {
 		upgradeDownloadContent = oldDownload
 	}()
 
-	_, err := performUpgradeInstall(context.Background(), "", true, false, strings.NewReader(""), io.Discard)
+	_, err := performUpgradeInstall(context.Background(), "v1.1.0", true, false, strings.NewReader(""), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("expected checksum mismatch error, got %v", err)
 	}
@@ -407,23 +490,86 @@ func TestPerformUpgradeInstallChecksumMismatchDoesNotReplace(t *testing.T) {
 	}
 }
 
+func TestMaybeNotifyUpgradeAvailableRunsForInteractiveQuote(t *testing.T) {
+	oldInteractive := upgradeInteractiveTerminal
+	oldRunAutomatic := upgradeRunAutomaticCheck
+	defer func() {
+		upgradeInteractiveTerminal = oldInteractive
+		upgradeRunAutomaticCheck = oldRunAutomatic
+	}()
+
+	upgradeInteractiveTerminal = func() bool { return true }
+	called := false
+	upgradeRunAutomaticCheck = func(ctx context.Context, statePath string, out io.Writer, interactive bool) (upgradeUpdateState, error) {
+		called = true
+		if !interactive {
+			t.Fatalf("expected interactive automatic check")
+		}
+		if strings.TrimSpace(statePath) == "" {
+			t.Fatalf("expected non-empty state path")
+		}
+		return upgradeUpdateState{}, nil
+	}
+
+	MaybeNotifyUpgradeAvailable(context.Background(), []string{"quote", "AAPL.US"}, io.Discard)
+	if !called {
+		t.Fatalf("expected automatic upgrade check to run for interactive quote")
+	}
+}
+
+func TestMaybeNotifyUpgradeAvailableSkipsUpgradeCommand(t *testing.T) {
+	oldInteractive := upgradeInteractiveTerminal
+	oldRunAutomatic := upgradeRunAutomaticCheck
+	defer func() {
+		upgradeInteractiveTerminal = oldInteractive
+		upgradeRunAutomaticCheck = oldRunAutomatic
+	}()
+
+	upgradeInteractiveTerminal = func() bool { return true }
+	upgradeRunAutomaticCheck = func(ctx context.Context, statePath string, out io.Writer, interactive bool) (upgradeUpdateState, error) {
+		t.Fatalf("did not expect automatic check for upgrade command")
+		return upgradeUpdateState{}, nil
+	}
+
+	MaybeNotifyUpgradeAvailable(context.Background(), []string{"upgrade", "--version", "v1.0.5"}, io.Discard)
+}
+
+func TestMaybeNotifyUpgradeAvailableSkipsNonInteractiveCommands(t *testing.T) {
+	oldInteractive := upgradeInteractiveTerminal
+	oldRunAutomatic := upgradeRunAutomaticCheck
+	defer func() {
+		upgradeInteractiveTerminal = oldInteractive
+		upgradeRunAutomaticCheck = oldRunAutomatic
+	}()
+
+	upgradeInteractiveTerminal = func() bool { return false }
+	upgradeRunAutomaticCheck = func(ctx context.Context, statePath string, out io.Writer, interactive bool) (upgradeUpdateState, error) {
+		t.Fatalf("did not expect automatic check for non-interactive command")
+		return upgradeUpdateState{}, nil
+	}
+
+	MaybeNotifyUpgradeAvailable(context.Background(), []string{"quote", "AAPL.US"}, io.Discard)
+}
+
 func TestShouldSkipAutomaticUpgradeCheck(t *testing.T) {
 	cases := []struct {
-		args []string
-		want bool
+		name        string
+		args        []string
+		interactive bool
+		want        bool
 	}{
-		{args: nil, want: true},
-		{args: []string{"upgrade"}, want: true},
-		{args: []string{"version"}, want: true},
-		{args: []string{"help"}, want: true},
-		{args: []string{"quote", "AAPL.US"}, want: true},
-		{args: []string{"longbridge", "quote", "AAPL.US"}, want: true},
-		{args: []string{"daemon"}, want: false},
-		{args: []string{"d"}, want: false},
+		{name: "empty interactive", args: nil, interactive: true, want: false},
+		{name: "empty non interactive", args: nil, interactive: false, want: true},
+		{name: "upgrade skipped", args: []string{"upgrade"}, interactive: true, want: true},
+		{name: "help skipped", args: []string{"help"}, interactive: true, want: true},
+		{name: "completion skipped", args: []string{"completion"}, interactive: true, want: true},
+		{name: "quote runs", args: []string{"quote", "AAPL.US"}, interactive: true, want: false},
+		{name: "longbridge runs", args: []string{"longbridge", "quote", "AAPL.US"}, interactive: true, want: false},
+		{name: "daemon runs", args: []string{"daemon"}, interactive: true, want: false},
 	}
 	for _, tc := range cases {
-		if got := shouldSkipAutomaticUpgradeCheck(tc.args); got != tc.want {
-			t.Fatalf("shouldSkipAutomaticUpgradeCheck(%v)=%t want=%t", tc.args, got, tc.want)
+		if got := shouldSkipAutomaticUpgradeCheck(tc.args, tc.interactive); got != tc.want {
+			t.Fatalf("%s: shouldSkipAutomaticUpgradeCheck(%v, %t)=%t want=%t", tc.name, tc.args, tc.interactive, got, tc.want)
 		}
 	}
 }

@@ -79,9 +79,11 @@ var (
 	upgradeDaemonRuntimeStatus   = daemonAdminRuntimeStatus
 	upgradeReplaceBinary         = replaceExecutableBinary
 	upgradePromptConfirm         = promptUpgradeConfirmation
+	upgradePromptVersion         = promptUpgradeTargetVersion
 	upgradeInteractiveTerminal   = isInteractiveTerminal
 	upgradeGitHubAPIBaseURL      = upgradeGithubAPIBase
 	upgradeHTTPClient            = http.DefaultClient
+	upgradeRunAutomaticCheck     = runAutomaticUpgradeCheck
 	upgradeGitHubToken           = func() string {
 		return strings.TrimSpace(getEnvFirst("GITHUB_TOKEN", "GH_TOKEN"))
 	}
@@ -96,21 +98,21 @@ func newUpgradeCommand(app *AppContext) *cobra.Command {
 
 	upgradeCmd := &cobra.Command{
 		Use:   "upgrade",
-		Short: "Check and install new releases",
+		Short: "Install a specific release version",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runUpgradeInstallCommand(cmd.Context(), app, strings.TrimSpace(targetVersion), yes, dryRun, cmd.InOrStdin(), cmd.OutOrStdout())
 		},
 	}
 
-	checkCmd := &cobra.Command{
-		Use:   "check",
-		Short: "Check latest release availability",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runUpgradeCheckCommand(cmd.Context(), app, strings.TrimSpace(targetVersion))
-		},
-	}
+		checkCmd := &cobra.Command{
+			Use:   "check",
+			Short: "Check latest release availability",
+			RunE: func(cmd *cobra.Command, _ []string) error {
+				return runUpgradeCheckCommand(cmd.Context(), app, strings.TrimSpace(targetVersion))
+			},
+		}
 
-	upgradeCmd.PersistentFlags().StringVar(&targetVersion, "version", "", "Target version tag (default latest), e.g. v1.2.3")
+		upgradeCmd.PersistentFlags().StringVar(&targetVersion, "version", "", "Target version tag, e.g. v1.2.3")
 	upgradeCmd.PersistentFlags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
 	upgradeCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Check and print planned action without replacing binary")
 	upgradeCmd.AddCommand(checkCmd)
@@ -226,6 +228,21 @@ func performUpgradeCheck(ctx context.Context, targetVersion string) (upgradeComm
 }
 
 func performUpgradeInstall(ctx context.Context, targetVersion string, yes bool, dryRun bool, in io.Reader, out io.Writer) (upgradeCommandResult, error) {
+	targetVersion = strings.TrimSpace(targetVersion)
+	if targetVersion == "" {
+		if !upgradeInteractiveTerminal() {
+			return upgradeCommandResult{}, fmt.Errorf("upgrade requires --version in non-interactive mode")
+		}
+		promptedVersion, err := upgradePromptVersion(in, out)
+		if err != nil {
+			return upgradeCommandResult{}, err
+		}
+		targetVersion = strings.TrimSpace(promptedVersion)
+		if targetVersion == "" {
+			return upgradeCommandResult{}, fmt.Errorf("upgrade requires a target version")
+		}
+	}
+
 	repo := resolveUpgradeReleaseRepo()
 	if strings.TrimSpace(repo) == "" {
 		return upgradeCommandResult{}, fmt.Errorf("release repo is empty")
@@ -238,7 +255,6 @@ func performUpgradeInstall(ctx context.Context, targetVersion string, yes bool, 
 
 	targetTag := normalizeVersionTag(release.TagName)
 	updateAvailable := isReleaseNewerThanCurrent(currentVersion, targetTag)
-	targetSpecified := strings.TrimSpace(targetVersion) != ""
 
 	result := upgradeCommandResult{
 		Mode:            "upgrade",
@@ -253,11 +269,7 @@ func performUpgradeInstall(ctx context.Context, targetVersion string, yes bool, 
 		DryRun:          dryRun,
 	}
 
-	if !targetSpecified && !updateAvailable {
-		result.Message = "already on latest version"
-		return result, nil
-	}
-	if targetSpecified && normalizeVersionTag(currentVersion) == targetTag {
+	if normalizeVersionTag(currentVersion) == targetTag {
 		result.Message = "target version already installed"
 		return result, nil
 	}
@@ -350,7 +362,8 @@ func performUpgradeInstall(ctx context.Context, targetVersion string, yes bool, 
 
 func MaybeNotifyUpgradeAvailable(ctx context.Context, rawArgs []string, out io.Writer) {
 	normalizedArgs := NormalizeArgs(rawArgs)
-	if shouldSkipAutomaticUpgradeCheck(normalizedArgs) {
+	interactive := upgradeInteractiveTerminal()
+	if shouldSkipAutomaticUpgradeCheck(normalizedArgs, interactive) {
 		return
 	}
 	if out == nil {
@@ -358,19 +371,22 @@ func MaybeNotifyUpgradeAvailable(ctx context.Context, rawArgs []string, out io.W
 	}
 
 	statePath := defaultUpdateStatePath()
-	_, _ = runAutomaticUpgradeCheck(ctx, statePath, out, upgradeInteractiveTerminal())
+	_, _ = upgradeRunAutomaticCheck(ctx, statePath, out, interactive)
 }
 
-func shouldSkipAutomaticUpgradeCheck(args []string) bool {
-	if len(args) == 0 {
+func shouldSkipAutomaticUpgradeCheck(args []string, interactive bool) bool {
+	if !interactive {
 		return true
+	}
+	if len(args) == 0 {
+		return false
 	}
 	first := strings.ToLower(strings.TrimSpace(args[0]))
 	switch first {
-	case "daemon", "d":
-		return false
-	default:
+	case "upgrade", "help", "completion":
 		return true
+	default:
+		return false
 	}
 }
 
@@ -437,7 +453,7 @@ func printUpgradeReminder(out io.Writer, currentVersion string, latestVersion st
 	if out == nil {
 		return
 	}
-	_, _ = fmt.Fprintf(out, "\nupdate available: current=%s latest=%s\nrun `longtradego upgrade` to install, or `longtradego upgrade check` for details.\n\n", currentVersion, latestVersion)
+	_, _ = fmt.Fprintf(out, "\nupdate available: current=%s latest=%s\nrun `longtradego upgrade --version %s` to install, or `longtradego upgrade check` for details.\n\n", currentVersion, latestVersion, latestVersion)
 }
 
 func updateUpgradeState(statePath string, mutate func(state *upgradeUpdateState)) error {
@@ -901,4 +917,20 @@ func promptUpgradeConfirmation(in io.Reader, out io.Writer, currentVersion strin
 	}
 	text := strings.ToLower(strings.TrimSpace(line))
 	return text == "y" || text == "yes", nil
+}
+
+func promptUpgradeTargetVersion(in io.Reader, out io.Writer) (string, error) {
+	if in == nil {
+		in = os.Stdin
+	}
+	if out == nil {
+		out = os.Stdout
+	}
+	_, _ = fmt.Fprint(out, "enter target version (for example: v1.0.5): ")
+	reader := bufio.NewReader(in)
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }

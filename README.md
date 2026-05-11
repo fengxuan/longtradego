@@ -131,6 +131,8 @@ Initialize example config files into the resolved config directory:
 # or only generate one file
 ~/.local/bin/longtradego config init --only security_keys
 ~/.local/bin/longtradego config init --only env
+# force the installed home config dir even when running inside the repo
+~/.local/bin/longtradego config init --home --only env
 ```
 
 This writes example files such as:
@@ -163,6 +165,8 @@ ls ~/.config/longtradego/logs
 ```
 
 When you run from the repo with `go run .`, the current workspace-relative `conf/`, `data/`, and `logs/` layout stays unchanged.
+`config init` now prints a repo-relative hint in that mode so it is obvious that files were written under `./conf`.
+Use `config init --home` if you want to force generation into `~/.config/longtradego/conf` while still running inside the repo.
 If `conf/longtradego.env` is absent in repo mode, project-root `.env` is still loaded as a backward-compatible fallback.
 
 If `longtradego` is not on your PATH yet:
@@ -210,11 +214,16 @@ go run ./cmd/longtradego upgrade --dry-run --yes
 
 # Install latest release (binary mode)
 longtradego upgrade
+
+# Install a specific release without querying GitHub release metadata
+longtradego upgrade --version v1.0.5
 ```
 
 Upgrade notes:
 
 - `upgrade` downloads release assets from GitHub Releases and verifies `checksums.txt` before replacement.
+- `upgrade --version vX.Y.Z` builds the direct release asset URL and avoids the GitHub release metadata API, which helps when anonymous API requests are rate-limited.
+- If you still use latest-version lookup, set `GITHUB_TOKEN` or `GH_TOKEN` to raise the GitHub API rate limit.
 - `upgrade` refuses to run while daemon is running; stop daemon first.
 - `upgrade` refuses `go run .` execution mode; install and run released binary first.
 - Automatic update checks run at daemon startup, are cached in `data/update_state.json` in repo mode or `~/.config/longtradego/data/update_state.json` after install, and are throttled to at most once per 24 hours.
