@@ -9,8 +9,14 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
+  build-artifact:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -20,7 +26,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build release artifacts
+      - name: Build release artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -28,19 +34,39 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ARCH="${{ matrix.arch }}"
+          BIN_DIR="dist/longtradego_${VERSION}_darwin_${ARCH}"
+          BIN_PATH="${BIN_DIR}/longtradego"
+          mkdir -p "${BIN_DIR}"
+          GOOS=darwin GOARCH="${ARCH}" CGO_ENABLED=0 \
+            go build -trimpath \
+            -ldflags "-s -w -X main.buildVersion=${TAG} -X main.buildCommit=${GITHUB_SHA} -X main.buildDate=${BUILD_DATE}" \
+            -o "${BIN_PATH}" .
+          tar -C "dist" -czf "dist/longtradego_${VERSION}_darwin_${ARCH}.tar.gz" "longtradego_${VERSION}_darwin_${ARCH}"
+          rm -rf "${BIN_DIR}"
 
-          for ARCH in amd64 arm64; do
-            BIN_DIR="dist/longtradego_${VERSION}_darwin_${ARCH}"
-            BIN_PATH="${BIN_DIR}/longtradego"
-            mkdir -p "${BIN_DIR}"
-            GOOS=darwin GOARCH="${ARCH}" CGO_ENABLED=0 \
-              go build -trimpath \
-              -ldflags "-s -w -X main.buildVersion=${TAG} -X main.buildCommit=${GITHUB_SHA} -X main.buildDate=${BUILD_DATE}" \
-              -o "${BIN_PATH}" .
-            tar -C "dist" -czf "dist/longtradego_${VERSION}_darwin_${ARCH}.tar.gz" "longtradego_${VERSION}_darwin_${ARCH}"
-            rm -rf "${BIN_DIR}"
-          done
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: longtradego-darwin-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
 
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: build-artifact
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: longtradego-darwin-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
           (cd dist && sha256sum longtradego_*.tar.gz > checksums.txt)
 
       - name: Publish GitHub Release Assets
