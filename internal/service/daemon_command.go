@@ -67,6 +67,10 @@ type daemonOwnedBookingRuntime struct {
 	StartToken string
 }
 
+type daemonOwnedSkillRouterRuntime struct {
+	RuntimePath string
+}
+
 func newDaemonCommand(app *AppContext, commandLogger *CommandFileLogger) *cobra.Command {
 	return &cobra.Command{
 		Use:     "daemon",
@@ -88,20 +92,21 @@ func newDaemonCommand(app *AppContext, commandLogger *CommandFileLogger) *cobra.
 			printDaemonWebhookStartupHint(daemonOut)
 
 			var (
-				taskManager       *daemonTaskManager
-				executeMu         sync.Mutex
-				monitorMu         sync.Mutex
-				daemonWebhookMu   sync.Mutex
-				daemonBookingMu   sync.Mutex
-				daemonStartedAt   = time.Now()
-				daemonSessionID   = newDaemonWebhookOwnerSessionID()
-				monitorSeq        int
-				monitorNextID     int64 = 1
-				monitorStatePath        = defaultDaemonMonitorStatePath()
-				daemonWebhookPIDs       = make(map[int]daemonOwnedWebhookRuntime)
-				daemonBookingPIDs       = make(map[int]daemonOwnedBookingRuntime)
-				monitors                = make(map[int]*daemonMonitorRuntime)
-				monitorRecords          = make(map[string]daemonMonitorRecord)
+				taskManager            *daemonTaskManager
+				executeMu              sync.Mutex
+				monitorMu              sync.Mutex
+				daemonWebhookMu        sync.Mutex
+				daemonBookingMu        sync.Mutex
+				daemonStartedAt        = time.Now()
+				daemonSessionID        = newDaemonWebhookOwnerSessionID()
+				monitorSeq             int
+				monitorNextID          int64 = 1
+				monitorStatePath             = defaultDaemonMonitorStatePath()
+				daemonWebhookPIDs            = make(map[int]daemonOwnedWebhookRuntime)
+				daemonBookingPIDs            = make(map[int]daemonOwnedBookingRuntime)
+				daemonSkillRouterPaths       = make(map[string]daemonOwnedSkillRouterRuntime)
+				monitors                     = make(map[int]*daemonMonitorRuntime)
+				monitorRecords               = make(map[string]daemonMonitorRecord)
 			)
 			runSingleParsedCommand := func(runCtx context.Context, parsedArgs []string) (any, error) {
 				executeMu.Lock()
@@ -117,6 +122,7 @@ func newDaemonCommand(app *AppContext, commandLogger *CommandFileLogger) *cobra.
 
 				runErr := executeCLICommand(effectiveCtx, app, commandLogger, parsedArgs)
 				_, _, result := app.ExecutionSnapshot()
+				trackDaemonOwnedSkillRouterLifecycle(parsedArgs, result, daemonSkillRouterPaths)
 
 				// Keep daemon status as foreground session state after command execution.
 				app.SetExecution("daemon", nil)
@@ -289,6 +295,13 @@ func newDaemonCommand(app *AppContext, commandLogger *CommandFileLogger) *cobra.
 				}
 				daemonBookingMu.Unlock()
 				stopDaemonOwnedBookingOnDaemonExit(cloned, daemonSessionID, daemonOut)
+			}()
+			defer func() {
+				cloned := make(map[string]daemonOwnedSkillRouterRuntime, len(daemonSkillRouterPaths))
+				for runtimePath, state := range daemonSkillRouterPaths {
+					cloned[runtimePath] = state
+				}
+				stopDaemonOwnedSkillRouterOnDaemonExit(cloned, daemonOut)
 			}()
 			defer func() {
 				monitorMu.Lock()
@@ -560,13 +573,7 @@ func newDaemonCommand(app *AppContext, commandLogger *CommandFileLogger) *cobra.
 					continue
 				}
 
-				commandResult, commandErr := runSingleParsedCommand(cmd.Context(), parsedArgs)
-				daemonWebhookMu.Lock()
-				trackDaemonOwnedWebhookLifecycle(parsedArgs, commandResult, daemonWebhookPIDs, daemonSessionID)
-				daemonWebhookMu.Unlock()
-				daemonBookingMu.Lock()
-				trackDaemonOwnedBookingLifecycle(parsedArgs, commandResult, daemonBookingPIDs, daemonSessionID)
-				daemonBookingMu.Unlock()
+				_, commandErr := runSingleParsedCommand(cmd.Context(), parsedArgs)
 				if commandErr != nil {
 					fmt.Printf("command failed: %v\n", commandErr)
 				}
@@ -1942,6 +1949,7 @@ var (
 		"run",
 		"list",
 		"validate",
+		"router",
 		"help",
 	}
 	daemonSkillRunFlagCandidates = []string{
@@ -1962,6 +1970,30 @@ var (
 		"--format",
 		"--skills-config",
 		"--llm-config",
+	}
+	daemonSkillRouterSubcommandCandidates = []string{
+		"start",
+		"status",
+		"stop",
+		"help",
+	}
+	daemonSkillRouterStartFlagCandidates = []string{
+		"--llm-config",
+		"--runtime",
+		"--log-file",
+		"--python",
+		"--format",
+	}
+	daemonSkillRouterStatusFlagCandidates = []string{
+		"--llm-config",
+		"--runtime",
+		"--format",
+	}
+	daemonSkillRouterStopFlagCandidates = []string{
+		"--llm-config",
+		"--runtime",
+		"--timeout",
+		"--format",
 	}
 	daemonSkillFormatCandidates = []string{
 		"table",
@@ -2248,6 +2280,46 @@ func skillCompletionCandidates(parts []string) [][]rune {
 			return stringCandidatesToRunes(daemonSkillValidateFlagCandidates)
 		}
 		return nil
+	case "router":
+		if len(args) <= 1 {
+			return stringCandidatesToRunes(daemonSkillRouterSubcommandCandidates)
+		}
+		routerSub := strings.ToLower(strings.TrimSpace(args[0]))
+		routerArgs := args[1:]
+		routerCurrent := ""
+		if len(routerArgs) > 0 {
+			routerCurrent = routerArgs[len(routerArgs)-1]
+		}
+		switch routerSub {
+		case "start":
+			if len(routerArgs) >= 2 && routerArgs[len(routerArgs)-2] == "--format" && routerCurrent == "" {
+				return stringCandidatesToRunes(daemonSkillFormatCandidates)
+			}
+			if routerCurrent == "" || strings.HasPrefix(routerCurrent, "--") {
+				return stringCandidatesToRunes(daemonSkillRouterStartFlagCandidates)
+			}
+			return nil
+		case "status":
+			if len(routerArgs) >= 2 && routerArgs[len(routerArgs)-2] == "--format" && routerCurrent == "" {
+				return stringCandidatesToRunes(daemonSkillFormatCandidates)
+			}
+			if routerCurrent == "" || strings.HasPrefix(routerCurrent, "--") {
+				return stringCandidatesToRunes(daemonSkillRouterStatusFlagCandidates)
+			}
+			return nil
+		case "stop":
+			if len(routerArgs) >= 2 && routerArgs[len(routerArgs)-2] == "--format" && routerCurrent == "" {
+				return stringCandidatesToRunes(daemonSkillFormatCandidates)
+			}
+			if routerCurrent == "" || strings.HasPrefix(routerCurrent, "--") {
+				return stringCandidatesToRunes(daemonSkillRouterStopFlagCandidates)
+			}
+			return nil
+		case "help":
+			return nil
+		default:
+			return stringCandidatesToRunes(daemonSkillRouterSubcommandCandidates)
+		}
 	case "help":
 		return nil
 	default:
@@ -2927,6 +2999,214 @@ func buildDaemonWebhookRuntimeOwnerSummary(runtime *webhookRuntimeInfo) string {
 		return "none"
 	}
 	return strings.Join(parts, ",")
+}
+
+func daemonCommandFlagValue(args []string, flagName string) string {
+	name := strings.TrimSpace(flagName)
+	if name == "" {
+		return ""
+	}
+	for index, token := range args {
+		trimmed := strings.TrimSpace(token)
+		if trimmed == name {
+			if index+1 >= len(args) {
+				return ""
+			}
+			return strings.TrimSpace(args[index+1])
+		}
+		prefix := name + "="
+		if strings.HasPrefix(trimmed, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+		}
+	}
+	return ""
+}
+
+func skillRouterStartResultFromAny(result any) (skillRouterStartResult, bool) {
+	switch typed := result.(type) {
+	case skillRouterStartResult:
+		return typed, true
+	case *skillRouterStartResult:
+		if typed == nil {
+			return skillRouterStartResult{}, false
+		}
+		return *typed, true
+	case map[string]any:
+		mode := strings.ToLower(strings.TrimSpace(skillAnyToString(typed["mode"])))
+		if mode != "" && mode != "start" {
+			return skillRouterStartResult{}, false
+		}
+		return skillRouterStartResult{
+			Mode:        strings.TrimSpace(skillAnyToString(typed["mode"])),
+			Status:      strings.TrimSpace(skillAnyToString(typed["status"])),
+			Message:     strings.TrimSpace(skillAnyToString(typed["message"])),
+			RuntimePath: strings.TrimSpace(skillAnyToString(typed["runtime_path"])),
+		}, true
+	default:
+		return skillRouterStartResult{}, false
+	}
+}
+
+func skillRouterStopResultFromAny(result any) (skillRouterStopResult, bool) {
+	switch typed := result.(type) {
+	case skillRouterStopResult:
+		return typed, true
+	case *skillRouterStopResult:
+		if typed == nil {
+			return skillRouterStopResult{}, false
+		}
+		return *typed, true
+	case map[string]any:
+		mode := strings.ToLower(strings.TrimSpace(skillAnyToString(typed["mode"])))
+		if mode != "" && mode != "stop" {
+			return skillRouterStopResult{}, false
+		}
+		pid := 0
+		if asNumber, ok := skillAnyToFloat64(typed["pid"]); ok {
+			pid = int(asNumber)
+		}
+		return skillRouterStopResult{
+			Mode:    strings.TrimSpace(skillAnyToString(typed["mode"])),
+			Status:  strings.TrimSpace(skillAnyToString(typed["status"])),
+			PID:     pid,
+			Message: strings.TrimSpace(skillAnyToString(typed["message"])),
+		}, true
+	default:
+		return skillRouterStopResult{}, false
+	}
+}
+
+func skillRunRouterTraceFromAny(result any) map[string]any {
+	switch typed := result.(type) {
+	case skillRunResult:
+		if trace, ok := typed.Trace.Router.(map[string]any); ok {
+			return trace
+		}
+	case *skillRunResult:
+		if typed != nil {
+			if trace, ok := typed.Trace.Router.(map[string]any); ok {
+				return trace
+			}
+		}
+	case map[string]any:
+		traceRaw, ok := typed["trace"].(map[string]any)
+		if !ok {
+			return nil
+		}
+		routerTrace, ok := traceRaw["router"].(map[string]any)
+		if !ok {
+			return nil
+		}
+		return routerTrace
+	}
+	return nil
+}
+
+func skillRunStartedSidecarRuntimePath(result any) string {
+	routerTrace := skillRunRouterTraceFromAny(result)
+	if len(routerTrace) == 0 {
+		return ""
+	}
+	started, ok := skillAnyToBool(routerTrace["sidecar_started_by_route"])
+	if !ok || !started {
+		return ""
+	}
+	return strings.TrimSpace(skillAnyToString(routerTrace["sidecar_runtime_path"]))
+}
+
+func resolveDaemonSkillRouterRuntimePath(args []string) string {
+	llmConfigPath := strings.TrimSpace(daemonCommandFlagValue(args, "--llm-config"))
+	if llmConfigPath == "" {
+		llmConfigPath = defaultSkillsLLMConfigPath()
+	}
+	return resolveSkillRouterRuntimePath(daemonCommandFlagValue(args, "--runtime"), resolveSkillsLLMConfigPath(llmConfigPath))
+}
+
+func trackDaemonOwnedSkillRouterLifecycle(args []string, result any, ownedRuntimePaths map[string]daemonOwnedSkillRouterRuntime) {
+	if len(args) < 2 || ownedRuntimePaths == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(args[0]), "skill") {
+		return
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[1]))
+	switch sub {
+	case "run":
+		runtimePath := strings.TrimSpace(skillRunStartedSidecarRuntimePath(result))
+		if runtimePath == "" {
+			return
+		}
+		ownedRuntimePaths[runtimePath] = daemonOwnedSkillRouterRuntime{RuntimePath: runtimePath}
+	case "router":
+		if len(args) < 3 {
+			return
+		}
+		routerSub := strings.ToLower(strings.TrimSpace(args[2]))
+		resolvedRuntimePath := resolveDaemonSkillRouterRuntimePath(args)
+		switch routerSub {
+		case "start":
+			startResult, ok := skillRouterStartResultFromAny(result)
+			if !ok {
+				return
+			}
+			if !strings.EqualFold(strings.TrimSpace(startResult.Status), "started") {
+				return
+			}
+			runtimePath := strings.TrimSpace(startResult.RuntimePath)
+			if runtimePath == "" {
+				runtimePath = resolvedRuntimePath
+			}
+			if runtimePath == "" {
+				return
+			}
+			ownedRuntimePaths[runtimePath] = daemonOwnedSkillRouterRuntime{RuntimePath: runtimePath}
+		case "stop":
+			stopResult, ok := skillRouterStopResultFromAny(result)
+			if !ok {
+				return
+			}
+			switch strings.ToLower(strings.TrimSpace(stopResult.Status)) {
+			case "stopped", "stale_removed", "not_running":
+				if resolvedRuntimePath != "" {
+					delete(ownedRuntimePaths, resolvedRuntimePath)
+				}
+				if len(ownedRuntimePaths) > 0 && (stopResult.PID > 0 || strings.EqualFold(strings.TrimSpace(stopResult.Status), "not_running")) {
+					for runtimePath := range ownedRuntimePaths {
+						if runtimePath == resolvedRuntimePath {
+							delete(ownedRuntimePaths, runtimePath)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func stopDaemonOwnedSkillRouterOnDaemonExit(ownedRuntimePaths map[string]daemonOwnedSkillRouterRuntime, out io.Writer) {
+	if len(ownedRuntimePaths) == 0 {
+		return
+	}
+	for runtimePath := range ownedRuntimePaths {
+		trimmedPath := strings.TrimSpace(runtimePath)
+		if trimmedPath == "" {
+			continue
+		}
+		stopResult, stopErr := stopSkillRouter(trimmedPath, 2*time.Second)
+		if stopErr != nil {
+			if out != nil {
+				_, _ = fmt.Fprintf(out, "daemon skill router cleanup failed (runtime=%s): %v\n", trimmedPath, stopErr)
+			}
+			continue
+		}
+		if out == nil {
+			continue
+		}
+		if stopResult.PID > 0 {
+			_, _ = fmt.Fprintf(out, "daemon exit stopped skill router pid=%d runtime=%s\n", stopResult.PID, trimmedPath)
+			continue
+		}
+		_, _ = fmt.Fprintf(out, "daemon exit skill router cleanup status=%s runtime=%s\n", strings.TrimSpace(stopResult.Status), trimmedPath)
+	}
 }
 
 func trackDaemonOwnedWebhookLifecycle(args []string, result any, ownedPIDs map[int]daemonOwnedWebhookRuntime, daemonSessionID string) {

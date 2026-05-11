@@ -105,6 +105,7 @@ func newBookingCommand(app *AppContext) *cobra.Command {
 	bookingCmd.AddCommand(newBookingReservationCommand(app, newService))
 	bookingCmd.AddCommand(newBookingQueryCommand(app, newService))
 	bookingCmd.AddCommand(newBookingAgentCommand(app))
+	bookingCmd.AddCommand(newBookingMCPCommand(app))
 	bookingCmd.AddCommand(newBookingServiceCommand(app, func() *bookingServiceServeConfig {
 		cfg := newBookingServiceServeConfig()
 		cfg.CatalogPath = strings.TrimSpace(catalogPath)

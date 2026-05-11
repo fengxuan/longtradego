@@ -2,7 +2,9 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -110,6 +112,142 @@ func TestResolveEmailAttachments(t *testing.T) {
 	if !bytes.Equal(attachments[0].Content, content) {
 		t.Fatalf("unexpected attachment content")
 	}
+	if attachments[0].SourcePath != filePath {
+		t.Fatalf("unexpected attachment source path: got %q want %q", attachments[0].SourcePath, filePath)
+	}
+}
+
+func TestLoadEmailSendConfigFromEnvDefaultsToSMTP(t *testing.T) {
+	t.Setenv("MAIL_SEND_PROVIDER", "")
+	t.Setenv("SMTP_HOST", "smtp.example.com")
+	t.Setenv("SMTP_PORT", "587")
+	t.Setenv("SMTP_USERNAME", "user@example.com")
+	t.Setenv("SMTP_PASSWORD", "secret")
+	t.Setenv("SMTP_FROM", "sender@example.com")
+
+	cfg, err := loadEmailSendConfigFromEnv()
+	if err != nil {
+		t.Fatalf("loadEmailSendConfigFromEnv failed: %v", err)
+	}
+	if cfg.Provider != "smtp" {
+		t.Fatalf("unexpected provider: %q", cfg.Provider)
+	}
+	if cfg.SMTP == nil || cfg.SMTP.Host != "smtp.example.com" {
+		t.Fatalf("unexpected smtp config: %#v", cfg.SMTP)
+	}
+}
+
+func TestLoadEmailSendConfigFromEnvMailsCLI(t *testing.T) {
+	t.Setenv("MAIL_SEND_PROVIDER", "mails_cli")
+	t.Setenv("MAILS_CLI_PATH", "/usr/local/bin/mails")
+
+	cfg, err := loadEmailSendConfigFromEnv()
+	if err != nil {
+		t.Fatalf("loadEmailSendConfigFromEnv failed: %v", err)
+	}
+	if cfg.Provider != "mails_cli" {
+		t.Fatalf("unexpected provider: %q", cfg.Provider)
+	}
+	if cfg.MailsCLI == nil || cfg.MailsCLI.Path != "/usr/local/bin/mails" {
+		t.Fatalf("unexpected mails cli config: %#v", cfg.MailsCLI)
+	}
+}
+
+func TestBuildMailSenderUnsupportedProvider(t *testing.T) {
+	_, err := buildMailSender(emailSendConfig{Provider: "unknown"})
+	if err == nil {
+		t.Fatalf("expected unsupported provider error")
+	}
+	if !strings.Contains(err.Error(), "unsupported mail send provider") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMailsCLISenderSend(t *testing.T) {
+	origCommandContext := mailsCommandContext
+	defer func() { mailsCommandContext = origCommandContext }()
+
+	var gotName string
+	var gotArgs []string
+	mailsCommandContext = func(ctx context.Context, name string, args ...string) execCmd {
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return fakeExecCmd{output: []byte("Message ID: msg-123\n")}
+	}
+
+	sender := mailsCLISender{config: mailsCLIConfig{Path: "/opt/homebrew/bin/mails"}}
+	result, err := sender.Send(context.Background(), emailRequest{
+		To:      []string{"alice@example.com", "bob@example.com"},
+		Subject: "hello",
+		Body:    "world",
+		Attachments: []emailAttachment{{
+			FileName:   "report.pdf",
+			SourcePath: "/tmp/report.pdf",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Send failed: %v", err)
+	}
+	if gotName != "/opt/homebrew/bin/mails" {
+		t.Fatalf("unexpected command name: %q", gotName)
+	}
+	expectedArgs := []string{
+		"send",
+		"--to", "alice@example.com",
+		"--to", "bob@example.com",
+		"--subject", "hello",
+		"--body", "world",
+		"--attach", "/tmp/report.pdf",
+	}
+	if !reflect.DeepEqual(gotArgs, expectedArgs) {
+		t.Fatalf("unexpected args: got %v want %v", gotArgs, expectedArgs)
+	}
+	if result.Provider != "mails_cli" {
+		t.Fatalf("unexpected provider: %q", result.Provider)
+	}
+	if result.MessageID != "msg-123" {
+		t.Fatalf("unexpected message id: %q", result.MessageID)
+	}
+}
+
+func TestMailsCLISenderSendRequiresAttachmentSourcePath(t *testing.T) {
+	sender := mailsCLISender{config: mailsCLIConfig{Path: "/usr/local/bin/mails"}}
+	_, err := sender.Send(context.Background(), emailRequest{
+		To:      []string{"alice@example.com"},
+		Subject: "hello",
+		Body:    "world",
+		Attachments: []emailAttachment{{
+			FileName: "report.pdf",
+		}},
+	})
+	if err == nil {
+		t.Fatalf("expected attachment source path error")
+	}
+	if !strings.Contains(err.Error(), "missing source path") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMailsCLISenderSendCommandFailure(t *testing.T) {
+	origCommandContext := mailsCommandContext
+	defer func() { mailsCommandContext = origCommandContext }()
+
+	mailsCommandContext = func(ctx context.Context, name string, args ...string) execCmd {
+		return fakeExecCmd{output: []byte("boom"), err: fmt.Errorf("exit status 1")}
+	}
+
+	sender := mailsCLISender{config: mailsCLIConfig{Path: "/usr/local/bin/mails"}}
+	_, err := sender.Send(context.Background(), emailRequest{
+		To:      []string{"alice@example.com"},
+		Subject: "hello",
+		Body:    "world",
+	})
+	if err == nil {
+		t.Fatalf("expected mails cli failure")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestReadPipedText(t *testing.T) {
@@ -212,4 +350,13 @@ func decodeBase64ForTest(t *testing.T, raw string) string {
 		t.Fatalf("base64 decode failed: %v", err)
 	}
 	return string(decoded)
+}
+
+type fakeExecCmd struct {
+	output []byte
+	err    error
+}
+
+func (c fakeExecCmd) CombinedOutput() ([]byte, error) {
+	return c.output, c.err
 }

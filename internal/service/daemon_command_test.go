@@ -140,6 +140,9 @@ func TestDaemonCompletionSkillSubcommandsAndFlags(t *testing.T) {
 	if !slices.Contains(subCandidates, "run") || !slices.Contains(subCandidates, "list") || !slices.Contains(subCandidates, "validate") {
 		t.Fatalf("expected skill completion subcommands, got: %v", subCandidates)
 	}
+	if !slices.Contains(subCandidates, "router") {
+		t.Fatalf("expected skill completion to include router subcommand, got: %v", subCandidates)
+	}
 
 	runFlagCandidates := completionCandidatesFromLine("skill run --")
 	if !slices.Contains(runFlagCandidates, "--text") || !slices.Contains(runFlagCandidates, "--symbols") || !slices.Contains(runFlagCandidates, "--dry-run") {
@@ -149,6 +152,13 @@ func TestDaemonCompletionSkillSubcommandsAndFlags(t *testing.T) {
 	formatCandidates := completionCandidatesFromLine("skill run --format ")
 	if !slices.Contains(formatCandidates, "json") || !slices.Contains(formatCandidates, "table") {
 		t.Fatalf("expected skill run --format values, got: %v", formatCandidates)
+	}
+
+	routerStartFlagCandidates := completionCandidatesFromLine("skill router start --")
+	if !slices.Contains(routerStartFlagCandidates, "--runtime") ||
+		!slices.Contains(routerStartFlagCandidates, "--llm-config") ||
+		!slices.Contains(routerStartFlagCandidates, "--python") {
+		t.Fatalf("expected skill router start completion flags, got: %v", routerStartFlagCandidates)
 	}
 }
 
@@ -589,6 +599,88 @@ func TestTrackDaemonOwnedBookingLifecycle(t *testing.T) {
 	)
 	if len(owned) != 0 {
 		t.Fatalf("expected tracked booking pids cleared after stop, got: %v", owned)
+	}
+}
+
+func TestTrackDaemonOwnedSkillRouterLifecycle(t *testing.T) {
+	owned := map[string]daemonOwnedSkillRouterRuntime{}
+
+	trackDaemonOwnedSkillRouterLifecycle(
+		[]string{"skill", "router", "start", "--runtime", "/tmp/router-a.json"},
+		skillRouterStartResult{
+			Mode:        "start",
+			Status:      "started",
+			RuntimePath: "/tmp/router-a.json",
+		},
+		owned,
+	)
+	if _, ok := owned["/tmp/router-a.json"]; !ok {
+		t.Fatalf("expected runtime path tracked after skill router start, got: %v", owned)
+	}
+
+	trackDaemonOwnedSkillRouterLifecycle(
+		[]string{"skill", "run", "--text", "weather"},
+		map[string]any{
+			"trace": map[string]any{
+				"router": map[string]any{
+					"sidecar_started_by_route": true,
+					"sidecar_runtime_path":     "/tmp/router-b.json",
+				},
+			},
+		},
+		owned,
+	)
+	if _, ok := owned["/tmp/router-b.json"]; !ok {
+		t.Fatalf("expected runtime path tracked after skill run auto-start, got: %v", owned)
+	}
+
+	trackDaemonOwnedSkillRouterLifecycle(
+		[]string{"skill", "router", "stop", "--runtime", "/tmp/router-a.json"},
+		skillRouterStopResult{
+			Mode:   "stop",
+			Status: "stopped",
+			PID:    123,
+		},
+		owned,
+	)
+	if _, ok := owned["/tmp/router-a.json"]; ok {
+		t.Fatalf("expected runtime path removed after skill router stop, got: %v", owned)
+	}
+	if _, ok := owned["/tmp/router-b.json"]; !ok {
+		t.Fatalf("expected other runtime path to remain tracked, got: %v", owned)
+	}
+}
+
+func TestStopDaemonOwnedSkillRouterOnDaemonExitWithPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	runtimePath := filepath.Join(tmpDir, "skill_router_runtime.json")
+	nowText := time.Now().Format(time.RFC3339Nano)
+	if err := writeSkillRouterRuntimeState(runtimePath, skillRouterRuntimeInfo{
+		PID:       999991,
+		Endpoint:  "http://127.0.0.1:19090/v1/route",
+		Host:      "127.0.0.1",
+		Port:      19090,
+		StartedAt: nowText,
+		UpdatedAt: nowText,
+	}); err != nil {
+		t.Fatalf("write skill router runtime failed: %v", err)
+	}
+
+	var output bytes.Buffer
+	stopDaemonOwnedSkillRouterOnDaemonExit(
+		map[string]daemonOwnedSkillRouterRuntime{
+			runtimePath: {RuntimePath: runtimePath},
+		},
+		&output,
+	)
+
+	if _, exists, err := readSkillRouterRuntimeState(runtimePath); err != nil {
+		t.Fatalf("read skill router runtime failed: %v", err)
+	} else if exists {
+		t.Fatalf("expected skill router runtime removed when owned")
+	}
+	if !strings.Contains(strings.ToLower(output.String()), "skill router") {
+		t.Fatalf("expected cleanup output, got: %s", output.String())
 	}
 }
 

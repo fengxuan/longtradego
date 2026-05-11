@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"net/smtp"
 	"net/textproto"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,7 +24,6 @@ import (
 
 	"github.com/spf13/cobra"
 )
-
 type smtpConfig struct {
 	Host     string
 	Port     int
@@ -42,6 +43,7 @@ type emailAttachment struct {
 	FileName    string
 	ContentType string
 	Content     []byte
+	SourcePath  string
 }
 
 type emailCommandResult struct {
@@ -51,7 +53,47 @@ type emailCommandResult struct {
 	Subject     string   `json:"subject"`
 	Attachments []string `json:"attachments,omitempty"`
 	SentAt      string   `json:"sent_at"`
+	MessageID   string   `json:"message_id,omitempty"`
 }
+
+type emailSendConfig struct {
+	Provider string
+	SMTP     *smtpConfig
+	MailsCLI *mailsCLIConfig
+}
+
+type mailsCLIConfig struct {
+	Path string
+}
+
+type emailSendResult struct {
+	Provider  string
+	From      string
+	MessageID string
+}
+
+type mailSender interface {
+	Send(ctx context.Context, req emailRequest) (emailSendResult, error)
+}
+
+type smtpSender struct {
+	config smtpConfig
+}
+
+type mailsCLISender struct {
+	config mailsCLIConfig
+}
+
+type execCmd interface {
+	CombinedOutput() ([]byte, error)
+}
+
+var (
+	mailsLookPath       = exec.LookPath
+	mailsCommandContext = func(ctx context.Context, name string, args ...string) execCmd {
+		return exec.CommandContext(ctx, name, args...)
+	}
+)
 
 type emailAliasConfig struct {
 	Aliases map[string][]string `json:"aliases"`
@@ -110,18 +152,18 @@ func newEmailCommand(app *AppContext) *cobra.Command {
 
 			app.SetExecution("email", recipients)
 
-			cfg, err := loadSMTPConfigFromEnv()
-			if err != nil {
-				return err
-			}
-
 			req := emailRequest{
 				To:          recipients,
 				Subject:     subject,
 				Body:        content,
 				Attachments: attachmentItems,
 			}
-			if err := sendSMTPMail(cfg, req); err != nil {
+			sender, err := buildMailSenderFromEnv()
+			if err != nil {
+				return err
+			}
+			sendResult, err := sender.Send(cmd.Context(), req)
+			if err != nil {
 				return err
 			}
 
@@ -130,12 +172,13 @@ func newEmailCommand(app *AppContext) *cobra.Command {
 				attachmentNames = append(attachmentNames, item.FileName)
 			}
 			result := emailCommandResult{
-				Provider:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-				From:        cfg.From,
+				Provider:    sendResult.Provider,
+				From:        sendResult.From,
 				To:          append([]string(nil), recipients...),
 				Subject:     subject,
 				Attachments: attachmentNames,
 				SentAt:      time.Now().Format(time.RFC3339),
+				MessageID:   sendResult.MessageID,
 			}
 			app.SetResult(result)
 
@@ -325,6 +368,7 @@ func resolveEmailAttachments(paths []string) ([]emailAttachment, error) {
 			FileName:    fileName,
 			ContentType: contentType,
 			Content:     data,
+			SourcePath:  path,
 		})
 	}
 	return items, nil
@@ -375,6 +419,115 @@ func loadSMTPConfigFromEnv() (smtpConfig, error) {
 		Password: password,
 		From:     parsedFrom.Address,
 	}, nil
+}
+
+func loadEmailSendConfigFromEnv() (emailSendConfig, error) {
+	provider := strings.ToLower(strings.TrimSpace(os.Getenv("MAIL_SEND_PROVIDER")))
+	if provider == "" || provider == "smtp" {
+		cfg, err := loadSMTPConfigFromEnv()
+		if err != nil {
+			return emailSendConfig{}, err
+		}
+		return emailSendConfig{
+			Provider: "smtp",
+			SMTP:     &cfg,
+		}, nil
+	}
+
+	switch provider {
+	case "mails_cli":
+		path := strings.TrimSpace(os.Getenv("MAILS_CLI_PATH"))
+		if path == "" {
+			resolved, err := mailsLookPath("mails")
+			if err != nil {
+				return emailSendConfig{}, fmt.Errorf("resolve mails cli: %w", err)
+			}
+			path = resolved
+		}
+		return emailSendConfig{
+			Provider: "mails_cli",
+			MailsCLI: &mailsCLIConfig{Path: path},
+		}, nil
+	default:
+		return emailSendConfig{}, fmt.Errorf("unsupported mail send provider %q", provider)
+	}
+}
+
+func buildMailSenderFromEnv() (mailSender, error) {
+	cfg, err := loadEmailSendConfigFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	return buildMailSender(cfg)
+}
+
+func buildMailSender(cfg emailSendConfig) (mailSender, error) {
+	switch cfg.Provider {
+	case "smtp":
+		if cfg.SMTP == nil {
+			return nil, fmt.Errorf("smtp provider requires smtp config")
+		}
+		return smtpSender{config: *cfg.SMTP}, nil
+	case "mails_cli":
+		if cfg.MailsCLI == nil {
+			return nil, fmt.Errorf("mails_cli provider requires mails cli config")
+		}
+		if strings.TrimSpace(cfg.MailsCLI.Path) == "" {
+			return nil, fmt.Errorf("mails cli path is empty")
+		}
+		return mailsCLISender{config: *cfg.MailsCLI}, nil
+	default:
+		return nil, fmt.Errorf("unsupported mail send provider %q", cfg.Provider)
+	}
+}
+
+func (s smtpSender) Send(ctx context.Context, req emailRequest) (emailSendResult, error) {
+	if err := sendSMTPMail(s.config, req); err != nil {
+		return emailSendResult{}, err
+	}
+	return emailSendResult{
+		Provider: fmt.Sprintf("smtp:%s:%d", s.config.Host, s.config.Port),
+		From:     s.config.From,
+	}, nil
+}
+
+func (s mailsCLISender) Send(ctx context.Context, req emailRequest) (emailSendResult, error) {
+	args := []string{"send"}
+	for _, recipient := range req.To {
+		args = append(args, "--to", recipient)
+	}
+	args = append(args, "--subject", req.Subject, "--body", req.Body)
+	for _, attachment := range req.Attachments {
+		if strings.TrimSpace(attachment.SourcePath) == "" {
+			return emailSendResult{}, fmt.Errorf("attachment %q missing source path for mails cli provider", attachment.FileName)
+		}
+		args = append(args, "--attach", attachment.SourcePath)
+	}
+
+	output, err := mailsCommandContext(ctx, s.config.Path, args...).CombinedOutput()
+	if err != nil {
+		trimmed := strings.TrimSpace(string(output))
+		if trimmed == "" {
+			return emailSendResult{}, fmt.Errorf("mails send failed: %w", err)
+		}
+		return emailSendResult{}, fmt.Errorf("mails send failed: %w: %s", err, trimmed)
+	}
+
+	return emailSendResult{
+		Provider: "mails_cli",
+		From:     "",
+		MessageID: extractMessageIDFromOutput(string(output)),
+	}, nil
+}
+
+func extractMessageIDFromOutput(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "message id:") {
+			return strings.TrimSpace(line[len("message id:"):])
+		}
+	}
+	return ""
 }
 
 func sendSMTPMail(cfg smtpConfig, req emailRequest) error {

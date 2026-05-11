@@ -6,6 +6,7 @@
       "executor": "market_screen_v1",
       "allowed_actions": [
         "lb",
+        "sys",
         "email",
         "task"
       ],
@@ -19,6 +20,14 @@
         "task"
       ],
       "description": "Weather skill powered by wttr.in / open-meteo"
+    },
+    "pdf": {
+      "enabled": true,
+      "allowed_actions": [
+        "sys",
+        "task"
+      ],
+      "description": "PDF generation and extraction skill"
     }
   }
 }

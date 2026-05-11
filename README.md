@@ -7,7 +7,7 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 - `cobra`-based CLI command structure
 - `quote` command with multiple symbols
 - `longbridge` passthrough command for full Longbridge CLI access (`lb` alias)
-- `email` command for SMTP notifications
+- `email` command for SMTP notifications or `mails` CLI delivery
 - `email receive` command for IMAP inbox polling and action trigger
 - `email monitor` command for new-mail monitoring (polling)
 - `mail monitor` cursor persistence (`data/mail_monitor_cursors.json`) for restart-safe UID continuation (daemon monitors are isolated by `MONITOR_ID`)
@@ -57,12 +57,17 @@ LONGBRIDGE_CLIENT_ID=your_client_id
 # Optional, default is 60355
 # LONGBRIDGE_CALLBACK_PORT=60355
 
-# SMTP for `email send`
+# SMTP for `email send` (default provider)
 # SMTP_HOST=smtp.example.com
 # SMTP_PORT=587
 # SMTP_USERNAME=your_account@example.com
 # SMTP_PASSWORD=your_password_or_app_password
 # SMTP_FROM=your_account@example.com
+
+# Optional provider switch for `email send`
+# MAIL_SEND_PROVIDER=smtp
+# MAIL_SEND_PROVIDER=mails_cli
+# MAILS_CLI_PATH=/opt/homebrew/bin/mails
 
 # Optional monitor defaults (mail monitor)
 # IMAP_MONITOR_MODE=hybrid
@@ -139,6 +144,23 @@ go run . email send \
   --to "alice@example.com,bob@example.com" \
   --subject "Longtrade Notification" \
   --body "AAPL reached target price."
+```
+
+`email send` provider selection:
+
+- Default behavior stays compatible with SMTP environment variables.
+- Set `MAIL_SEND_PROVIDER=smtp` to force SMTP.
+- Set `MAIL_SEND_PROVIDER=mails_cli` to send through the local `mails` CLI.
+- Optional `MAILS_CLI_PATH` overrides the detected `mails` binary path.
+
+Example with `mails` CLI provider:
+
+```bash
+MAIL_SEND_PROVIDER=mails_cli go run . email send \
+  --to "alice@example.com" \
+  --subject "Longtrade Notification" \
+  --body "Sent via mails CLI" \
+  --attach ./report.txt
 ```
 
 Send email by recipient alias (`--to` can be alias or email):
@@ -262,6 +284,35 @@ go run . sys --shell "uname -a && date"
 `sys --shell` uses `$SHELL` when available (falls back to `zsh`, then `sh`).
 `sys` writes execution logs (stdout/stderr/exit code) to `logs/system_command.log` and does not print command output to terminal, to avoid interfering with interactive input.
 For readable JSON payloads, keep using `stdout`/`stderr` for raw text compatibility and prefer `stdout_json` / `stderr_json` when present.
+
+Skill routing (V2 sidecar mode):
+
+```bash
+# validate new V2 router/LLM config schema
+go run . skill validate --llm-config conf/skills_llm.json
+
+# start local langgraph sidecar
+go run . skill router start --llm-config conf/skills_llm.json
+
+# check and stop sidecar
+go run . skill router status
+go run . skill router stop
+
+# sidecar status endpoints
+curl http://127.0.0.1:19090/healthz
+curl http://127.0.0.1:19090/v1/status
+# open in browser: http://127.0.0.1:19090/status
+
+# run skill request (non-explicit text routes to sidecar /v1/route)
+go run . skill run --text "给我当前特斯拉的股票价格信息" --dry-run --format json
+```
+
+Skill router notes:
+
+- Non-explicit natural language requests now route through sidecar `POST /v1/route`.
+- Sidecar status is available at `GET /v1/status` (JSON) and `GET /status` (HTML page).
+- Explicit commands (for example `longbridge quote ...`, `pdftotext ...`) are still locally routed and do not require sidecar.
+- `conf/skills_llm.json` now uses V2 schema with top-level `router` / `llm` / `sidecar`; legacy flat schema (`api_key`, `base_url`, `model`) is rejected with migration guidance.
 
 Webhook lifecycle and usage:
 

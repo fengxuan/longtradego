@@ -1,0 +1,44 @@
+{
+  "skills": [
+    {
+      "id": "longbridge",
+      "capabilities": [
+        "market_data"
+      ],
+      "priority": 60,
+      "source": "longbridge/developers",
+      "source_url": "https://github.com/longbridge/developers.git",
+      "install_command_template": "npx skills add {source} -g -y"
+    },
+    {
+      "id": "weather",
+      "capabilities": [
+        "weather"
+      ],
+      "priority": 50,
+      "source": "local/weather",
+      "source_url": "",
+      "install_command_template": "npx skills add {source} -g -y"
+    },
+    {
+      "id": "pdf",
+      "capabilities": [
+        "pdf"
+      ],
+      "priority": 50,
+      "source": "anthropics/skills",
+      "source_url": "https://github.com/anthropics/skills.git",
+      "install_command_template": "npx skills add {source} -g -y"
+    },
+    {
+      "id": "calculator",
+      "capabilities": [
+        "calculation"
+      ],
+      "priority": 70,
+      "source": "openai/skills@calculator",
+      "source_url": "https://github.com/openai/skills",
+      "install_command_template": "npx skills add {source} -g -y"
+    }
+  ]
+}

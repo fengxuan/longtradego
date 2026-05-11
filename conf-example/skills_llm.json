@@ -1,5 +1,21 @@
 {
-  "api_key": "YOUR_OPENAI_COMPATIBLE_API_KEY",
-  "base_url": "https://api.openai.com/v1",
-  "model": "gpt-4.1-mini"
+  "router": {
+    "endpoint": "http://127.0.0.1:19090/v1/route",
+    "timeout_seconds": 20,
+    "auth_token": ""
+  },
+  "llm": {
+    "api_key": "YOUR_OPENAI_COMPATIBLE_API_KEY",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4.1-mini"
+  },
+  "sidecar": {
+    "host": "127.0.0.1",
+    "port": 19090,
+    "runtime": "data/skill_router_runtime.json",
+    "log": "logs/skill_router.log",
+    "script": "scripts/skill_router_sidecar.py",
+    "python_bin": "python3",
+    "skills_catalog": "conf/skills_catalog.json"
+  }
 }
