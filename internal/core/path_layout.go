@@ -11,6 +11,7 @@ const (
 	repoDataDirName   = "data"
 	repoLogDirName    = "logs"
 	appHomeEnvVar     = "LONGTRADEGO_HOME"
+	dotenvFileName    = "longtradego.env"
 )
 
 var (
@@ -83,6 +84,17 @@ func ResolveDataPath(name string) string {
 
 func ResolveLogPath(name string) string {
 	return filepath.Join(DefaultLogDir(), strings.TrimSpace(name))
+}
+
+func DefaultEnvFilePath() string {
+	return filepath.Join(DefaultConfigDir(), dotenvFileName)
+}
+
+func LegacyRepoEnvFilePath() string {
+	if !UseRepoRelativeLayout() {
+		return ""
+	}
+	return ".env"
 }
 
 func looksLikeProjectWorkspace(start string) bool {

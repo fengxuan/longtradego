@@ -14,6 +14,10 @@ import (
 func Run(rawArgs []string) error {
 	ctx := context.Background()
 
+	if err := core.LoadDefaultEnvFiles(); err != nil {
+		return err
+	}
+
 	commandLogger, err := core.NewCommandFileLogger()
 	if err != nil {
 		log.Printf("failed to initialize command logger: %v", err)

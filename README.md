@@ -51,7 +51,15 @@ A small Golang CLI demo for Longbridge OpenAPI, currently focused on quote queri
 
 ## Environment
 
-Use `.env` in project root:
+Default env file locations:
+
+- repo/dev mode: `conf/longtradego.env`
+- installed binary mode: `~/.config/longtradego/conf/longtradego.env`
+- compatibility fallback in repo mode only: project-root `.env`
+
+Explicit shell environment variables still override values from env files.
+
+Example `longtradego.env`:
 
 ```env
 LONGBRIDGE_CLIENT_ID=your_client_id
@@ -78,13 +86,15 @@ LONGBRIDGE_CLIENT_ID=your_client_id
 # IMAP_MONITOR_FALLBACK_POLL_INTERVAL=2m
 # IMAP_MONITOR_BODY_MAX_BYTES=20000
 
+# Optional override for release source
+# LONGTRADEGO_RELEASE_REPO=fengxuan/longtradego
 ```
 
 Notes:
 
 - On first OAuth run, CLI prints an authorization URL.
 - Token is managed by Longbridge SDK and persisted locally.
-- IMAP for `mail receive/monitor/analyze` reads the default mail settings config only (no IMAP credential fallback from `.env`).
+- IMAP for `mail receive/monitor/analyze` reads the default mail settings config only (no IMAP credential fallback from `longtradego.env`).
 - Booking intent parse (`/booking/intents/parse`) reads the default booking LLM config only (no LLM credential fallback from environment variables).
 
 ## Run
@@ -120,6 +130,7 @@ Initialize example config files into the resolved config directory:
 ~/.local/bin/longtradego config init
 # or only generate one file
 ~/.local/bin/longtradego config init --only security_keys
+~/.local/bin/longtradego config init --only env
 ```
 
 This writes example files such as:
@@ -127,6 +138,7 @@ This writes example files such as:
 - `~/.config/longtradego/conf/admin_auth.json`
 - `~/.config/longtradego/conf/booking_llm.json`
 - `~/.config/longtradego/conf/email_aliases.json`
+- `~/.config/longtradego/conf/longtradego.env`
 - `~/.config/longtradego/conf/mail_receive_setting.json`
 - `~/.config/longtradego/conf/security_keys.json`
 
@@ -151,6 +163,7 @@ ls ~/.config/longtradego/logs
 ```
 
 When you run from the repo with `go run .`, the current workspace-relative `conf/`, `data/`, and `logs/` layout stays unchanged.
+If `conf/longtradego.env` is absent in repo mode, project-root `.env` is still loaded as a backward-compatible fallback.
 
 If `longtradego` is not on your PATH yet:
 

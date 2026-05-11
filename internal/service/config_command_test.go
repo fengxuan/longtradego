@@ -81,7 +81,7 @@ func TestRunConfigPathsUserHome(t *testing.T) {
 func TestRunConfigInitCreatesTemplates(t *testing.T) {
 	dir := t.TempDir()
 	cmd := newConfigInitCommand(nil)
-	cmd.SetArgs([]string{"--dir", dir, "--only", "security_keys", "--only", "email_aliases"})
+	cmd.SetArgs([]string{"--dir", dir, "--only", "security_keys", "--only", "email_aliases", "--only", "env"})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -90,11 +90,15 @@ func TestRunConfigInitCreatesTemplates(t *testing.T) {
 
 	securityPath := filepath.Join(dir, "security_keys.json")
 	aliasPath := filepath.Join(dir, "email_aliases.json")
+	envPath := filepath.Join(dir, "longtradego.env")
 	if _, err := os.Stat(securityPath); err != nil {
 		t.Fatalf("expected security_keys.json created: %v", err)
 	}
 	if _, err := os.Stat(aliasPath); err != nil {
 		t.Fatalf("expected email_aliases.json created: %v", err)
+	}
+	if _, err := os.Stat(envPath); err != nil {
+		t.Fatalf("expected longtradego.env created: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "admin_auth.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected admin_auth.json not created, err=%v", err)
@@ -106,18 +110,25 @@ func TestRunConfigInitCreatesTemplates(t *testing.T) {
 	if !strings.Contains(output, "created: "+aliasPath) {
 		t.Fatalf("expected created output for email aliases, got %q", output)
 	}
+	if !strings.Contains(output, "created: "+envPath) {
+		t.Fatalf("expected created output for env template, got %q", output)
+	}
 }
 
 func TestRunConfigInitSkipsExistingWithoutOverwrite(t *testing.T) {
 	dir := t.TempDir()
 	targetPath := filepath.Join(dir, "security_keys.json")
+	envPath := filepath.Join(dir, "longtradego.env")
 	original := []byte("original")
 	if err := os.WriteFile(targetPath, original, 0o644); err != nil {
 		t.Fatalf("seed security_keys.json failed: %v", err)
 	}
+	if err := os.WriteFile(envPath, []byte("SMTP_HOST=existing.example.com\n"), 0o644); err != nil {
+		t.Fatalf("seed longtradego.env failed: %v", err)
+	}
 
 	cmd := newConfigInitCommand(nil)
-	cmd.SetArgs([]string{"--dir", dir, "--only", "security_keys"})
+	cmd.SetArgs([]string{"--dir", dir, "--only", "security_keys", "--only", "env"})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -130,20 +141,34 @@ func TestRunConfigInitSkipsExistingWithoutOverwrite(t *testing.T) {
 	if string(raw) != string(original) {
 		t.Fatalf("expected existing file preserved, got %q", string(raw))
 	}
+	envRaw, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("read longtradego.env failed: %v", err)
+	}
+	if string(envRaw) != "SMTP_HOST=existing.example.com\n" {
+		t.Fatalf("expected existing env preserved, got %q", string(envRaw))
+	}
 	if !strings.Contains(out.String(), "skipped existing: "+targetPath) {
-		t.Fatalf("expected skipped output, got %q", out.String())
+		t.Fatalf("expected skipped output for json, got %q", out.String())
+	}
+	if !strings.Contains(out.String(), "skipped existing: "+envPath) {
+		t.Fatalf("expected skipped output for env, got %q", out.String())
 	}
 }
 
 func TestRunConfigInitOverwritesWhenRequested(t *testing.T) {
 	dir := t.TempDir()
 	targetPath := filepath.Join(dir, "security_keys.json")
+	envPath := filepath.Join(dir, "longtradego.env")
 	if err := os.WriteFile(targetPath, []byte("original"), 0o644); err != nil {
 		t.Fatalf("seed security_keys.json failed: %v", err)
 	}
+	if err := os.WriteFile(envPath, []byte("SMTP_HOST=old.example.com\n"), 0o644); err != nil {
+		t.Fatalf("seed longtradego.env failed: %v", err)
+	}
 
 	cmd := newConfigInitCommand(nil)
-	cmd.SetArgs([]string{"--dir", dir, "--only", "security_keys", "--overwrite"})
+	cmd.SetArgs([]string{"--dir", dir, "--only", "security_keys", "--only", "env", "--overwrite"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("config init execute failed: %v", err)
 	}
@@ -154,6 +179,13 @@ func TestRunConfigInitOverwritesWhenRequested(t *testing.T) {
 	if !strings.Contains(string(raw), "replace-with-strong-random-token") {
 		t.Fatalf("expected template content after overwrite, got %q", string(raw))
 	}
+	envRaw, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("read longtradego.env failed: %v", err)
+	}
+	if !strings.Contains(string(envRaw), "LONGBRIDGE_CLIENT_ID=your-client-id") {
+		t.Fatalf("expected env template content after overwrite, got %q", string(envRaw))
+	}
 }
 
 func TestRunConfigInitRejectsUnknownTemplate(t *testing.T) {
@@ -161,5 +193,20 @@ func TestRunConfigInitRejectsUnknownTemplate(t *testing.T) {
 	cmd.SetArgs([]string{"--dir", t.TempDir(), "--only", "unknown"})
 	if err := cmd.Execute(); err == nil {
 		t.Fatalf("expected unknown template error")
+	}
+}
+
+func TestRunConfigInitOnlyEnv(t *testing.T) {
+	dir := t.TempDir()
+	cmd := newConfigInitCommand(nil)
+	cmd.SetArgs([]string{"--dir", dir, "--only", "env"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("config init execute failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "longtradego.env")); err != nil {
+		t.Fatalf("expected longtradego.env created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "security_keys.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected security_keys.json not created, err=%v", err)
 	}
 }

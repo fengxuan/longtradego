@@ -25,5 +25,7 @@ var (
 	resolveConfigPath         = core.ResolveConfigPath
 	resolveDataPath           = core.ResolveDataPath
 	resolveLogPath            = core.ResolveLogPath
+	defaultEnvFilePath        = core.DefaultEnvFilePath
+	legacyRepoEnvFilePath     = core.LegacyRepoEnvFilePath
 	useRepoRelativeLayout     = core.UseRepoRelativeLayout
 )

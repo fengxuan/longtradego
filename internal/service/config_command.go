@@ -84,6 +84,36 @@ const (
   ]
 }
 `
+	configTemplateEnv = `# Default env file for longtradego.
+# Explicit shell environment variables still override values here.
+
+# Longbridge OAuth configuration
+LONGBRIDGE_CLIENT_ID=your-client-id
+# LONGBRIDGE_CALLBACK_PORT=60355
+
+# SMTP for email send (default provider)
+# SMTP_HOST=smtp.example.com
+# SMTP_PORT=587
+# SMTP_USERNAME=your_account@example.com
+# SMTP_PASSWORD=your_password_or_app_password
+# SMTP_FROM=your_account@example.com
+
+# Optional provider switch for email send
+# MAIL_SEND_PROVIDER=smtp
+# MAIL_SEND_PROVIDER=mails_cli
+# MAILS_CLI_PATH=/opt/homebrew/bin/mails
+
+# Optional monitor defaults (mail monitor)
+# IMAP_MONITOR_MODE=hybrid
+# IMAP_MONITOR_LIMIT=20
+# IMAP_MONITOR_CONNECT_TIMEOUT=10s
+# IMAP_MONITOR_POLL_INTERVAL=15s
+# IMAP_MONITOR_FALLBACK_POLL_INTERVAL=2m
+# IMAP_MONITOR_BODY_MAX_BYTES=20000
+
+# Optional override for release source
+# LONGTRADEGO_RELEASE_REPO=fengxuan/longtradego
+`
 )
 
 var configInitTemplates = []configTemplate{
@@ -92,6 +122,7 @@ var configInitTemplates = []configTemplate{
 	{Name: "email_aliases", FileName: "email_aliases.json", Content: configTemplateEmailAliases},
 	{Name: "mail_receive_setting", FileName: "mail_receive_setting.json", Content: configTemplateMailReceive},
 	{Name: "security_keys", FileName: "security_keys.json", Content: configTemplateSecurityKeys},
+	{Name: "env", FileName: "longtradego.env", Content: configTemplateEnv},
 }
 
 func newConfigCommand(app *AppContext) *cobra.Command {
@@ -138,7 +169,7 @@ func newConfigInitCommand(app *AppContext) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&dir, "dir", "", "Target config directory (defaults to resolved config dir)")
 	cmd.Flags().BoolVar(&overwrite, "overwrite", false, "Overwrite existing files")
-	cmd.Flags().StringArrayVar(&only, "only", nil, "Only write selected template names (repeatable: admin_auth, booking_llm, email_aliases, mail_receive_setting, security_keys)")
+	cmd.Flags().StringArrayVar(&only, "only", nil, "Only write selected template names (repeatable: admin_auth, booking_llm, email_aliases, env, mail_receive_setting, security_keys)")
 	return cmd
 }
 
