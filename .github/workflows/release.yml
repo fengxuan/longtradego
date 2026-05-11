@@ -40,7 +40,7 @@ jobs:
           mkdir -p "${BIN_DIR}"
           GOOS=darwin GOARCH="${ARCH}" CGO_ENABLED=0 \
             go build -trimpath \
-            -ldflags "-s -w -X main.buildVersion=${TAG} -X main.buildCommit=${GITHUB_SHA} -X main.buildDate=${BUILD_DATE}" \
+            -ldflags "-s -w -X longtradego/internal/service.buildVersion=${TAG} -X longtradego/internal/service.buildCommit=${GITHUB_SHA} -X longtradego/internal/service.buildDate=${BUILD_DATE}" \
             -o "${BIN_PATH}" .
           tar -C "dist" -czf "dist/longtradego_${VERSION}_darwin_${ARCH}.tar.gz" "longtradego_${VERSION}_darwin_${ARCH}"
           rm -rf "${BIN_DIR}"

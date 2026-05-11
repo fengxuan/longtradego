@@ -1239,9 +1239,9 @@ GitHub Actions workflow: `.github/workflows/release.yml`
   - `longtradego_<version>_darwin_arm64.tar.gz`
   - `checksums.txt` (SHA256)
 - Build metadata injected via ldflags:
-  - `main.buildVersion`
-  - `main.buildCommit`
-  - `main.buildDate`
+  - `longtradego/internal/service.buildVersion`
+  - `longtradego/internal/service.buildCommit`
+  - `longtradego/internal/service.buildDate`
 
 Install script (user-writable bin directory by default):
 
