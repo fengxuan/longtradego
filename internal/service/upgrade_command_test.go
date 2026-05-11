@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -67,6 +70,87 @@ func TestPerformUpgradeCheckFetchError(t *testing.T) {
 	_, err := performUpgradeCheck(context.Background(), "")
 	if err == nil || !strings.Contains(err.Error(), "network down") {
 		t.Fatalf("expected network error, got %v", err)
+	}
+}
+
+func TestFetchGitHubReleaseExplicitVersionSkipsAPI(t *testing.T) {
+	oldBaseURL := upgradeGitHubAPIBaseURL
+	oldClient := upgradeHTTPClient
+	defer func() {
+		upgradeGitHubAPIBaseURL = oldBaseURL
+		upgradeHTTPClient = oldClient
+	}()
+
+	upgradeGitHubAPIBaseURL = "http://127.0.0.1:1"
+	upgradeHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		t.Fatalf("did not expect HTTP request for explicit version: %s", req.URL.String())
+		return nil, nil
+	})}
+
+	release, err := fetchGitHubRelease(context.Background(), "fengxuan/longtradego", "v1.0.5")
+	if err != nil {
+		t.Fatalf("fetchGitHubRelease explicit version failed: %v", err)
+	}
+	if release.TagName != "v1.0.5" {
+		t.Fatalf("unexpected tag: %+v", release)
+	}
+	if len(release.Assets) != 2 {
+		t.Fatalf("expected direct release assets, got %+v", release.Assets)
+	}
+	if !strings.Contains(release.Assets[0].BrowserDownloadURL, "/releases/download/v1.0.5/") {
+		t.Fatalf("expected direct download url, got %+v", release.Assets[0])
+	}
+}
+
+func TestFetchGitHubReleaseLatestUsesGitHubToken(t *testing.T) {
+	oldBaseURL := upgradeGitHubAPIBaseURL
+	oldClient := upgradeHTTPClient
+	oldToken := upgradeGitHubToken
+	defer func() {
+		upgradeGitHubAPIBaseURL = oldBaseURL
+		upgradeHTTPClient = oldClient
+		upgradeGitHubToken = oldToken
+	}()
+
+	var authHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader = r.Header.Get("Authorization")
+		if r.URL.Path != "/repos/fengxuan/longtradego/releases/latest" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(githubRelease{TagName: "v1.0.5", HTMLURL: "https://example.com/r/v1.0.5"})
+	}))
+	defer server.Close()
+
+	upgradeGitHubAPIBaseURL = server.URL
+	upgradeHTTPClient = server.Client()
+	upgradeGitHubToken = func() string { return "token-123" }
+
+	release, err := fetchGitHubRelease(context.Background(), "fengxuan/longtradego", "")
+	if err != nil {
+		t.Fatalf("fetchGitHubRelease latest failed: %v", err)
+	}
+	if authHeader != "Bearer token-123" {
+		t.Fatalf("expected bearer token header, got %q", authHeader)
+	}
+	if release.TagName != "v1.0.5" {
+		t.Fatalf("unexpected release: %+v", release)
+	}
+}
+
+func TestBuildDirectGitHubRelease(t *testing.T) {
+	release := buildDirectGitHubRelease("fengxuan/longtradego", "v1.0.5", "darwin", "arm64")
+	if release.TagName != "v1.0.5" {
+		t.Fatalf("unexpected tag: %+v", release)
+	}
+	if len(release.Assets) != 2 {
+		t.Fatalf("expected 2 assets, got %+v", release.Assets)
+	}
+	if release.Assets[0].Name != "longtradego_1.0.5_darwin_arm64.tar.gz" {
+		t.Fatalf("unexpected binary asset: %+v", release.Assets[0])
+	}
+	if release.Assets[1].BrowserDownloadURL != "https://github.com/fengxuan/longtradego/releases/download/v1.0.5/checksums.txt" {
+		t.Fatalf("unexpected checksum asset: %+v", release.Assets[1])
 	}
 }
 
@@ -356,6 +440,12 @@ func testUpgradeRelease(tag string) githubRelease {
 			{Name: "checksums.txt", BrowserDownloadURL: "https://example.com/download/checksums.txt"},
 		},
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func mustBuildTarGzBinary(t *testing.T, name string, payload []byte) []byte {

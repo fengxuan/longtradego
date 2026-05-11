@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -81,6 +80,11 @@ var (
 	upgradeReplaceBinary         = replaceExecutableBinary
 	upgradePromptConfirm         = promptUpgradeConfirmation
 	upgradeInteractiveTerminal   = isInteractiveTerminal
+	upgradeGitHubAPIBaseURL      = upgradeGithubAPIBase
+	upgradeHTTPClient            = http.DefaultClient
+	upgradeGitHubToken           = func() string {
+		return strings.TrimSpace(getEnvFirst("GITHUB_TOKEN", "GH_TOKEN"))
+	}
 )
 
 func newUpgradeCommand(app *AppContext) *cobra.Command {
@@ -495,11 +499,13 @@ func fetchGitHubRelease(ctx context.Context, repo string, targetVersion string) 
 		return githubRelease{}, fmt.Errorf("release repo is empty")
 	}
 
-	path := "/repos/" + repo + "/releases/latest"
-	if strings.TrimSpace(targetVersion) != "" {
-		path = "/repos/" + repo + "/releases/tags/" + url.PathEscape(strings.TrimSpace(targetVersion))
+	trimmedTarget := normalizeVersionTag(targetVersion)
+	if trimmedTarget != "" {
+		return buildDirectGitHubRelease(repo, trimmedTarget, runtime.GOOS, runtime.GOARCH), nil
 	}
-	endpoint := strings.TrimRight(upgradeGithubAPIBase, "/") + path
+
+	path := "/repos/" + repo + "/releases/latest"
+	endpoint := strings.TrimRight(upgradeGitHubAPIBaseURL, "/") + path
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -507,8 +513,11 @@ func fetchGitHubRelease(ctx context.Context, repo string, targetVersion string) 
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "longtradego/"+currentBuildVersion())
+	if token := strings.TrimSpace(upgradeGitHubToken()); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := upgradeHTTPClient.Do(req)
 	if err != nil {
 		return githubRelease{}, err
 	}
@@ -530,6 +539,21 @@ func fetchGitHubRelease(ctx context.Context, repo string, targetVersion string) 
 		return githubRelease{}, fmt.Errorf("release %s is draft and not upgradeable", release.TagName)
 	}
 	return release, nil
+}
+
+func buildDirectGitHubRelease(repo string, tag string, goos string, goarch string) githubRelease {
+	normalizedTag := normalizeVersionTag(tag)
+	version := strings.TrimPrefix(normalizedTag, "v")
+	baseURL := fmt.Sprintf("https://github.com/%s/releases/download/%s", strings.TrimSpace(repo), normalizedTag)
+	assetName := fmt.Sprintf("longtradego_%s_%s_%s.tar.gz", version, strings.TrimSpace(goos), strings.TrimSpace(goarch))
+	return githubRelease{
+		TagName: normalizedTag,
+		HTMLURL: fmt.Sprintf("https://github.com/%s/releases/tag/%s", strings.TrimSpace(repo), normalizedTag),
+		Assets: []githubReleaseAsset{
+			{Name: assetName, BrowserDownloadURL: baseURL + "/" + assetName},
+			{Name: "checksums.txt", BrowserDownloadURL: baseURL + "/checksums.txt"},
+		},
+	}
 }
 
 func downloadUpgradeContent(ctx context.Context, downloadURL string) ([]byte, error) {
