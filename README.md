@@ -111,11 +111,22 @@ Install a specific version:
 curl -fsSL https://raw.githubusercontent.com/fengxuan/longtradego/main/scripts/install.sh | bash -s -- v0.1.0
 ```
 
-After install, verify the binary and resolved directories:
+First-time setup for a normal user:
+
+1. Install the binary.
+2. Generate the env template into the installed config directory.
+3. Edit `~/.config/longtradego/conf/longtradego.env`.
 
 ```bash
+# 1. verify install
 ~/.local/bin/longtradego version
 ~/.local/bin/longtradego config paths
+
+# 2. generate the default env template
+~/.local/bin/longtradego config init --only env
+
+# 3. edit the generated file
+open ~/.config/longtradego/conf/longtradego.env
 ```
 
 Installed binary default directories:
@@ -152,7 +163,7 @@ Post-install verification checklist:
 ~/.local/bin/longtradego config paths
 
 # 2. generate example config files once
-~/.local/bin/longtradego config init
+~/.local/bin/longtradego config init --only env
 
 # 3. inspect the generated config directory
 ls ~/.config/longtradego/conf
@@ -210,24 +221,24 @@ go run ./cmd/longtradego version
 go run ./cmd/longtradego upgrade check
 
 # Dry-run planned upgrade (no binary replacement)
-go run ./cmd/longtradego upgrade --dry-run --yes
+go run ./cmd/longtradego upgrade v1.0.5 --dry-run --yes
 
-# Install latest release (binary mode)
-longtradego upgrade
-
-# Install a specific release without querying GitHub release metadata
+# Install a specific release (recommended)
+longtradego upgrade v1.0.5
+# or
 longtradego upgrade --version v1.0.5
 ```
 
 Upgrade notes:
 
-- `upgrade` downloads release assets from GitHub Releases and verifies `checksums.txt` before replacement.
-- `upgrade --version vX.Y.Z` builds the direct release asset URL and avoids the GitHub release metadata API, which helps when anonymous API requests are rate-limited.
+- `upgrade` installs a specific target version and no longer defaults to latest install when the version is omitted.
+- `upgrade vX.Y.Z` and `upgrade --version vX.Y.Z` both build the direct release asset URL and avoid the GitHub release metadata API, which helps when anonymous API requests are rate-limited.
+- Use `upgrade check` if you want to see the latest available version first.
 - If you still use latest-version lookup, set `GITHUB_TOKEN` or `GH_TOKEN` to raise the GitHub API rate limit.
+- `upgrade` downloads release assets from GitHub Releases and verifies `checksums.txt` before replacement.
 - `upgrade` refuses to run while daemon is running; stop daemon first.
 - `upgrade` refuses `go run .` execution mode; install and run released binary first.
-- Automatic update checks run at daemon startup, are cached in `data/update_state.json` in repo mode or `~/.config/longtradego/data/update_state.json` after install, and are throttled to at most once per 24 hours.
-- Update reminder text is shown only in interactive terminals (non-interactive runs stay silent).
+- Automatic update checks are cached in `data/update_state.json` in repo mode or `~/.config/longtradego/data/update_state.json` after install, are throttled to at most once per 24 hours, and only print reminders in interactive terminals.
 
 Send email notification:
 
