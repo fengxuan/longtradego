@@ -24,6 +24,7 @@ import (
 
 	"github.com/spf13/cobra"
 )
+
 type smtpConfig struct {
 	Host     string
 	Port     int
@@ -514,8 +515,8 @@ func (s mailsCLISender) Send(ctx context.Context, req emailRequest) (emailSendRe
 	}
 
 	return emailSendResult{
-		Provider: "mails_cli",
-		From:     "",
+		Provider:  "mails_cli",
+		From:      "",
 		MessageID: extractMessageIDFromOutput(string(output)),
 	}, nil
 }

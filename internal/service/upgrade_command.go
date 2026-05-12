@@ -104,15 +104,15 @@ func newUpgradeCommand(app *AppContext) *cobra.Command {
 		},
 	}
 
-		checkCmd := &cobra.Command{
-			Use:   "check",
-			Short: "Check latest release availability",
-			RunE: func(cmd *cobra.Command, _ []string) error {
-				return runUpgradeCheckCommand(cmd.Context(), app, strings.TrimSpace(targetVersion))
-			},
-		}
+	checkCmd := &cobra.Command{
+		Use:   "check",
+		Short: "Check latest release availability",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runUpgradeCheckCommand(cmd.Context(), app, strings.TrimSpace(targetVersion))
+		},
+	}
 
-		upgradeCmd.PersistentFlags().StringVar(&targetVersion, "version", "", "Target version tag, e.g. v1.2.3")
+	upgradeCmd.PersistentFlags().StringVar(&targetVersion, "version", "", "Target version tag, e.g. v1.2.3")
 	upgradeCmd.PersistentFlags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
 	upgradeCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Check and print planned action without replacing binary")
 	upgradeCmd.AddCommand(checkCmd)
