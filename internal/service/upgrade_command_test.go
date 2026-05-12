@@ -203,6 +203,54 @@ func TestRunAutomaticUpgradeCheckInteractiveReminder(t *testing.T) {
 	}
 }
 
+func TestResolveUpgradeTargetVersion(t *testing.T) {
+	cases := []struct {
+		name string
+		flag string
+		args []string
+		want string
+	}{
+		{name: "flag wins", flag: "v1.0.9", args: []string{"v1.0.8"}, want: "v1.0.9"},
+		{name: "positional fallback", flag: "", args: []string{"v1.0.9"}, want: "v1.0.9"},
+		{name: "trim positional", flag: "", args: []string{"  v1.0.9  "}, want: "v1.0.9"},
+		{name: "empty", flag: "", args: nil, want: ""},
+	}
+	for _, tc := range cases {
+		if got := resolveUpgradeTargetVersion(tc.flag, tc.args); got != tc.want {
+			t.Fatalf("%s: resolveUpgradeTargetVersion(%q, %v)=%q want=%q", tc.name, tc.flag, tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestNewUpgradeCommandAcceptsPositionalVersion(t *testing.T) {
+	oldVersion := buildVersion
+	oldFetch := upgradeFetchRelease
+	oldInteractive := upgradeInteractiveTerminal
+	defer func() {
+		buildVersion = oldVersion
+		upgradeFetchRelease = oldFetch
+		upgradeInteractiveTerminal = oldInteractive
+	}()
+
+	buildVersion = "v1.0.0"
+	upgradeInteractiveTerminal = func() bool { return false }
+	upgradeFetchRelease = func(ctx context.Context, repo string, targetVersion string) (githubRelease, error) {
+		if targetVersion != "v1.0.9" {
+			t.Fatalf("expected positional version v1.0.9, got %q", targetVersion)
+		}
+		return testUpgradeRelease("v1.0.9"), nil
+	}
+
+	cmd := newUpgradeCommand(nil)
+	cmd.SetArgs([]string{"v1.0.9", "--dry-run", "--yes"})
+	cmd.SetIn(strings.NewReader(""))
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("expected positional version dry-run to succeed, got %v", err)
+	}
+}
+
 func TestPerformUpgradeInstallPromptsForVersion(t *testing.T) {
 	tmpDir := t.TempDir()
 	withUpgradeTestWorkingDir(t, tmpDir)

@@ -97,10 +97,12 @@ func newUpgradeCommand(app *AppContext) *cobra.Command {
 	)
 
 	upgradeCmd := &cobra.Command{
-		Use:   "upgrade",
+		Use:   "upgrade [version]",
 		Short: "Install a specific release version",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runUpgradeInstallCommand(cmd.Context(), app, strings.TrimSpace(targetVersion), yes, dryRun, cmd.InOrStdin(), cmd.OutOrStdout())
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			resolvedVersion := resolveUpgradeTargetVersion(strings.TrimSpace(targetVersion), args)
+			return runUpgradeInstallCommand(cmd.Context(), app, resolvedVersion, yes, dryRun, cmd.InOrStdin(), cmd.OutOrStdout())
 		},
 	}
 
@@ -117,6 +119,16 @@ func newUpgradeCommand(app *AppContext) *cobra.Command {
 	upgradeCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Check and print planned action without replacing binary")
 	upgradeCmd.AddCommand(checkCmd)
 	return upgradeCmd
+}
+
+func resolveUpgradeTargetVersion(flagValue string, args []string) string {
+	if trimmed := strings.TrimSpace(flagValue); trimmed != "" {
+		return trimmed
+	}
+	if len(args) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(args[0])
 }
 
 func runUpgradeCheckCommand(ctx context.Context, app *AppContext, targetVersion string) error {
